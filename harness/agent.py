@@ -67,6 +67,7 @@ class Agent:
         skills: list[Skill] | None = None,
         session: str | None = None,
         sessions_dir: str = DEFAULT_DIR,
+        max_tool_steps: int | None = None,
         verify_attempts: int = CONFIG.verify_attempts,
         require_run: bool = CONFIG.require_run,
         tracer: Tracer | None = None,
@@ -97,6 +98,13 @@ class Agent:
         self._turn_approvals = 0
         self._stop_reason = "stop"
         self.context_limit = context_limit
+        # v0.3: per-instance override of the module-global tool-step budget
+        # (MAX_TOOL_STEPS). None (the default) preserves today's behavior exactly —
+        # every existing caller is unchanged. A consumer that needs to honor its own
+        # declared turn budget (e.g. an agent-package's limits.max_turns) passes it
+        # here instead of reaching into the module global (adr/0002: a generic seam,
+        # not a consumer's config format).
+        self.max_tool_steps = max_tool_steps
         self.skills = skills or []
         self._last_tokens = 0  # model-reported usage from the last call (ch-08)
         self.session = session
@@ -365,7 +373,10 @@ class Agent:
         never here — so the verification gate's ``turn_start`` index stays valid even
         across the re-prompt runs ``_enforce_run`` drives."""
         specs = self.tools.specs() if self.tools else None
-        for _ in range(MAX_TOOL_STEPS):
+        tool_step_budget = (
+            self.max_tool_steps if self.max_tool_steps is not None else MAX_TOOL_STEPS
+        )
+        for _ in range(tool_step_budget):
             t0 = time.perf_counter()
             payload = self._payload()
             resp = chat(

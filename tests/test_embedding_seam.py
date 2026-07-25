@@ -90,6 +90,27 @@ def test_tool_budget_stop_reason():
     assert r.stop_reason == "tool_budget"
 
 
+# --- v0.3 per-instance tool-step budget ---------------------------------------
+def test_max_tool_steps_overrides_the_module_global():
+    calls = {"n": 0}
+
+    def always_tool(messages, **k) -> LLMResponse:
+        calls["n"] += 1
+        return _calc_call("1+1")
+
+    p = Provider(base_url="fake://x", model="fake", api_key="x", responder=always_tool)
+    r = Agent(provider=p, tools=default_tools(), max_tool_steps=3).run("loop forever")
+
+    assert r.stop_reason == "tool_budget"
+    assert calls["n"] == 3
+
+
+def test_max_tool_steps_default_none_leaves_behavior_unchanged():
+    a = Agent(provider=fake(scripted=lambda m: "PONG"), max_tool_steps=None)
+    r = a.run("hi")
+    assert r.text == "PONG" and r.stop_reason == "stop"
+
+
 # --- v0.2 tool metadata + per-tool truncation --------------------------------
 def test_tool_attributes_seed_into_each_call():
     reg = ToolRegistry()
@@ -240,7 +261,7 @@ def test_response_format_reaches_the_http_payload(monkeypatch):
 def test_gemma_facade_exports_the_surface():
     import gemma
 
-    assert gemma.__version__ == "0.2.0"
+    assert gemma.__version__ == "0.3.0"
     for name in (
         "Agent",
         "RunResult",
