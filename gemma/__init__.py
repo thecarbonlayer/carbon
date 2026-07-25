@@ -24,7 +24,7 @@ from harness.result import RunResult, ToolCall
 from harness.tools import Tool, ToolRegistry, default_tools
 from model import Provider, chat, fake, load_env
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
     "CONFIG",

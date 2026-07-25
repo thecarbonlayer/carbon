@@ -14,6 +14,15 @@ One entry per release; commits stay fine-grained under a `feat(surface)` or
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-24
+
+Lets a consumer honor its own declared turn budget without reaching into
+`harness.agent`'s module global. Additive.
+
+### Added
+
+- `Agent(max_tool_steps=...)`: a per-instance override of the tool-step budget the run loop enforces, alongside the existing `CONFIG.max_tool_steps` module default. `None` (the default) preserves prior behavior exactly.
+
 ## [0.2.0] - 2026-07-17
 
 Lets a consumer's tool declarations carry through to the run result, so more of
