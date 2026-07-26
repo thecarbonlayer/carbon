@@ -1,7 +1,7 @@
 # Changelog
 
 The teaching curriculum is versioned by chapter tags (`ch-00`..`ch-14`) and does
-not change. This file tracks the other axis: the `gemma` library and its
+not change. This file tracks the other axis: the `carbon` library and its
 editable surface, which evolve continuously as external consumers and the
 self-improving loop push on the seam. See
 [dev-notes/adr/0001](dev-notes/adr/0001-version-the-evolution-separately.md).
@@ -13,6 +13,17 @@ One entry per release; commits stay fine-grained under a `feat(surface)` or
 `feat(sdk)` scope.
 
 ## [Unreleased]
+
+### Changed
+
+- **Renamed the project and package `gemma` → `carbon`.** The repo was named
+  after the model it happened to drive, which blurred the one distinction the
+  curriculum exists to teach: the harness is not the model. `import gemma`
+  becomes `import carbon`; the model is still whatever `LLM_MODEL` names, and
+  still defaults to `google/gemma-4-26b-a4b`. No behavior changed.
+- The `gemma_sha` key in `provenance()` is deliberately **not** renamed. It is a
+  wire format, and every measurement record ever written carries it; renaming
+  would orphan committed evidence. New keys use the new name.
 
 ## [0.3.0] - 2026-07-24
 
@@ -30,7 +41,7 @@ its hand-built trace and truncation scaffolding can go. Both additive.
 
 ### Added
 
-- `Tool.attributes`: static, consumer-defined metadata (a tier, a category) that gemma seeds into every `ToolCall.attributes` bag. gemma never reads it; the values are the consumer's.
+- `Tool.attributes`: static, consumer-defined metadata (a tier, a category) that carbon seeds into every `ToolCall.attributes` bag. carbon never reads it; the values are the consumer's.
 - `Tool.max_result_chars`: a per-tool result budget. A chatty tool truncates at its own size instead of the global door clamp.
 
 ## [0.1.0] - 2026-07-16
@@ -47,7 +58,7 @@ generic mechanism; domain and policy stay in the consumer (adr/0002).
 - Public `ToolRegistry` introspection (get/wrap/override/list), a per-call attribute bag and `is_error` flag, and a `subscribe()` event stream.
 - `Provider.from_env(root=)`, a public `load_env()`, model params as agent config, and a `provenance()` stamp.
 - `config_schema()` introspection alongside the public `load_config` door.
-- A curated, semantically versioned `gemma` package. Existing module paths keep working.
+- A curated, semantically versioned `carbon` package. Existing module paths keep working.
 
 ### Changed
 

@@ -24,7 +24,7 @@ def main(argv: list[str] | None = None) -> int:
         failed.append("ruff-format")
     if _run(["ruff", "check", "."]) != 0:
         failed.append("ruff-check")
-    if _run(["mypy", "model", "harness", "ui", "tasks", "gemma"]) != 0:
+    if _run(["mypy", "model", "harness", "ui", "tasks", "carbon"]) != 0:
         failed.append("mypy")
 
     rc = _run(["pytest"])
@@ -37,7 +37,7 @@ def main(argv: list[str] | None = None) -> int:
         importlib.import_module("model")
         importlib.import_module("ui.tui")
         importlib.import_module("tasks.checks")
-        importlib.import_module("gemma")
+        importlib.import_module("carbon")
         print("smoke import OK")
     except Exception as exc:  # noqa: BLE001
         print(f"smoke import FAILED: {exc}")
