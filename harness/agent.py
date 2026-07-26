@@ -131,7 +131,7 @@ class Agent:
         """Observe this agent's events as they happen — ``turn_start``, each
         ``tool_call`` (name, args, result, is_error), and ``turn_end`` (carrying the
         RunResult). Each event is a plain dict, so a driver reads or reacts mid-run
-        without importing gemma's internals (the embedding seam, adr/0002)."""
+        without importing carbon's internals (the embedding seam, adr/0002)."""
         self._subscribers.append(callback)
 
     def _emit(self, event: dict) -> None:
@@ -220,7 +220,7 @@ class Agent:
 
     def _collect_tool_calls(self, turn_start: int) -> list[ToolCall]:
         """Reconstruct this turn's tool calls from the transcript, pairing each
-        assistant tool_call with its recorded tool result by id. gemma reports what
+        assistant tool_call with its recorded tool result by id. carbon reports what
         ran; the ``attributes`` bag is left empty for a consumer to fill."""
         results: dict[str, str] = {
             m.get("tool_call_id", ""): str(m.get("content", ""))

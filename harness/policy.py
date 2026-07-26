@@ -6,7 +6,7 @@ agent, exactly which tools may run and under what rule — an allow-list, a
 deny-list, read-only, or an approval prompt — without reaching into the loop.
 
 ``Policy`` is that rule as one object. The interactive prompt becomes one backend
-(``approve``); always-allow and always-deny are others. gemma supplies the
+(``approve``); always-allow and always-deny are others. carbon supplies the
 enforcement; the values and any predicate are the consumer's (dev-notes/adr/0002).
 
 Back-compat: ``Agent`` still accepts ``approve=`` and ``approval_required=`` and
@@ -19,7 +19,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 
-# gemma's own mutating built-ins. ``read_only`` denies these outright rather than
+# carbon's own mutating built-ins. ``read_only`` denies these outright rather than
 # gating them. A consumer whose tools all read (e.g. a query agent) sees no effect.
 DEFAULT_MUTATORS = frozenset({"write_file", "edit_file", "bash"})
 

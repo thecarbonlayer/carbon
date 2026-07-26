@@ -38,7 +38,7 @@ def chat(
 
     ``response_format``, when given, is forwarded to the endpoint verbatim (e.g.
     ``{"type": "json_schema", "json_schema": {...}}`` or ``{"type": "json_object"}``)
-    so a caller can constrain the model to structured output. gemma forwards it and
+    so a caller can constrain the model to structured output. carbon forwards it and
     parses nothing; the schema is the caller's (the embedding seam, adr/0002).
     """
     provider = provider or Provider.from_env()

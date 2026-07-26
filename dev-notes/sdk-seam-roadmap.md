@@ -1,19 +1,19 @@
 # SDK seam roadmap
 
-The prioritized backlog for gemma's embedding seam: the surface external code
+The prioritized backlog for carbon's embedding seam: the surface external code
 uses to build domain-specific agents on the harness. This is a living document,
 not a chapter (see [ADR 0001](adr/0001-version-the-evolution-separately.md)). It
 widens as consumers and the self-improving loop hit the seam's ceiling.
 
 Governing razor (see [ADR 0002](adr/0002-mechanism-in-gemma-domain-in-the-consumer.md)):
-**generic mechanism goes in gemma; domain and policy stay in the consumer.**
+**generic mechanism goes in carbon; domain and policy stay in the consumer.**
 
 ## Where the requirements came from
 
-Three real consumers already import gemma and each hand-built the same generic
+Three real consumers already import carbon and each hand-built the same generic
 scaffolding. That reinvention is the specification.
 
-| Consumer hand-built this | Because gemma lacks | Requirement |
+| Consumer hand-built this | Because carbon lacks | Requirement |
 |---|---|---|
 | a result object over `send`; reads `turns` and `approvals` per run | a structured run result | T1.1 |
 | JSON pulled out of prose in three places | schema-constrained output | T1.2 |
@@ -51,7 +51,7 @@ Six of these are additive. Only T1.3 changes how the loop decides.
   bounds (derived from the frozen dataclass and its validation, so it cannot
   drift), and keep `load_config` a stable public door. Lets an external editor
   mutate the surface without hardcoding it.
-- **T1.7 A curated `gemma` package.** A thin `gemma/__init__` re-exporting
+- **T1.7 A curated `carbon` package.** A thin `carbon/__init__` re-exporting
   exactly the SDK surface, versioned with semantic versions. Internal module
   paths keep working, so migration is opt-in.
 
@@ -77,11 +77,11 @@ Six of these are additive. Only T1.3 changes how the loop decides.
 - OpenAI-compatible providers only. The right coverage for LM Studio, Ollama, and OpenRouter.
 - Shallow cost accounting. Local inference is free.
 
-## What must never migrate into gemma
+## What must never migrate into carbon
 
 A consumer's tool taxonomy and database guards, a judge's criteria, checkpoint
 weights, eval integrity rules, and any propose-and-validate or release workflow.
-These are domain and policy. gemma provides the seams they hang on, nothing more.
+These are domain and policy. carbon provides the seams they hang on, nothing more.
 
 ## Suggested first slice
 

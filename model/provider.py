@@ -53,7 +53,7 @@ def load_env(root: str | Path = ".") -> None:
     """Minimal .env loader (no dependency). Real env vars always win.
 
     ``root`` is the directory holding ``.env``. It defaults to the process cwd, but
-    a consumer running from elsewhere (an eval suite, a tuner) passes the gemma
+    a consumer running from elsewhere (an eval suite, a tuner) passes the carbon
     checkout root so it reads the same file the harness's own gates read, instead
     of reimplementing dotenv (the embedding seam, see dev-notes/adr/0002).
     """

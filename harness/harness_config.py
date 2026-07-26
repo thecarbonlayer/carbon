@@ -136,7 +136,7 @@ def config_schema() -> list[dict]:
     Derived from the same tables ``load_config`` validates against, so it cannot
     drift from the door. An external editor reads this to know which knobs exist,
     their types, which are collections, and which must stay positive — instead of
-    hardcoding that knowledge (the mechanism gemma owns; which knob to turn stays
+    hardcoding that knowledge (the mechanism carbon owns; which knob to turn stays
     the editor's, see dev-notes/adr/0002).
     """
     out: list[dict] = []
