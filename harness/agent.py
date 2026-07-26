@@ -32,14 +32,14 @@ from harness.compaction import compact, estimate_tokens
 from harness.context import deliver
 from harness.harness_config import CONFIG
 from harness.instructions import load_agents_md, test_command
-from harness.limits import clamp
+from harness.limits import truncate
 from harness.memory import DEFAULT_DIR, load_session, load_trace, save_session, save_trace
 from harness.observability import Tracer
 from harness.policy import Policy
 from harness.result import RunResult, ToolCall
 from harness.skills import Skill, skills_prompt
 from harness.tools import ToolRegistry
-from model import OnDelta, Provider, chat
+from model import LLMResponse, OnDelta, Provider, chat
 
 # Behavioral knobs live in the editable surface (harness/harness_config.json);
 # these names are pure re-exports so existing imports keep working.
@@ -71,8 +71,8 @@ class Agent:
         verify_attempts: int = CONFIG.verify_attempts,
         require_run: bool = CONFIG.require_run,
         tracer: Tracer | None = None,
-        temperature: float = 0.0,
-        max_tokens: int = 1024,
+        temperature: float = CONFIG.temperature,
+        max_tokens: int = CONFIG.max_tokens,
         response_format: dict | None = None,
         policy: Policy | None = None,
     ) -> None:
@@ -97,6 +97,7 @@ class Agent:
         self._turn_model_calls = 0
         self._turn_approvals = 0
         self._stop_reason = "stop"
+        self.retry_count = 0
         self.context_limit = context_limit
         # v0.3: per-instance override of the module-global tool-step budget
         # (MAX_TOOL_STEPS). None (the default) preserves today's behavior exactly —
@@ -114,6 +115,8 @@ class Agent:
         # Set true whenever the last turn triggered compaction — the REPL reads
         # this to surface that the window was managed (a demoable, visible event).
         self.just_compacted = False
+        self.compaction_count = 0
+        self._active_turn_start = 0
         self.verify_attempts = verify_attempts
         # ch-12: when a turn changes code, refuse "done" until a real passing run
         # of the project's declared test command is observed. require_run opts out.
@@ -149,10 +152,15 @@ class Agent:
         # ch-08: prefer the model's reported usage; fall back to an estimate on turn one.
         self.just_compacted = False
         window = self._last_tokens or estimate_tokens(self.messages)
-        if window > self.context_limit:
-            self.messages = compact(self.messages, model=self.model, provider=self.provider)
+        trigger = int(self.context_limit * CONFIG.compaction.trigger_fraction)
+        if window > trigger:
+            managed = compact(self.messages, model=self.model, provider=self.provider)
+            if managed is self.messages:
+                return
+            self.messages = managed
             self._last_tokens = 0  # recomputed from the next response
             self.just_compacted = True
+            self.compaction_count += 1
 
     def _system_text(self) -> str:
         """Instruction layer = system prompt + project AGENTS.md + skills menu."""
@@ -197,8 +205,10 @@ class Agent:
             self.messages.append({"role": "user", "content": f"Context file:\n{block}"})
         self.messages.append({"role": "user", "content": user_text})
         turn_start = len(self.messages)
+        self._active_turn_start = turn_start
         self._emit({"type": "turn_start"})
         reply = self._run(on_delta)
+        turn_start = self._active_turn_start
         # gate "done" on a real test run (re-prompt runs stream too)
         reply = self._enforce_run(reply, turn_start, on_delta)
         self._save()  # durable state: persist after every turn
@@ -293,6 +303,7 @@ class Agent:
                 }
             )
             reply = self._run(on_delta)
+            turn_start = self._active_turn_start
         # The last re-prompt's run hasn't been checked yet — check it, then fail closed.
         if self._record_pass(command, turn_start):
             return reply
@@ -377,19 +388,7 @@ class Agent:
             self.max_tool_steps if self.max_tool_steps is not None else MAX_TOOL_STEPS
         )
         for _ in range(tool_step_budget):
-            t0 = time.perf_counter()
-            payload = self._payload()
-            resp = chat(
-                payload,
-                model=self.model,
-                tools=specs,
-                temperature=self.temperature,
-                max_tokens=self.max_tokens,
-                response_format=self.response_format,
-                provider=self.provider,
-                on_delta=on_delta,
-            )
-            self._turn_model_calls += 1
+            resp, payload, t0 = self._model_call_with_recovery(specs, on_delta)
             self._last_tokens = int(resp.usage.get("total_tokens", 0)) or self._last_tokens
             if self.tracer:
                 self.tracer.record_llm(
@@ -402,6 +401,22 @@ class Agent:
                     tool_definitions=specs,  # the same list already sent to chat()
                 )
             if resp.tool_calls and self.tools is not None:
+                if resp.finish_reason == "length":
+                    # A cut-off JSON argument can still look like a tool call to a
+                    # forgiving provider. Never execute actions from an incomplete
+                    # response; surface an explicit, diagnosable stop instead.
+                    self.messages.append(
+                        {
+                            "role": "assistant",
+                            "content": (
+                                (resp.content or "")
+                                + "\n[response truncated before tool calls completed; "
+                                "no tool call was executed]"
+                            ),
+                        }
+                    )
+                    self._stop_reason = "incomplete_response"
+                    return "error: model response was truncated; no tool calls were executed"
                 self.messages.append(
                     {
                         "role": "assistant",
@@ -436,19 +451,136 @@ class Agent:
                             "is_error": status == "error",
                         }
                     )
-                    # Truncate at the tool's own budget if it declares one, else the
-                    # global door clamp (CONFIG.max_item_chars).
+                    # Keep the selected, Carbon-owned strategy fixed while a tool may
+                    # ask for a smaller budget. The strategy itself is an editable,
+                    # bounded choice; arbitrary truncation code is not.
                     tool = self.tools.get(name)
                     budget = tool.max_result_chars if tool and tool.max_result_chars else None
-                    content = clamp(result, budget) if budget else clamp(result)
+                    hint = None
+                    if name == "read_file":
+                        hint = "Use start_line/end_line to request the missing range."
+                    content = truncate(
+                        result,
+                        CONFIG.tool_output,
+                        budget=budget,
+                        continuation_hint=hint,
+                    )
                     self.messages.append(
                         {"role": "tool", "tool_call_id": tc.get("id", ""), "content": content}
                     )
                 continue
+            if resp.finish_reason == "length":
+                partial = resp.content or ""
+                self.messages.append(
+                    {
+                        "role": "assistant",
+                        "content": partial + "\n[response truncated before completion]",
+                    }
+                )
+                self._stop_reason = "incomplete_response"
+                return (
+                    f"{partial}\n\n"
+                    "[incomplete: the model reached its output limit before finishing]"
+                )
             self.messages.append({"role": "assistant", "content": resp.content})
             return resp.content
         self._stop_reason = "tool_budget"
         return "error: exceeded tool-step budget"
+
+    @staticmethod
+    def _context_overflow(exc: Exception) -> bool:
+        text = str(exc).lower()
+        return any(
+            marker in text
+            for marker in (
+                "context length",
+                "context window",
+                "maximum context",
+                "too many tokens",
+                "token limit",
+            )
+        )
+
+    @staticmethod
+    def _transient_error(exc: Exception) -> bool:
+        text = str(exc).lower()
+        return any(
+            marker in text
+            for marker in (
+                "429",
+                "rate limit",
+                "timeout",
+                "timed out",
+                "temporarily unavailable",
+                "connection reset",
+                "connection refused",
+                "502",
+                "503",
+                "504",
+            )
+        )
+
+    def _compact_active_history(self) -> bool:
+        """Compact before this turn while preserving turn-relative gate indices."""
+        prefix = self.messages[: self._active_turn_start]
+        current_turn = self.messages[self._active_turn_start :]
+        managed = compact(prefix, model=self.model, provider=self.provider)
+        if managed is prefix:
+            return False
+        self.messages = managed + current_turn
+        self._active_turn_start = len(managed)
+        self._last_tokens = 0
+        self.just_compacted = True
+        self.compaction_count += 1
+        return True
+
+    def _model_call_with_recovery(
+        self, specs: list[dict] | None, on_delta: OnDelta | None
+    ) -> tuple[LLMResponse, list[dict], float]:
+        """Call the model with one forced overflow recovery and bounded retries."""
+        policy = CONFIG.retry
+        attempt = 0
+        overflow_recovered = False
+        while True:
+            attempt += 1
+            payload = self._payload()
+            t0 = time.perf_counter()
+            try:
+                response = chat(
+                    payload,
+                    model=self.model,
+                    tools=specs,
+                    temperature=self.temperature,
+                    max_tokens=self.max_tokens,
+                    response_format=self.response_format,
+                    provider=self.provider,
+                    on_delta=on_delta,
+                )
+                # Count completed calls only. `turns` is evidence the improvement
+                # loop reads; a flaky endpoint must not read as a chattier agent.
+                # Recovery attempts are their own signal — see `retry_count`.
+                self._turn_model_calls += 1
+                return response, payload, t0
+            except Exception as exc:
+                if (
+                    not overflow_recovered
+                    and self._context_overflow(exc)
+                    and self._compact_active_history()
+                ):
+                    overflow_recovered = True
+                    self.retry_count += 1
+                    continue
+                can_retry = (
+                    policy.strategy == "backoff"
+                    and self._transient_error(exc)
+                    and attempt < policy.max_attempts
+                )
+                if not can_retry:
+                    raise
+                self.retry_count += 1
+                delay = policy.base_delay_ms * (2 ** (attempt - 1)) / 1000
+                if delay:
+                    time.sleep(delay)
 
 
 # --- non-interactive print mode ---------------------------------------------
@@ -468,14 +600,21 @@ def _coding_tools(workspace, *, exclude_session: str | None) -> ToolRegistry:
     from harness.tools import default_tools, read_file_tool
     from harness.workspace import edit_file_tool, write_file_tool
 
-    tools = default_tools()
-    tools.register(read_file_tool(str(workspace.root)))
-    tools.register(write_file_tool(workspace))
-    tools.register(edit_file_tool(workspace))
-    tools.register(bash_tool(Sandbox(trusted=True, timeout=120), workdir=str(workspace.root)))
-    tools.register(search_memory_tool(exclude=exclude_session))
-    tools.register(delegate_tool())
-    tools.register(fan_out_tool())
+    def workspace_tools() -> ToolRegistry:
+        registry = default_tools()
+        registry.register(read_file_tool(str(workspace.root)))
+        registry.register(write_file_tool(workspace))
+        registry.register(edit_file_tool(workspace))
+        registry.register(
+            bash_tool(Sandbox(trusted=True, timeout=120), workdir=str(workspace.root))
+        )
+        registry.register(search_memory_tool(exclude=exclude_session))
+        return registry
+
+    tools = workspace_tools()
+    workers = workspace_tools()
+    tools.register(delegate_tool(tools=workers, agents_dir=str(workspace.root)))
+    tools.register(fan_out_tool(tools=workers, agents_dir=str(workspace.root)))
     return tools
 
 

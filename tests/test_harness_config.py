@@ -15,7 +15,16 @@ from pathlib import Path
 
 import pytest
 
-from harness.harness_config import CONFIG, CONFIG_PATH, HarnessConfig, load_config
+from harness.harness_config import (
+    CONFIG,
+    CONFIG_PATH,
+    CompactionPolicy,
+    HarnessConfig,
+    RetryPolicy,
+    TruncationPolicy,
+    load_config,
+    surface_manifest,
+)
 
 
 def _valid_raw() -> dict:
@@ -38,9 +47,15 @@ def test_config_loads_and_is_typed():
     assert isinstance(CONFIG.verify_attempts, int)
     assert isinstance(CONFIG.require_run, bool)
     assert isinstance(CONFIG.max_item_chars, int)
+    assert isinstance(CONFIG.file_injection, TruncationPolicy)
+    assert isinstance(CONFIG.tool_output, TruncationPolicy)
+    assert isinstance(CONFIG.compaction, CompactionPolicy)
+    assert isinstance(CONFIG.retry, RetryPolicy)
     assert isinstance(CONFIG.compaction_prompt, str)
     assert isinstance(CONFIG.memory_search_limit, int)
     assert isinstance(CONFIG.attach_pattern, str)
+    assert isinstance(CONFIG.temperature, float)
+    assert isinstance(CONFIG.max_tokens, int)
 
 
 def test_set_fields_are_frozensets_of_str():
@@ -118,6 +133,27 @@ def test_non_string_in_set_field_is_rejected(tmp_path):
         load_config(_write(tmp_path, raw))
 
 
+def test_unknown_strategy_is_rejected(tmp_path):
+    raw = _valid_raw()
+    raw["tool_output"]["strategy"] = "run_whatever_code_refinery_sent"
+    with pytest.raises(ValueError, match="strategy must be one of"):
+        load_config(_write(tmp_path, raw))
+
+
+def test_invalid_strategy_parameter_is_rejected(tmp_path):
+    raw = _valid_raw()
+    raw["compaction"]["trigger_fraction"] = 1.5
+    with pytest.raises(ValueError, match="trigger_fraction"):
+        load_config(_write(tmp_path, raw))
+
+
+def test_retry_attempts_are_hard_bounded(tmp_path):
+    raw = _valid_raw()
+    raw["retry"]["max_attempts"] = 6
+    with pytest.raises(ValueError, match="from 1 to 5"):
+        load_config(_write(tmp_path, raw))
+
+
 def test_non_object_document_is_rejected(tmp_path):
     p = tmp_path / "harness_config.json"
     p.write_text(json.dumps([1, 2, 3]))
@@ -142,6 +178,22 @@ def test_reexports_equal_config_values():
     assert context._ATTACH.pattern == CONFIG.attach_pattern
 
 
+def test_surface_manifest_separates_choices_from_invariants():
+    manifest = surface_manifest()
+    editable = {item["name"]: item for item in manifest["editable"]}
+    locked = {item["name"]: item for item in manifest["locked_fields"]}
+    immutable = {item["name"] for item in manifest["immutable"]}
+    assert editable["tool_output"]["strategies"] == ["head_tail", "keep_head"]
+    assert locked["version"]["editable"] is False
+    assert "verification integrity" in locked["require_run"]["locked_reason"]
+    assert {
+        "tool_argument_validation",
+        "unique_atomic_edits",
+        "verification_integrity",
+        "workspace_and_secret_boundaries",
+    } <= immutable
+
+
 def test_ctor_defaults_come_from_config():
     from harness.agent import Agent
 
@@ -149,6 +201,8 @@ def test_ctor_defaults_come_from_config():
     assert a.context_limit == CONFIG.default_context_limit
     assert a.verify_attempts == CONFIG.verify_attempts
     assert a.require_run == CONFIG.require_run
+    assert a.max_tokens == CONFIG.max_tokens
+    assert a.temperature == CONFIG.temperature
 
 
 def test_tui_approval_tools_read_the_config():

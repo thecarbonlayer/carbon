@@ -44,6 +44,35 @@ CONFIG_PATH = Path(__file__).with_name("harness_config.json")
 
 
 @dataclass(frozen=True)
+class TruncationPolicy:
+    """A bounded, Carbon-implemented strategy for one information door."""
+
+    strategy: str
+    budget: int
+    tail_fraction: float
+
+
+@dataclass(frozen=True)
+class CompactionPolicy:
+    """When and how conversation history is compacted."""
+
+    strategy: str
+    keep_head: int
+    keep_tail: int
+    trigger_fraction: float
+    summary_max_tokens: int
+
+
+@dataclass(frozen=True)
+class RetryPolicy:
+    """Bounded recovery for transient provider failures."""
+
+    strategy: str
+    max_attempts: int
+    base_delay_ms: int
+
+
+@dataclass(frozen=True)
 class HarnessConfig:
     """The harness's behavioral knobs, loaded from ``harness_config.json``."""
 
@@ -56,9 +85,15 @@ class HarnessConfig:
     verify_attempts: int  # re-prompts before the gate marks a turn unverified
     require_run: bool  # enforce an observed passing test run after code changes
     max_item_chars: int  # per-item clamp applied at the door (limits.py)
+    file_injection: TruncationPolicy  # policy for @path context blocks
+    tool_output: TruncationPolicy  # policy for tool results entering history
+    compaction: CompactionPolicy  # strategy, shape, trigger, and summary budget
+    retry: RetryPolicy  # transient provider retry strategy and hard bound
     compaction_prompt: str  # the summarizer's instructions (compaction.py)
     memory_search_limit: int  # max hits returned by cross-session recall
     attach_pattern: str  # regex (as a string) for @path references; compiled in context.py
+    temperature: float  # default sampling temperature
+    max_tokens: int  # default completion budget
 
 
 # name -> expected JSON type; list-typed fields are validated as arrays of
@@ -73,9 +108,15 @@ _SCHEMA: dict[str, type] = {
     "verify_attempts": int,
     "require_run": bool,
     "max_item_chars": int,
+    "file_injection": dict,
+    "tool_output": dict,
+    "compaction": dict,
+    "retry": dict,
     "compaction_prompt": str,
     "memory_search_limit": int,
     "attach_pattern": str,
+    "temperature": float,
+    "max_tokens": int,
 }
 _SET_FIELDS = {"approval_tools", "code_extensions"}
 # integer knobs that are counts/budgets — zero or negative would wedge the loop
@@ -85,7 +126,55 @@ _POSITIVE_INT_FIELDS = {
     "verify_attempts",
     "max_item_chars",
     "memory_search_limit",
+    "max_tokens",
 }
+
+_TRUNCATION_STRATEGIES = frozenset({"keep_head", "head_tail"})
+_COMPACTION_STRATEGIES = frozenset({"summarize_middle", "structured_checkpoint"})
+_RETRY_STRATEGIES = frozenset({"fail_fast", "backoff"})
+
+# These are correctness and trust properties, not optimization choices. They
+# are published beside the editable schema so an external improver can avoid
+# wasting proposals on behavior it is intentionally forbidden to weaken.
+_IMMUTABLE_INVARIANTS = (
+    {
+        "name": "tool_argument_validation",
+        "reason": "Malformed or incomplete tool calls must never execute.",
+    },
+    {
+        "name": "unique_atomic_edits",
+        "reason": "An edit must match exactly once and report the resulting diff.",
+    },
+    {
+        "name": "workspace_and_secret_boundaries",
+        "reason": "No strategy may expand file access or weaken secret-file refusal.",
+    },
+    {
+        "name": "subagent_workspace_identity",
+        "reason": "Delegated workers must use the workspace explicitly bound by the parent.",
+    },
+    {
+        "name": "verification_integrity",
+        "reason": "Fresh real test receipts and fail-closed verification are not editable.",
+    },
+    {
+        "name": "strategy_registry_and_config_validation",
+        "reason": (
+            "Refinery may select vetted strategies; it may not install executable code hooks."
+        ),
+    },
+)
+_NON_EDITABLE_FIELDS = frozenset(
+    {
+        "version",
+        "approval_tools",
+        "code_extensions",
+        "require_run",
+        "attach_pattern",
+        "max_item_chars",
+        "memory_search_limit",
+    }
+)
 
 
 def _short(value: object) -> str:
@@ -103,6 +192,10 @@ def _check_field(key: str, value: object, expected: type) -> None:
     that compiles with a capture group — well-formedness checks, not value pins."""
     if expected is int:
         ok = isinstance(value, int) and not isinstance(value, bool)
+    elif expected is float:
+        # JSON has one number type: an improver proposing `1` means 1.0, and
+        # bouncing it on a type technicality wastes a legitimate proposal.
+        ok = isinstance(value, int | float) and not isinstance(value, bool)
     elif expected is list:
         ok = isinstance(value, list) and all(isinstance(x, str) for x in value)
     else:
@@ -128,6 +221,98 @@ def _check_field(key: str, value: object, expected: type) -> None:
                 f"harness config: field {key!r} must have at least one capture group "
                 f"(the use site extracts the path via group(1)), got {_short(value)}"
             )
+    if key == "temperature" and not 0 <= float(value) <= 2:  # type: ignore[arg-type]
+        raise ValueError(
+            f"harness config: field {key!r} must be a number from 0 to 2, got {_short(value)}"
+        )
+
+
+def _object_keys(name: str, value: dict, expected: set[str]) -> None:
+    unknown = sorted(set(value) - expected)
+    missing = sorted(expected - set(value))
+    if unknown or missing:
+        raise ValueError(
+            f"harness config: field {name!r} has "
+            f"unknown keys {unknown or 'none'} and missing keys {missing or 'none'}"
+        )
+
+
+def _truncation_policy(name: str, value: dict) -> TruncationPolicy:
+    _object_keys(name, value, {"strategy", "budget", "tail_fraction"})
+    strategy = value["strategy"]
+    budget = value["budget"]
+    tail_fraction = value["tail_fraction"]
+    if strategy not in _TRUNCATION_STRATEGIES:
+        raise ValueError(
+            f"harness config: field {name!r} strategy must be one of "
+            f"{sorted(_TRUNCATION_STRATEGIES)}, got {_short(strategy)}"
+        )
+    if not isinstance(budget, int) or isinstance(budget, bool) or budget <= 0:
+        raise ValueError(f"harness config: field {name!r}.budget must be a positive integer")
+    if (
+        not isinstance(tail_fraction, int | float)
+        or isinstance(tail_fraction, bool)
+        or not 0 < float(tail_fraction) < 1
+    ):
+        raise ValueError(f"harness config: field {name!r}.tail_fraction must be between 0 and 1")
+    return TruncationPolicy(strategy, budget, float(tail_fraction))
+
+
+def _compaction_policy(value: dict) -> CompactionPolicy:
+    name = "compaction"
+    _object_keys(
+        name,
+        value,
+        {"strategy", "keep_head", "keep_tail", "trigger_fraction", "summary_max_tokens"},
+    )
+    strategy = value["strategy"]
+    if strategy not in _COMPACTION_STRATEGIES:
+        raise ValueError(
+            f"harness config: field {name!r} strategy must be one of "
+            f"{sorted(_COMPACTION_STRATEGIES)}, got {_short(strategy)}"
+        )
+    for key in ("keep_head", "keep_tail", "summary_max_tokens"):
+        item = value[key]
+        if not isinstance(item, int) or isinstance(item, bool) or item <= 0:
+            raise ValueError(f"harness config: field {name!r}.{key} must be a positive integer")
+    fraction = value["trigger_fraction"]
+    if (
+        not isinstance(fraction, int | float)
+        or isinstance(fraction, bool)
+        or not 0 < float(fraction) <= 1
+    ):
+        raise ValueError(
+            f"harness config: field {name!r}.trigger_fraction must be greater than 0 and at most 1"
+        )
+    return CompactionPolicy(
+        strategy,
+        value["keep_head"],
+        value["keep_tail"],
+        float(fraction),
+        value["summary_max_tokens"],
+    )
+
+
+def _retry_policy(value: dict) -> RetryPolicy:
+    name = "retry"
+    _object_keys(name, value, {"strategy", "max_attempts", "base_delay_ms"})
+    strategy = value["strategy"]
+    if strategy not in _RETRY_STRATEGIES:
+        raise ValueError(
+            f"harness config: field {name!r} strategy must be one of "
+            f"{sorted(_RETRY_STRATEGIES)}, got {_short(strategy)}"
+        )
+    attempts = value["max_attempts"]
+    if not isinstance(attempts, int) or isinstance(attempts, bool) or not 1 <= attempts <= 5:
+        raise ValueError(
+            f"harness config: field {name!r}.max_attempts must be an integer from 1 to 5"
+        )
+    delay = value["base_delay_ms"]
+    if not isinstance(delay, int) or isinstance(delay, bool) or not 0 <= delay <= 10_000:
+        raise ValueError(
+            f"harness config: field {name!r}.base_delay_ms must be an integer from 0 to 10000"
+        )
+    return RetryPolicy(strategy, attempts, delay)
 
 
 def config_schema() -> list[dict]:
@@ -141,15 +326,56 @@ def config_schema() -> list[dict]:
     """
     out: list[dict] = []
     for name, typ in _SCHEMA.items():
-        out.append(
-            {
-                "name": name,
-                "type": "list[str]" if typ is list else typ.__name__,
-                "collection": name in _SET_FIELDS,
-                "positive_int": name in _POSITIVE_INT_FIELDS,
+        item = {
+            "name": name,
+            "type": "list[str]" if typ is list else typ.__name__,
+            "collection": name in _SET_FIELDS,
+            "positive_int": name in _POSITIVE_INT_FIELDS,
+            "editable": name not in _NON_EDITABLE_FIELDS,
+        }
+        if name == "max_item_chars":
+            item["deprecated"] = (
+                "Compatibility re-export only; use file_injection.budget or "
+                "tool_output.budget through their policy objects."
+            )
+        elif name in {"approval_tools", "code_extensions", "require_run"}:
+            item["locked_reason"] = "Part of permission or verification integrity."
+        elif name == "attach_pattern":
+            item["locked_reason"] = "Context-delivery parser contract, not an optimization knob."
+        elif name == "memory_search_limit":
+            item["locked_reason"] = "Locked until Refinery has memory-recall miners and guards."
+        if name in {"file_injection", "tool_output"}:
+            item["strategies"] = sorted(_TRUNCATION_STRATEGIES)
+            item["parameters"] = {
+                "budget": {"type": "int", "positive": True},
+                "tail_fraction": {"type": "float", "exclusive_min": 0, "exclusive_max": 1},
             }
-        )
+        elif name == "compaction":
+            item["strategies"] = sorted(_COMPACTION_STRATEGIES)
+            item["parameters"] = {
+                "keep_head": {"type": "int", "positive": True},
+                "keep_tail": {"type": "int", "positive": True},
+                "trigger_fraction": {"type": "float", "exclusive_min": 0, "max": 1},
+                "summary_max_tokens": {"type": "int", "positive": True},
+            }
+        elif name == "retry":
+            item["strategies"] = sorted(_RETRY_STRATEGIES)
+            item["parameters"] = {
+                "max_attempts": {"type": "int", "min": 1, "max": 5},
+                "base_delay_ms": {"type": "int", "min": 0, "max": 10_000},
+            }
+        out.append(item)
     return out
+
+
+def surface_manifest() -> dict:
+    """Machine-readable editable choices and permanent non-editable invariants."""
+    fields = config_schema()
+    return {
+        "editable": [item for item in fields if item["editable"]],
+        "locked_fields": [item for item in fields if not item["editable"]],
+        "immutable": [dict(item) for item in _IMMUTABLE_INVARIANTS],
+    }
 
 
 def load_config(path: str | Path = CONFIG_PATH) -> HarnessConfig:
@@ -171,7 +397,18 @@ def load_config(path: str | Path = CONFIG_PATH) -> HarnessConfig:
     kwargs: dict[str, Any] = {}
     for key, expected in _SCHEMA.items():
         _check_field(key, raw[key], expected)
-        kwargs[key] = frozenset(raw[key]) if key in _SET_FIELDS else raw[key]
+        if key in _SET_FIELDS:
+            kwargs[key] = frozenset(raw[key])
+        elif key in {"file_injection", "tool_output"}:
+            kwargs[key] = _truncation_policy(key, raw[key])
+        elif key == "compaction":
+            kwargs[key] = _compaction_policy(raw[key])
+        elif key == "retry":
+            kwargs[key] = _retry_policy(raw[key])
+        elif expected is float:
+            kwargs[key] = float(raw[key])  # a JSON `1` is a valid temperature
+        else:
+            kwargs[key] = raw[key]
     return HarnessConfig(**kwargs)
 
 

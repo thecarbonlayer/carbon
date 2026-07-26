@@ -59,7 +59,12 @@ def _is_secret_file(p: Path) -> bool:
     )
 
 
-def read_file(path: str, root: str | Path | None = None) -> str:
+def read_file(
+    path: str,
+    root: str | Path | None = None,
+    start_line: int | None = None,
+    end_line: int | None = None,
+) -> str:
     """Return a file's contents — confined to a root (ch-08 hardening).
 
     The model-invoked tool must not wander the host filesystem (no /etc/passwd) and
@@ -73,7 +78,33 @@ def read_file(path: str, root: str | Path | None = None) -> str:
         return f"error: path outside workspace: {path}"
     if _is_secret_file(p):
         return f"error: refusing to read secret file: {path}"
-    return p.read_text() if p.is_file() else f"error: no such file: {path}"
+    if not p.is_file():
+        return f"error: no such file: {path}"
+    body = p.read_text()
+    if start_line is None and end_line is None:
+        return body
+    lines = body.splitlines(keepends=True)
+    total = len(lines)
+    first = start_line if start_line is not None else 1
+    # Judge the range the model actually asked for before clamping it against the
+    # file's length — deriving `last` from `total` first turns a valid start_line=1
+    # on an empty file into a bogus "1 <= start_line <= end_line" complaint.
+    if first < 1 or (end_line is not None and end_line < first):
+        return "error: read_file line range must satisfy 1 <= start_line <= end_line"
+    if not total:
+        return f"[{path}: empty file]"
+    if first > total:
+        return f"error: start_line {first} is past end of file ({total} lines)"
+    last = end_line if end_line is not None else min(total, first + 199)
+    selected = "".join(lines[first - 1 : last])
+    shown_last = min(last, total)
+    marker = f"[{path}: lines {first}-{shown_last} of {total}]"
+    if shown_last < total:
+        marker += (
+            f"\n[continue with read_file(path={path!r}, "
+            f"start_line={shown_last + 1}, end_line={min(total, shown_last + 200)})]"
+        )
+    return f"{marker}\n{selected}"
 
 
 @dataclass
@@ -138,6 +169,9 @@ class ToolRegistry:
             args = json.loads(arguments) if arguments else {}
         except json.JSONDecodeError:
             return f"error: could not parse arguments {arguments!r}"
+        problem = _validate_arguments(args, tool.parameters)
+        if problem:
+            return f"error: invalid arguments for {name}: {problem}"
         try:
             return str(tool.func(**args))
         except Exception as exc:  # noqa: BLE001 — tool errors are fed back to the model
@@ -147,22 +181,78 @@ class ToolRegistry:
         return len(self._tools)
 
 
+def _matches_type(value: object, expected: str) -> bool:
+    if expected == "string":
+        return isinstance(value, str)
+    if expected == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if expected == "number":
+        return isinstance(value, int | float) and not isinstance(value, bool)
+    if expected == "boolean":
+        return isinstance(value, bool)
+    if expected == "array":
+        return isinstance(value, list)
+    if expected == "object":
+        return isinstance(value, dict)
+    return True
+
+
+def _validate_arguments(arguments: object, schema: dict) -> str | None:
+    """Small JSON-schema door for the subset Carbon tool contracts use."""
+    if not isinstance(arguments, dict):
+        return "top-level arguments must be an object"
+    required = schema.get("required") or []
+    missing = [name for name in required if name not in arguments]
+    if missing:
+        return f"missing required fields {missing}"
+    properties = schema.get("properties") or {}
+    if schema.get("additionalProperties") is False:
+        unknown = sorted(set(arguments) - set(properties))
+        if unknown:
+            return f"unknown fields {unknown}"
+    for name, value in arguments.items():
+        rule = properties.get(name)
+        if not isinstance(rule, dict):
+            continue
+        expected = rule.get("type")
+        if isinstance(expected, str) and not _matches_type(value, expected):
+            return f"field {name!r} must be {expected}"
+        if "enum" in rule and value not in rule["enum"]:
+            return f"field {name!r} must be one of {rule['enum']!r}"
+        if expected == "array" and isinstance(value, list) and isinstance(rule.get("items"), dict):
+            item_type = rule["items"].get("type")
+            if isinstance(item_type, str) and any(
+                not _matches_type(item, item_type) for item in value
+            ):
+                return f"every item in field {name!r} must be {item_type}"
+    return None
+
+
 def read_file_tool(root: str | Path | None = None) -> Tool:
     """A ``read_file`` tool confined to ``root`` (defaults to the process cwd).
 
     The mature agent binds this to its workspace so the model reads the same tree
     it writes to — and never the host cwd (where ``.env`` lives)."""
 
-    def _read(path: str) -> str:
-        return read_file(path, root=root)
+    def _read(path: str, start_line: int | None = None, end_line: int | None = None) -> str:
+        return read_file(path, root=root, start_line=start_line, end_line=end_line)
 
     return Tool(
         name="read_file",
-        description="Read a UTF-8 text file from disk and return its contents.",
+        description=(
+            "Read a UTF-8 workspace file. For large files, use 1-based start_line/end_line "
+            "ranges and follow the continuation hint instead of repeatedly requesting the "
+            "whole file."
+        ),
         parameters={
             "type": "object",
-            "properties": {"path": {"type": "string"}},
+            "properties": {
+                "path": {"type": "string"},
+                "start_line": {"type": "integer"},
+                "end_line": {"type": "integer"},
+            },
             "required": ["path"],
+            "additionalProperties": False,
         },
         func=_read,
     )

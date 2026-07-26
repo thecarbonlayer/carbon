@@ -16,7 +16,7 @@ import re
 from pathlib import Path
 
 from harness.harness_config import CONFIG
-from harness.limits import clamp
+from harness.limits import truncate
 
 # the pattern travels as a string in the editable surface; compiled here, at the use site
 _ATTACH = re.compile(CONFIG.attach_pattern)
@@ -36,5 +36,11 @@ def deliver(user_text: str) -> list[str]:
             except (OSError, UnicodeDecodeError):
                 # Unreadable or binary (`@image.png`) — skip it, don't crash the turn.
                 continue
-            blocks.append(clamp(f"--- {path} ---\n{body}"))
+            blocks.append(
+                truncate(
+                    f"--- {path} ---\n{body}",
+                    CONFIG.file_injection,
+                    continuation_hint="Reference a smaller file or use read_file ranges.",
+                )
+            )
     return blocks

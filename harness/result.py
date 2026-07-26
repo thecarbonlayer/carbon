@@ -45,7 +45,7 @@ class RunResult:
     tool_calls: list[ToolCall] = field(default_factory=list)
     turns: int = 0  # model calls this turn, including verify re-prompts
     approvals: int = 0  # gated tool calls that were approved and ran
-    stop_reason: str = "stop"  # "stop" | "tool_budget"
+    stop_reason: str = "stop"  # "stop" | "tool_budget" | "incomplete_response"
     totals: dict = field(default_factory=dict)
 
     def __str__(self) -> str:

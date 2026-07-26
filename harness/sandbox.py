@@ -43,7 +43,15 @@ _MAX_OUTPUT = 100_000  # cap returned output so a chatty command can't flood the
 
 def _cap(s: str | None) -> str:
     s = s or ""
-    return s if len(s) <= _MAX_OUTPUT else s[:_MAX_OUTPUT] + "\n...[output truncated]"
+    if len(s) <= _MAX_OUTPUT:
+        return s
+    # The subprocess safety cap is larger than the prompt door, but it must use
+    # the same selected retention policy or a prefix-only cap here would destroy
+    # the failure tail before Agent can preserve it.
+    from harness.harness_config import CONFIG
+    from harness.limits import truncate
+
+    return truncate(s, CONFIG.tool_output, budget=_MAX_OUTPUT)
 
 
 def _kill_group(proc: subprocess.Popen) -> None:

@@ -16,7 +16,16 @@ chapters. See dev-notes/adr/0001 (why this evolves on its own axis) and 0002
 from __future__ import annotations
 
 from harness.agent import Agent, run_once
-from harness.harness_config import CONFIG, HarnessConfig, config_schema, load_config
+from harness.harness_config import (
+    CONFIG,
+    CompactionPolicy,
+    HarnessConfig,
+    RetryPolicy,
+    TruncationPolicy,
+    config_schema,
+    load_config,
+    surface_manifest,
+)
 from harness.observability import Tracer
 from harness.policy import DEFAULT_MUTATORS, Policy
 from harness.provenance import provenance
@@ -24,20 +33,23 @@ from harness.result import RunResult, ToolCall
 from harness.tools import Tool, ToolRegistry, default_tools
 from model import Provider, chat, fake, load_env
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 __all__ = [
     "CONFIG",
     "DEFAULT_MUTATORS",
     "Agent",
     "HarnessConfig",
+    "CompactionPolicy",
     "Policy",
     "Provider",
     "RunResult",
+    "RetryPolicy",
     "Tool",
     "ToolCall",
     "ToolRegistry",
     "Tracer",
+    "TruncationPolicy",
     "__version__",
     "chat",
     "config_schema",
@@ -47,4 +59,5 @@ __all__ = [
     "load_env",
     "provenance",
     "run_once",
+    "surface_manifest",
 ]
