@@ -6,7 +6,7 @@ verified — discarded into ``self.messages`` for a consumer to reconstruct. Rea
 consumers did exactly that reconstruction by hand. This makes it first-class.
 
 ``Agent.run`` returns a ``RunResult``; ``Agent.send`` stays returning the final
-text (``RunResult.text``), so existing callers are untouched. gemma reports what
+text (``RunResult.text``), so existing callers are untouched. carbon reports what
 happened, never what it means: the ``attributes`` bag on each tool call is left
 empty for a consumer to fill with its own taxonomy (see dev-notes/adr/0002).
 """
@@ -21,7 +21,7 @@ class ToolCall:
     """One tool invocation this turn: what the model asked, what it got back.
 
     ``attributes`` is a consumer-populated bag (a tier, a domain status, a cost);
-    gemma leaves it empty. ``is_error`` is the generic signal that the tool
+    carbon leaves it empty. ``is_error`` is the generic signal that the tool
     returned an error string.
     """
 

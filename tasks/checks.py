@@ -669,7 +669,7 @@ DEMOS["ch-11"] = _demo_ch11
 # test the model didn't write. The harness reads the command from AGENTS.md and,
 # after a code change, won't accept "done" without an observed passing run of it.
 # The command here is a deps-free python3 script so the accept is deterministic;
-# the on-camera demo points the same mechanism at a real repo (gemma: uv run verify).
+# the on-camera demo points the same mechanism at a real repo (carbon: uv run verify).
 _CH12_AGENTS_MD = "# demo project\n\n## Testing\n```\npython3 test_is_prime.py\n```\n"
 _CH12_TEST = (
     "from is_prime import is_prime\n\n"

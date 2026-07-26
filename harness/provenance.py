@@ -4,7 +4,7 @@ A consumer that measures the agent (an eval suite, a self-improving loop) needs 
 attribute a result to the harness state that produced it. Real consumers were each
 shelling out to git and reading the config version by hand. This returns the
 primitives; the consumer composes its own fingerprint on top — a verifier hash, a
-dirty-tree hash — because those are the consumer's policy, not gemma's
+dirty-tree hash — because those are the consumer's policy, not carbon's
 (dev-notes/adr/0002).
 """
 
