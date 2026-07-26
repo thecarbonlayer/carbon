@@ -69,7 +69,7 @@ def test_run_returns_structured_result_and_events():
     assert len(r.tool_calls) == 1
     tc = r.tool_calls[0]
     assert tc.name == "calculator" and tc.result == "42"
-    assert tc.is_error is False and tc.attributes == {}  # gemma leaves the bag empty
+    assert tc.is_error is False and tc.attributes == {}  # carbon leaves the bag empty
 
     kinds = [e["type"] for e in events]
     assert kinds[0] == "turn_start" and "tool_call" in kinds and kinds[-1] == "turn_end"
@@ -258,10 +258,10 @@ def test_response_format_reaches_the_http_payload(monkeypatch):
 
 
 # --- T1.7 curated façade ------------------------------------------------------
-def test_gemma_facade_exports_the_surface():
-    import gemma
+def test_carbon_facade_exports_the_surface():
+    import carbon
 
-    assert gemma.__version__ == "0.3.0"
+    assert carbon.__version__ == "0.3.0"
     for name in (
         "Agent",
         "RunResult",
@@ -277,8 +277,8 @@ def test_gemma_facade_exports_the_surface():
         "load_env",
         "Tracer",
     ):
-        assert hasattr(gemma, name), name
+        assert hasattr(carbon, name), name
     # the façade re-exports the same objects, it does not fork them
     from harness.agent import Agent as HarnessAgent
 
-    assert gemma.Agent is HarnessAgent
+    assert carbon.Agent is HarnessAgent

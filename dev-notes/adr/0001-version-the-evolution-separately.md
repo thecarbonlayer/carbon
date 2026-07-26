@@ -33,7 +33,7 @@ Track two orthogonal axes.
 
 - **Curriculum.** Frozen. Tagged `ch-00`..`ch-14`. It does not grow.
 - **Evolution.** The library surface and the editable surface, versioned with
-  semantic versions on the `gemma` package (`v0.x`), recorded in
+  semantic versions on the `carbon` package (`v0.x`), recorded in
   [CHANGELOG.md](../../CHANGELOG.md), with the configuration's own integer
   `version` field as the fine-grained counter underneath.
 

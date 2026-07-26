@@ -1,4 +1,4 @@
-# AGENTS.md — gemma
+# AGENTS.md — carbon
 
 ## Intent
 

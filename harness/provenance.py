@@ -39,6 +39,12 @@ def provenance(model: str | None = None, root: str | Path = ".") -> dict:
     ``config_version`` is the editable surface's own counter; ``gemma_sha`` is the
     checkout that produced the run (``None`` outside a git repo). A consumer layers
     its own identity (dataset, verifier version) onto this dict.
+
+    The key stays ``gemma_sha`` after the project was renamed to carbon: this is a
+    wire format, and every result record ever written carries it. Renaming it would
+    orphan the committed measurement history (refinery's results/ and iterations/),
+    which is cited evidence, not scratch data. New keys get the new name; this one
+    is frozen.
     """
     return {
         "config_version": CONFIG.version,

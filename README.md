@@ -117,7 +117,7 @@ It is an ongoing response to where the loop hits its ceiling.
 
 To keep these two rhythms honest, the repo versions them on separate axes. The
 curriculum stays frozen and tagged `ch-00` through `ch-14`. The library and
-editable surface evolve under semantic versions on the `gemma` package, recorded
+editable surface evolve under semantic versions on the `carbon` package, recorded
 in [CHANGELOG.md](CHANGELOG.md), with the configuration's own `version` field as
 the fine-grained counter underneath.
 

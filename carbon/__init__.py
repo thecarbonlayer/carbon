@@ -1,8 +1,8 @@
-"""gemma — the public SDK surface (v0.1, the embedding seam).
+"""carbon — the public SDK surface (v0.1, the embedding seam).
 
 The curriculum builds the harness one primitive per chapter across ``model/``,
 ``harness/``, and ``ui/``. This package is the curated, versioned surface external
-code builds on: ``import gemma`` gives you exactly the agent, its structured
+code builds on: ``import carbon`` gives you exactly the agent, its structured
 result, tools and their registry, the permission policy, the provider and model
 seam, the editable-config door and its schema, and provenance — and nothing else.
 
