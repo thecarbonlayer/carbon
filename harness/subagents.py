@@ -10,6 +10,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 
 from harness.tools import Tool, ToolRegistry, default_tools
+from model import Provider
 
 DEFAULT_WORKER_SYSTEM = "You are a focused worker. Do exactly the subtask and answer concisely."
 
@@ -19,27 +20,66 @@ def run_subagent(
     *,
     system: str | None = None,
     model: str | None = None,
+    provider: Provider | None = None,
     tools: ToolRegistry | None = None,
+    agents_dir: str = ".",
 ) -> str:
     from harness.agent import Agent  # lazy: avoids an import cycle at module load
 
-    sub = Agent(system=system or DEFAULT_WORKER_SYSTEM, tools=tools or default_tools(), model=model)
+    sub = Agent(
+        system=system or DEFAULT_WORKER_SYSTEM,
+        tools=tools or default_tools(),
+        model=model,
+        provider=provider,
+        agents_dir=agents_dir,
+    )
     return sub.send(task)
 
 
-def fan_out(tasks: list[str], *, model: str | None = None, max_workers: int = 4) -> list[str]:
+def fan_out(
+    tasks: list[str],
+    *,
+    model: str | None = None,
+    provider: Provider | None = None,
+    tools: ToolRegistry | None = None,
+    agents_dir: str = ".",
+    max_workers: int = 4,
+) -> list[str]:
     """Run subtasks in parallel, each in its own isolated subagent. Order preserved."""
     if not tasks:
         return []
     with ThreadPoolExecutor(max_workers=min(max_workers, len(tasks))) as pool:
-        return list(pool.map(lambda t: run_subagent(t, model=model), tasks))
+        return list(
+            pool.map(
+                lambda t: run_subagent(
+                    t,
+                    model=model,
+                    provider=provider,
+                    tools=tools,
+                    agents_dir=agents_dir,
+                ),
+                tasks,
+            )
+        )
 
 
-def delegate_tool(model: str | None = None) -> Tool:
+def delegate_tool(
+    model: str | None = None,
+    *,
+    provider: Provider | None = None,
+    tools: ToolRegistry | None = None,
+    agents_dir: str = ".",
+) -> Tool:
     """A tool that lets a main agent delegate a self-contained subtask to a subagent."""
 
     def delegate(task: str) -> str:
-        return run_subagent(task, model=model)
+        return run_subagent(
+            task,
+            model=model,
+            provider=provider,
+            tools=tools,
+            agents_dir=agents_dir,
+        )
 
     return Tool(
         name="delegate",
@@ -53,7 +93,13 @@ def delegate_tool(model: str | None = None) -> Tool:
     )
 
 
-def fan_out_tool(model: str | None = None) -> Tool:
+def fan_out_tool(
+    model: str | None = None,
+    *,
+    provider: Provider | None = None,
+    tools: ToolRegistry | None = None,
+    agents_dir: str = ".",
+) -> Tool:
     """A tool that lets the model split work into independent subtasks and run them
     in parallel, each in its own isolated subagent. Results come back labeled and
     ordered, so the model can read them as one block."""
@@ -63,7 +109,13 @@ def fan_out_tool(model: str | None = None) -> Tool:
         # would spawn one subagent per character. Require a real list of strings.
         if not isinstance(tasks, list) or not all(isinstance(t, str) for t in tasks):
             return "error: `tasks` must be a list of strings"
-        results = fan_out(tasks, model=model)
+        results = fan_out(
+            tasks,
+            model=model,
+            provider=provider,
+            tools=tools,
+            agents_dir=agents_dir,
+        )
         return "\n\n".join(
             f"[subtask {i}] {task}\n{result}"
             for i, (task, result) in enumerate(zip(tasks, results, strict=False), 1)

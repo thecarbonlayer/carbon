@@ -149,7 +149,8 @@ def test_per_tool_truncation_budget():
     r = Agent(provider=p, tools=reg).run("go")
 
     res = r.tool_calls[0].result
-    assert res.startswith("X" * 10) and "truncated" in res and len(res) < 100
+    assert res.startswith("X" * 4) and res.endswith("X" * 6)
+    assert "truncated" in res and len(res) < 100
 
 
 # --- T1.3 permission policy ---------------------------------------------------
@@ -203,13 +204,25 @@ def test_config_schema_describes_the_surface():
         "verify_attempts",
         "require_run",
         "max_item_chars",
+        "file_injection",
+        "tool_output",
+        "compaction",
+        "retry",
         "compaction_prompt",
         "memory_search_limit",
         "attach_pattern",
+        "temperature",
+        "max_tokens",
     }
     assert by["approval_tools"]["collection"] and by["approval_tools"]["type"] == "list[str]"
     assert by["max_tool_steps"]["positive_int"] and by["max_tool_steps"]["type"] == "int"
     assert by["require_run"]["type"] == "bool" and not by["require_run"]["positive_int"]
+    assert by["tool_output"]["strategies"] == ["head_tail", "keep_head"]
+    assert by["compaction"]["strategies"] == [
+        "structured_checkpoint",
+        "summarize_middle",
+    ]
+    assert by["retry"]["strategies"] == ["backoff", "fail_fast"]
 
 
 # --- T1.5 provenance + schema output -----------------------------------------
@@ -261,7 +274,7 @@ def test_response_format_reaches_the_http_payload(monkeypatch):
 def test_carbon_facade_exports_the_surface():
     import carbon
 
-    assert carbon.__version__ == "0.3.0"
+    assert carbon.__version__ == "0.4.0"
     for name in (
         "Agent",
         "RunResult",
@@ -273,6 +286,7 @@ def test_carbon_facade_exports_the_surface():
         "chat",
         "load_config",
         "config_schema",
+        "surface_manifest",
         "provenance",
         "load_env",
         "Tracer",

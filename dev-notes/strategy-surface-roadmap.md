@@ -79,28 +79,33 @@ before it enters the surface:
 
 Cluster letters continue the existing suite (A–D shipped, E is truncation).
 
-### 1. Truncation (Compress/Write) — IN FLIGHT
+### 1. Truncation (Compress/Write) — SHIPPED IN CONFIG V3
 
 Plan: `docs/superpowers/plans/2026-07-17-truncation-strategy-surface.md`.
-Fields `file_injection` / `tool_output`; menu `keep_head | head_tail |
-head_tail_summarize | offload_to_file`; cluster E. Subsumes sdk-roadmap T2.3
-(per-tool budgets stay as the `budget` override under any strategy). This
-seam is the template: every section below lands the same way.
+Fields `file_injection` / `tool_output`; first menu `keep_head | head_tail`;
+cluster E. Per-tool budgets stay as an override under the selected strategy.
+`head_tail_summarize` and `offload_to_file` remain later additions, and must
+ship with their own miners before entering the menu.
 
-### 2. Compaction shape (Compress)
+### 2. Compaction shape (Compress) — FIRST MENU SHIPPED IN CONFIG V3
 
 - **Baked today:** summarize-the-middle with `keep_head=2`, `keep_tail=4`
   hardcoded in `compaction.py:compact()`, triggered only when
   `estimate_tokens > context_limit` in `agent.py:_maybe_compact`.
-- **Proposed field:** `"compaction": {"strategy": ..., "keep_head": 2,
+- **Current field:** `"compaction": {"strategy": ..., "keep_head": 2,
   "keep_tail": 4, "trigger_fraction": 1.0}`. Menu: `summarize_middle`
   (today), `drop_tool_results` (summarize only tool messages, keep
   reasoning verbatim; tool output is the bulk and the least quotable),
   `offload_middle` (write the middle to a session file, leave a pointer;
   the Write move applied to history). `trigger_fraction` makes the
   when-to-fire threshold tunable (Hermes fires at ~0.5, carbon at 1.0).
+- **Shipped menu:** `summarize_middle | structured_checkpoint`. The latter
+  serializes tool names, arguments, results, and prior summaries into a
+  cumulative headed checkpoint. `drop_tool_results` and `offload_middle`
+  remain roadmap entries.
 - **Suite:** cluster A already mines compaction loss (A1 held-in, A3
-  held-out); add cluster H guards: a fact inside a *tool result* mid-history
+  held-out), while G2 covers repeated cumulative compaction. Add future guards
+  for a fact inside a *tool result* mid-history
   (separates `drop_tool_results` from `summarize_middle`), and a
   turn-count-heavy session where an early trigger_fraction wins.
 - **Order note:** do this second; it reuses the strategy-interface pattern
@@ -202,19 +207,18 @@ this knob ships with guards, not as a default.
   (the editor must not be able to reach its own grader) applies inside
   carbon too.
 
-### 8. Retry and escalation (orchestrate)
+### 8. Retry and escalation (orchestrate) — BOUNDED BACKOFF SHIPPED IN CONFIG V3
 
-- **Baked today:** `MAX_TOOL_STEPS` budget then hard stop
+- **Current:** `MAX_TOOL_STEPS` budget then hard stop
   (`agent.py:_run`); orchestrator plan/gate/retry has fixed retry counts
   (`orchestrator.py`).
-- **Proposed field:** `"retry": {"strategy": "fail_fast"}`. Menu:
-  `fail_fast` (today), `backoff` (T2.4, provider errors only),
+- **Current field:** `"retry": {"strategy": "backoff", "max_attempts": 3,
+  "base_delay_ms": 100}`. Menu: `fail_fast`, `backoff` (provider errors only),
   `escalate_subagent` (hand the failing step to a fresh subagent window
   once before giving up; the Isolate move as a retry policy).
-- **Suite:** cluster K. Needs fault injection, which the eval consumer
-  already does via `ToolRegistry.wrap`; miner: a tool that fails twice then
-  succeeds (backoff wins); guard: a permanently-failing tool must still
-  stop at the budget (no infinite retry).
+- **Suite:** cluster H fault-injects a transient provider failure, a context
+  overflow, and a permanently failing provider. The latter guards the
+  five-attempt hard maximum. `escalate_subagent` remains future work.
 - **Order note:** last of the behavior seams; depends on subagent plumbing
   being stable under T1.x and is the least mined by real failures so far.
 - **Companion field, same seam:** `"loop_detection": {"strategy": "none" |
@@ -267,14 +271,14 @@ automated editor. Revisit only if a consumer runs untrusted code.
 | # | Seam | Cluster | Why here |
 |---|------|---------|----------|
 | 1 | Truncation | E | In flight; template for the pattern |
-| 2 | Compaction shape | H | Same move, miners half-exist (A1/A3) |
+| 2 | Compaction shape | A/G | First menu shipped; extend only with new guards |
 | 3 | Tool exposure | F | T2.1 tool belt makes it urgent; guards trivial (D1/D2) |
 | 4 | Session onboarding | L | Low-risk, additive; field-proven lever (LangChain); win shows up as fewer turns |
 | 5 | Memory recall | G | `feat/embedding-seam` already builds strategy #2 |
 | 6 | Sampling params | — | Quick win, ride along with any bump; per-phase variant waits for orchestrator |
 | 7 | Assembly order | I | High leverage, but needs runner token capture + verification-gate care |
 | 8 | Verification reporting | J | Valuable (pass^k honesty), sharpest integrity boundary |
-| 9 | Retry/escalation + loop detection | K | Least real-failure evidence yet; needs fault-injection plumbing |
+| 9 | Retry/escalation + loop detection | H | Backoff shipped; escalation/loop nudge remain |
 
 Each row is one plan (authored just-in-time against the then-current code,
 the truncation plan's format), one `config_version` bump, one suite cluster

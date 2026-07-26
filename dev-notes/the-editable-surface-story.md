@@ -12,7 +12,7 @@ resets, new contributors, and time.
    two gates (`verify` offline, `accept` live). The point of building from
    scratch is that someone on the team knows where every seam is.
 2. **We built a self-improvement loop around it** (refinery, separate
-   repo): 13 tasks in clusters, held-in shown to the proposer, held-out
+   repo): 23 tasks in clusters, held-in shown to the proposer, held-out
    hidden, repeated attempts averaged as fractions, acceptance rule
    `Δ_in ≥ 0, Δ_ho ≥ 0, max > 0`, evidence in a PR, human merges. Grader and
    editor never share a home.
@@ -36,6 +36,11 @@ resets, new contributors, and time.
    and which held-in/held-out tasks can tell its menu entries apart. No
    tasks, no knob. See the roadmap's "mental model" section for the layer
    mapping and per-seam clusters.
+6. **Correctness is not a menu.** Unique atomic edits, tool-argument
+   validation, incomplete-response refusal, worker workspace identity,
+   verification freshness, and containment are published as immutable
+   invariants. Refinery reads that do-not-propose list from
+   `carbon.surface_manifest()` before authoring candidates.
 
 ## Standing reminders
 

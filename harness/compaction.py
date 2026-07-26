@@ -57,8 +57,10 @@ def _clean_cut(messages: list[dict], i: int) -> bool:
 def compact(
     messages: list[dict],
     *,
-    keep_head: int = 2,
-    keep_tail: int = 4,
+    keep_head: int | None = None,
+    keep_tail: int | None = None,
+    strategy: str | None = None,
+    summary_max_tokens: int | None = None,
     model: str | None = None,
     provider: Provider | None = None,
 ) -> list[dict]:
@@ -69,6 +71,11 @@ def compact(
     with a 400). If snapping leaves nothing safe to summarize, the history is
     returned unchanged — better a large window this turn than a corrupt one.
     """
+    policy = CONFIG.compaction
+    keep_head = policy.keep_head if keep_head is None else keep_head
+    keep_tail = policy.keep_tail if keep_tail is None else keep_tail
+    strategy = strategy or policy.strategy
+    summary_max_tokens = summary_max_tokens or policy.summary_max_tokens
     if len(messages) <= keep_head + keep_tail:
         return messages
 
@@ -86,16 +93,40 @@ def compact(
     tail = messages[tail_start:]
     middle = messages[head_end:tail_start]
 
-    transcript = "\n".join(f"{m.get('role')}: {m.get('content', '')}" for m in middle)
+    transcript = "\n".join(_serialize_message(m) for m in middle)
+    prompt = COMPACTION_PROMPT
+    if strategy == "structured_checkpoint":
+        prompt += (
+            "\n\nReturn a cumulative structured checkpoint with these headings: Goal, "
+            "Constraints, Decisions, Completed work, Files read or changed, Exact commands "
+            "and tool calls, Failures and rejected approaches, Current state, Next steps. "
+            "Merge any earlier [summary of earlier conversation] into this checkpoint. "
+            "Preserve identifiers, paths, arguments, receipts, and error tails verbatim."
+        )
+    elif strategy != "summarize_middle":
+        raise ValueError(f"unsupported compaction strategy: {strategy}")
     summary = chat(
         [
-            {"role": "system", "content": COMPACTION_PROMPT},
+            {"role": "system", "content": prompt},
             {"role": "user", "content": transcript},
         ],
         model=model,
         provider=provider,  # summarize through the same endpoint the turn uses
-        max_tokens=512,
+        max_tokens=summary_max_tokens,
     ).content
 
-    note = {"role": "system", "content": f"[summary of earlier conversation]\n{summary}"}
+    note = {
+        "role": "system",
+        "content": f"[summary of earlier conversation; strategy={strategy}]\n{summary}",
+    }
     return head + [note] + tail
+
+
+def _serialize_message(message: dict) -> str:
+    """Loss-aware JSONL for the summarizer, including tool names and arguments."""
+    kept = {
+        key: message[key]
+        for key in ("role", "content", "tool_calls", "tool_call_id")
+        if key in message
+    }
+    return json.dumps(kept, ensure_ascii=False, sort_keys=True)

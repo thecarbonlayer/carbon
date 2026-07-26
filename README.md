@@ -109,11 +109,13 @@ teaches one primitive in its mature form. That spine does not grow.
 
 What grows is the surface around it. The harness now has external consumers that
 import it as a library to build their own domain-specific agents, and a
-self-improving loop that proposes edits to its own configuration. Both push in
-the same direction: the harness needs a stable embedding seam, and its editable
-surface needs to keep widening. What the self-improving loop can achieve is
-bounded by how wide that surface is, so widening it is not a task that finishes.
-It is an ongoing response to where the loop hits its ceiling.
+self-improving loop that proposes edits to its own configuration. That surface is
+now a set of bounded Carbon-owned strategy menus, not merely scalar limits:
+file and tool-output retention, compaction shape and trigger, completion budget,
+and sampling policy. `carbon.surface_manifest()` publishes both the selectable
+menu and the explicit immutable invariants. The loop can pick vetted mechanisms;
+it cannot inject code, weaken verification, relax workspace boundaries, or make
+ambiguous edits legal.
 
 To keep these two rhythms honest, the repo versions them on separate axes. The
 curriculum stays frozen and tagged `ch-00` through `ch-14`. The library and
@@ -121,10 +123,10 @@ editable surface evolve under semantic versions on the `carbon` package, recorde
 in [CHANGELOG.md](CHANGELOG.md), with the configuration's own `version` field as
 the fine-grained counter underneath.
 
-One rule governs every addition to that surface: generic mechanism lives in the
-harness, while domain and policy live in the consumer. The harness grows seams;
-it never grows a consumer's subject matter. The reasoning behind these decisions
-lives in [dev-notes/](dev-notes/).
+Two rules govern every addition: generic mechanism lives in the harness while
+domain and policy live in the consumer, and no knob becomes editable until an
+external miner and guard can distinguish its choices. The reasoning behind these
+decisions lives in [dev-notes/](dev-notes/).
 
 ## How it is built (and verified)
 

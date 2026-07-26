@@ -15,9 +15,12 @@ the files survive across calls for ``bash`` (run in the same dir) to see.
 
 from __future__ import annotations
 
+import os
+import shutil
 import subprocess
 import tempfile
 from collections.abc import Callable
+from difflib import unified_diff
 from pathlib import Path
 
 from harness.tools import Tool
@@ -55,10 +58,41 @@ class Workspace:
             # prepend `new` at offset 0 — reject it rather than corrupt the file.
             return f"error: `old` must be non-empty to edit {path}"
         text = p.read_text()
-        if old not in text:
+        matches = text.count(old)
+        if matches == 0:
             return f"error: text to replace not found in {path}"
-        p.write_text(text.replace(old, new, 1))
-        return f"edited {path}"
+        if matches > 1:
+            return (
+                f"error: text to replace occurs {matches} times in {path}; "
+                "include more surrounding context so the edit is unique"
+            )
+        updated = text.replace(old, new, 1)
+        # Write beside the target and rename over it, so a crash mid-write can never
+        # leave a half-file. Two details the naive version gets wrong: the temp name
+        # must be unique (delegated workers share one workspace across threads, and a
+        # fixed name lets two edits collide mid-write), and the mode must be copied
+        # from the original (mkstemp is 0600, and a plain rename would silently strip
+        # the executable bit off a script).
+        fd, tmp_name = tempfile.mkstemp(dir=p.parent, prefix=f".{p.name}.", suffix=".carbon-edit")
+        temp = Path(tmp_name)
+        try:
+            with os.fdopen(fd, "w") as fh:
+                fh.write(updated)
+            shutil.copymode(p, temp)
+            temp.replace(p)
+        except BaseException:
+            temp.unlink(missing_ok=True)
+            raise
+        diff = "".join(
+            unified_diff(
+                text.splitlines(keepends=True),
+                updated.splitlines(keepends=True),
+                fromfile=f"a/{path}",
+                tofile=f"b/{path}",
+                n=3,
+            )
+        )
+        return f"edited {path}\n{diff}".rstrip()
 
 
 def write_file_tool(ws: Workspace) -> Tool:
@@ -77,7 +111,11 @@ def write_file_tool(ws: Workspace) -> Tool:
 def edit_file_tool(ws: Workspace) -> Tool:
     return Tool(
         name="edit_file",
-        description="Replace the first occurrence of `old` with `new` in a workspace file.",
+        description=(
+            "Atomically replace one unique occurrence of `old` with `new` in a workspace "
+            "file. Ambiguous matches fail; include enough surrounding context to identify "
+            "one location. Returns the resulting unified diff."
+        ),
         parameters={
             "type": "object",
             "properties": {

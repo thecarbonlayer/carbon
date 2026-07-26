@@ -25,6 +25,31 @@ One entry per release; commits stay fine-grained under a `feat(surface)` or
   wire format, and every measurement record ever written carries it; renaming
   would orphan committed evidence. New keys use the new name.
 
+## [0.4.0] - 2026-07-26
+
+Closes the highest-impact output-quality gaps found by a differential review of
+the agent's own output, and widens the self-improvement surface from scalar
+tuning to bounded strategy selection, so Refinery has more to work with.
+
+### Added
+
+- `file_injection`, `tool_output`, `compaction`, and `retry` strategy objects,
+  landing together as config v3.
+- `surface_manifest()`, separating editable choices, locked fields, and immutable
+  correctness/trust invariants.
+- Ranged `read_file` access with line counts and continuation hints.
+- Tool-argument validation, explicit incomplete-response handling, and worker
+  workspace/tool binding.
+- Forced compaction-and-retry recovery for context-window overflow.
+
+### Changed
+
+- Tool and sandbox output preserve both head and tail by default.
+- Compaction uses a cumulative, structured, tool-aware checkpoint at 80% of the
+  configured context limit.
+- `edit_file` now rejects ambiguous matches, writes atomically, and returns a diff.
+- Default completion budget increased from 1,024 to 4,096 tokens.
+
 ## [0.3.0] - 2026-07-24
 
 Lets a consumer honor its own declared turn budget without reaching into
