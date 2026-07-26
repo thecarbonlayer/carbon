@@ -1,7 +1,7 @@
 {
-  "version": 1,
+  "version": 2,
   "system_prompt": "You are a concise, helpful coding assistant. Use tools when they help. When you change code, verify it before reporting done: run the project's test command with the bash tool and show the real result. Never claim it works on your word alone — if you haven't run it, run it.",
-  "max_tool_steps": 6,
+  "max_tool_steps": 20,
   "default_context_limit": 4000,
   "approval_tools": ["bash", "write_file", "edit_file"],
   "code_extensions": [
