@@ -36,13 +36,10 @@ from textual.widgets import Button, Footer, Input, Label, Static, Tree
 
 import harness.agent as agent_mod
 from harness.harness_config import CONFIG
-from harness.memory import DEFAULT_DIR, delete_session, search_memory_tool
+from harness.memory import DEFAULT_DIR, delete_session
 from harness.observability import Tracer
-from harness.sandbox import Sandbox, bash_tool
 from harness.skills import load_skills
-from harness.subagents import delegate_tool, fan_out_tool
-from harness.tools import default_tools, read_file_tool
-from harness.workspace import Workspace, edit_file_tool, write_file_tool
+from harness.workspace import Workspace
 from model import Provider
 from model.pricing import format_cost
 
@@ -205,20 +202,18 @@ class AgentTUI(App):
 
     # --- agent construction -------------------------------------------------
     def _build_agent(self, session: str) -> agent_mod.Agent:
-        tools = default_tools()
-        # read from the same tree we write to (the worktree), never the host cwd.
-        tools.register(read_file_tool(str(self.workspace.root)))
-        tools.register(write_file_tool(self.workspace))
-        tools.register(edit_file_tool(self.workspace))
-        # trusted bash: the agent works on your real project (worktree), so your
-        # test command runs for real, approval-gated — not the network-none jail.
-        tools.register(
-            bash_tool(Sandbox(trusted=True, timeout=120), workdir=str(self.workspace.root))
+        # One builder for print mode, the REPL, and the TUI. Building the belt here
+        # by hand is how the TUI's delegates ended up reading the process cwd instead
+        # of the worktree — the detached-worktree mismatch. Read from the same tree we
+        # write to, and hand workers the same binding. Trusted bash: the agent works
+        # on your real project, so your test command runs for real, approval-gated.
+        tools = agent_mod._coding_tools(
+            self.workspace,
+            exclude_session=session,  # recall across *other* sessions
+            provider=self.provider,
+            model=self.provider.model,
+            sessions_dir=self.sessions_dir,
         )
-        # recall across *other* sessions — this one is already in context.
-        tools.register(search_memory_tool(self.sessions_dir, exclude=session))
-        tools.register(delegate_tool(model=self.provider.model))
-        tools.register(fan_out_tool(model=self.provider.model))
         tracer = Tracer(model=self.provider.model)
         return agent_mod.Agent(
             system=agent_mod.DEFAULT_SYSTEM,

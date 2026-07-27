@@ -151,7 +151,11 @@ _IMMUTABLE_INVARIANTS = (
     },
     {
         "name": "subagent_workspace_identity",
-        "reason": "Delegated workers must use the workspace explicitly bound by the parent.",
+        "reason": (
+            "Delegated workers use the workspace explicitly bound by the parent, "
+            "read-only: a worker runs under its own Policy, so a mutating tool "
+            "would execute outside the parent's approval gate."
+        ),
     },
     {
         "name": "verification_integrity",

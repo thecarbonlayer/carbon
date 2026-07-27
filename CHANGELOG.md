@@ -38,8 +38,8 @@ tuning to bounded strategy selection, so Refinery has more to work with.
 - `surface_manifest()`, separating editable choices, locked fields, and immutable
   correctness/trust invariants.
 - Ranged `read_file` access with line counts and continuation hints.
-- Tool-argument validation, explicit incomplete-response handling, and worker
-  workspace/tool binding.
+- Tool-argument validation, explicit incomplete-response handling, and read-only
+  worker binding to the parent's workspace, provider, and model.
 - Forced compaction-and-retry recovery for context-window overflow.
 
 ### Changed
