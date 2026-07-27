@@ -27,6 +27,7 @@ import json
 import sys
 import time
 from collections.abc import Callable
+from pathlib import Path
 
 from harness.compaction import compact, estimate_tokens
 from harness.context import deliver
@@ -521,18 +522,47 @@ class Agent:
         )
 
     def _compact_active_history(self) -> bool:
-        """Compact before this turn while preserving turn-relative gate indices."""
+        """Reclaim window without disturbing turn-relative gate indices.
+
+        Prefix compaction first. When there is no prefix to compact — a first turn,
+        or history that is already a checkpoint — the overflow is coming from *this*
+        turn, and summarizing earlier messages cannot reach it. A single oversized
+        tool result on turn one would otherwise escape as the original provider
+        exception. Fall back to shrinking this turn's tool results in place.
+        """
         prefix = self.messages[: self._active_turn_start]
         current_turn = self.messages[self._active_turn_start :]
         managed = compact(prefix, model=self.model, provider=self.provider)
         if managed is prefix:
-            return False
+            return self._shrink_turn_tool_results()
         self.messages = managed + current_turn
         self._active_turn_start = len(managed)
         self._last_tokens = 0
         self.just_compacted = True
         self.compaction_count += 1
         return True
+
+    def _shrink_turn_tool_results(self) -> bool:
+        """Shrink this turn's oversized tool results in place; True if anything moved.
+
+        Receipt-safe by construction. The verification gate pairs an *assistant*
+        message's tool_calls with a tool message whose content starts with
+        ``[exit 0`` — so this never touches assistant messages, and every truncation
+        strategy in the menu keeps the head, where that marker lives.
+        """
+        budget = max(200, CONFIG.tool_output.budget // 4)
+        shrank = False
+        for message in self.messages[self._active_turn_start :]:
+            if message.get("role") != "tool":
+                continue
+            content = str(message.get("content", ""))
+            if len(content) <= budget:
+                continue
+            message["content"] = truncate(content, CONFIG.tool_output, budget=budget)
+            shrank = True
+        if shrank:
+            self._last_tokens = 0
+        return shrank
 
     def _model_call_with_recovery(
         self, specs: list[dict] | None, on_delta: OnDelta | None
@@ -591,30 +621,54 @@ def _approver(yes: bool) -> Callable[[str, str], bool] | None:
     return (lambda name, args: True) if yes else None
 
 
-def _coding_tools(workspace, *, exclude_session: str | None) -> ToolRegistry:
-    """The mature agent's toolset, rooted at ``workspace`` — the same wiring the
-    REPL uses, factored out so one-shot mode builds an identical agent."""
+def _coding_tools(
+    workspace,
+    *,
+    exclude_session: str | None,
+    provider: Provider | None = None,
+    model: str | None = None,
+    sessions_dir: str | Path | None = None,
+) -> ToolRegistry:
+    """The mature agent's toolset, rooted at ``workspace`` — the one builder print
+    mode, the REPL, and the TUI all use, so a delegated worker can't end up reading
+    a different tree than the agent that spawned it.
+
+    ``provider``/``model`` are threaded to the workers too: a consumer that passes a
+    custom provider expects its delegates to use it, not to silently fall back to
+    whatever the environment points at.
+    """
     from harness.memory import search_memory_tool
     from harness.sandbox import Sandbox, bash_tool
     from harness.subagents import delegate_tool, fan_out_tool
     from harness.tools import default_tools, read_file_tool
     from harness.workspace import edit_file_tool, write_file_tool
 
-    def workspace_tools() -> ToolRegistry:
+    root = str(workspace.root)
+    memory_dir = sessions_dir if sessions_dir is not None else DEFAULT_DIR
+
+    def worker_tools() -> ToolRegistry:
+        """What a delegated worker gets: the parent's workspace, read-only.
+
+        A worker runs as its own Agent with its own Policy, so a mutating tool handed
+        to a worker executes without ever reaching the parent's approval gate — a
+        parent running fail-closed could delegate the write it just refused. Until
+        delegation has a composite approval design, workers observe and report; the
+        parent makes the changes.
+        """
         registry = default_tools()
-        registry.register(read_file_tool(str(workspace.root)))
-        registry.register(write_file_tool(workspace))
-        registry.register(edit_file_tool(workspace))
-        registry.register(
-            bash_tool(Sandbox(trusted=True, timeout=120), workdir=str(workspace.root))
-        )
-        registry.register(search_memory_tool(exclude=exclude_session))
+        registry.register(read_file_tool(root))
+        registry.register(search_memory_tool(memory_dir, exclude=exclude_session))
         return registry
 
-    tools = workspace_tools()
-    workers = workspace_tools()
-    tools.register(delegate_tool(tools=workers, agents_dir=str(workspace.root)))
-    tools.register(fan_out_tool(tools=workers, agents_dir=str(workspace.root)))
+    tools = default_tools()
+    tools.register(read_file_tool(root))
+    tools.register(write_file_tool(workspace))
+    tools.register(edit_file_tool(workspace))
+    tools.register(bash_tool(Sandbox(trusted=True, timeout=120), workdir=root))
+    tools.register(search_memory_tool(memory_dir, exclude=exclude_session))
+    workers = worker_tools()
+    tools.register(delegate_tool(model=model, provider=provider, tools=workers, agents_dir=root))
+    tools.register(fan_out_tool(model=model, provider=provider, tools=workers, agents_dir=root))
     return tools
 
 
@@ -649,7 +703,13 @@ def run_once(
         system=DEFAULT_SYSTEM,
         provider=provider,
         model=provider.model,
-        tools=_coding_tools(workspace, exclude_session=session),
+        tools=_coding_tools(
+            workspace,
+            exclude_session=session,
+            provider=provider,
+            model=provider.model,
+            sessions_dir=sessions_dir,
+        ),
         approve=_approver(yes),
         approval_required=APPROVAL_TOOLS,
         skills=load_skills("skills"),
@@ -742,8 +802,6 @@ def _run_repl(args: argparse.Namespace) -> None:
         workspace, cleanup = Workspace(), (lambda: None)
         print(f"not a git repo — working in a scratch dir — {workspace.root}")
 
-    tools = _coding_tools(workspace, exclude_session="repl")
-
     def approve(name: str, args_json: str) -> bool:
         return input(f"  approve {name}({args_json})? [y/N] ").strip().lower() in ("y", "yes")
 
@@ -751,6 +809,9 @@ def _run_repl(args: argparse.Namespace) -> None:
     # it to price calls (else the REPL trace shows $0.0000), and the agent reuses it.
     provider = Provider.from_env()
     tracer = Tracer(model=provider.model)  # ch-13: record every step + price it
+    tools = _coding_tools(
+        workspace, exclude_session="repl", provider=provider, model=provider.model
+    )
     agent = Agent(
         system=DEFAULT_SYSTEM,
         provider=provider,

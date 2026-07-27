@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 
+from harness.policy import Policy
 from harness.tools import Tool, ToolRegistry, default_tools
 from model import Provider
 
@@ -23,7 +24,15 @@ def run_subagent(
     provider: Provider | None = None,
     tools: ToolRegistry | None = None,
     agents_dir: str = ".",
+    policy: Policy | None = None,
 ) -> str:
+    """Run one subtask in an isolated Agent.
+
+    ``policy`` is the parent's approval gate. A worker is a full Agent with its own
+    Policy, so without this a mutating tool in ``tools`` executes with no approval —
+    a parent running fail-closed could delegate the very write it would refuse.
+    Callers that hand workers mutating tools must pass the gate along with them.
+    """
     from harness.agent import Agent  # lazy: avoids an import cycle at module load
 
     sub = Agent(
@@ -32,6 +41,7 @@ def run_subagent(
         model=model,
         provider=provider,
         agents_dir=agents_dir,
+        policy=policy,
     )
     return sub.send(task)
 
@@ -43,6 +53,7 @@ def fan_out(
     provider: Provider | None = None,
     tools: ToolRegistry | None = None,
     agents_dir: str = ".",
+    policy: Policy | None = None,
     max_workers: int = 4,
 ) -> list[str]:
     """Run subtasks in parallel, each in its own isolated subagent. Order preserved."""
@@ -57,6 +68,7 @@ def fan_out(
                     provider=provider,
                     tools=tools,
                     agents_dir=agents_dir,
+                    policy=policy,
                 ),
                 tasks,
             )
@@ -69,6 +81,7 @@ def delegate_tool(
     provider: Provider | None = None,
     tools: ToolRegistry | None = None,
     agents_dir: str = ".",
+    policy: Policy | None = None,
 ) -> Tool:
     """A tool that lets a main agent delegate a self-contained subtask to a subagent."""
 
@@ -79,6 +92,7 @@ def delegate_tool(
             provider=provider,
             tools=tools,
             agents_dir=agents_dir,
+            policy=policy,
         )
 
     return Tool(
@@ -99,6 +113,7 @@ def fan_out_tool(
     provider: Provider | None = None,
     tools: ToolRegistry | None = None,
     agents_dir: str = ".",
+    policy: Policy | None = None,
 ) -> Tool:
     """A tool that lets the model split work into independent subtasks and run them
     in parallel, each in its own isolated subagent. Results come back labeled and
@@ -115,6 +130,7 @@ def fan_out_tool(
             provider=provider,
             tools=tools,
             agents_dir=agents_dir,
+            policy=policy,
         )
         return "\n\n".join(
             f"[subtask {i}] {task}\n{result}"
