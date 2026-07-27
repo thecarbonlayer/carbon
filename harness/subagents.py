@@ -26,12 +26,14 @@ def run_subagent(
     agents_dir: str = ".",
     policy: Policy | None = None,
 ) -> str:
-    """Run one subtask in an isolated Agent.
+    """Run one subtask in an isolated Agent. Read-only unless told otherwise.
 
-    ``policy`` is the parent's approval gate. A worker is a full Agent with its own
-    Policy, so without this a mutating tool in ``tools`` executes with no approval —
-    a parent running fail-closed could delegate the very write it would refuse.
-    Callers that hand workers mutating tools must pass the gate along with them.
+    A worker is a full Agent with its own Policy, and nothing about the parent's
+    gate travels across that boundary. Defaulting ``policy`` to None would mean an
+    empty Policy — every tool in ``tools`` allowed, no approval — so a parent
+    running fail-closed could delegate the very write it would refuse. The default
+    is therefore ``Policy(read_only=True)``: mutation is opt-in, and a caller that
+    wants a worker to write must hand it a policy that says so.
     """
     from harness.agent import Agent  # lazy: avoids an import cycle at module load
 
@@ -41,7 +43,7 @@ def run_subagent(
         model=model,
         provider=provider,
         agents_dir=agents_dir,
-        policy=policy,
+        policy=policy or Policy(read_only=True),
     )
     return sub.send(task)
 

@@ -174,3 +174,97 @@ def test_shrinking_the_current_turn_preserves_the_verification_receipt():
     assert agent._shrink_turn_tool_results() is True
     assert agent.messages[1]["content"].startswith("[exit 0")
     assert agent._observed_pass("uv run verify", 0) is True
+
+
+def test_subagent_api_is_read_only_when_no_policy_is_given():
+    """Omitting `policy` must not mean "no gate" — the default is read-only.
+
+    A worker is a full Agent with its own Policy, so `policy=None` defaulting to an
+    empty Policy would allow every tool in `tools` with no approval. Mutation is
+    opt-in; a caller that wants a worker to write must say so.
+    """
+    root = Path(tempfile.mkdtemp())
+    registry = ToolRegistry()
+    registry.register(write_file_tool(Workspace(root=root)))
+
+    state = {"n": 0}
+
+    def script(messages, **kwargs):
+        state["n"] += 1
+        if state["n"] == 1:
+            return _tool_call("write_file", path="ungated.txt", content="x")
+        return LLMResponse(content="done")
+
+    run_subagent("write it", tools=registry, provider=_calls(script))  # no policy
+
+    assert not (root / "ungated.txt").exists()
+
+
+def test_mixed_history_overflow_compacts_and_shrinks_in_one_pass():
+    """Compactable prefix *and* an oversized current tool result.
+
+    There is one recovery attempt. Doing only the prefix leaves the tool result
+    whole and spends the attempt, so the next call overflows again and escapes.
+    """
+    registry = ToolRegistry()
+    registry.register(
+        Tool(
+            name="big",
+            description="returns a lot",
+            parameters={"type": "object", "properties": {}, "required": []},
+            func=lambda: "X" * 80_000,
+        )
+    )
+    state = {"n": 0}
+
+    def script(messages, **kwargs):
+        if messages and "context summarizer" in str(messages[0].get("content", "")):
+            return LLMResponse(content="SUMMARY")
+        state["n"] += 1
+        if state["n"] == 1:
+            return _tool_call("big")
+        if state["n"] == 2:
+            raise RuntimeError("maximum context length exceeded")
+        return LLMResponse(content="RECOVERED")
+
+    agent = Agent(provider=_calls(script), tools=registry)
+    agent.messages = [{"role": "user", "content": f"old-{i}"} for i in range(20)]
+
+    result = agent.run("go")
+
+    assert result.text == "RECOVERED"
+    assert agent.compaction_count == 1  # prefix summarized
+    tool_results = [m for m in agent.messages if m.get("role") == "tool"]
+    assert tool_results and all(len(m["content"]) < 80_000 for m in tool_results)  # and shrunk
+
+
+def test_read_only_workers_can_still_explore_the_repository():
+    """Read-only must not mean blind. A worker with only read_file needs exact
+    paths, which is not enough to explore a tree it has never seen."""
+    root = Path(tempfile.mkdtemp())
+    (root / "pkg").mkdir()
+    (root / "pkg" / "mod.py").write_text("def target():\n    return 1\n")
+    (root / ".env").write_text("LLM_API_KEY=secret")
+
+    tools = _coding_tools(Workspace(root=root), exclude_session=None)
+    worker_names: list[str] = []
+
+    def script(messages, **kwargs):
+        if any("focused worker" in str(m.get("content", "")) for m in messages):
+            return LLMResponse(content="worker done")
+        if not worker_names:
+            worker_names.append("x")
+            return _tool_call("delegate", task="explore")
+        return LLMResponse(content="done")
+
+    Agent(provider=_calls(script), tools=tools).run("go")
+
+    from harness.tools import list_files, search_text
+
+    listing = list_files("**/*.py", root=root)
+    assert "pkg/mod.py" in listing
+    assert ".env" not in list_files("**/*", root=root)  # secrets stay refused
+    assert "pkg/mod.py:1:" in search_text("def target", root=root)
+    assert "outside" in list_files("../**", root=root) or "must stay inside" in list_files(
+        "/etc/**", root=root
+    )
