@@ -524,23 +524,26 @@ class Agent:
     def _compact_active_history(self) -> bool:
         """Reclaim window without disturbing turn-relative gate indices.
 
-        Prefix compaction first. When there is no prefix to compact — a first turn,
-        or history that is already a checkpoint — the overflow is coming from *this*
-        turn, and summarizing earlier messages cannot reach it. A single oversized
-        tool result on turn one would otherwise escape as the original provider
-        exception. Fall back to shrinking this turn's tool results in place.
+        Both halves, always, in one pass — there is only one recovery attempt, so
+        doing half the work spends it. Prefix compaction cannot reach an oversized
+        tool result inside the *current* turn, and shrinking the current turn does
+        nothing about a long earlier history; a session with both would compact the
+        prefix, leave the tool result whole, and crash on the next overflow with its
+        one attempt already used.
         """
         prefix = self.messages[: self._active_turn_start]
         current_turn = self.messages[self._active_turn_start :]
         managed = compact(prefix, model=self.model, provider=self.provider)
-        if managed is prefix:
-            return self._shrink_turn_tool_results()
-        self.messages = managed + current_turn
-        self._active_turn_start = len(managed)
-        self._last_tokens = 0
-        self.just_compacted = True
-        self.compaction_count += 1
-        return True
+        compacted = managed is not prefix
+        if compacted:
+            self.messages = managed + current_turn
+            self._active_turn_start = len(managed)
+            self.just_compacted = True
+            self.compaction_count += 1
+        shrank = self._shrink_turn_tool_results()
+        if compacted or shrank:
+            self._last_tokens = 0
+        return compacted or shrank
 
     def _shrink_turn_tool_results(self) -> bool:
         """Shrink this turn's oversized tool results in place; True if anything moved.
@@ -560,8 +563,6 @@ class Agent:
                 continue
             message["content"] = truncate(content, CONFIG.tool_output, budget=budget)
             shrank = True
-        if shrank:
-            self._last_tokens = 0
         return shrank
 
     def _model_call_with_recovery(
@@ -640,7 +641,7 @@ def _coding_tools(
     from harness.memory import search_memory_tool
     from harness.sandbox import Sandbox, bash_tool
     from harness.subagents import delegate_tool, fan_out_tool
-    from harness.tools import default_tools, read_file_tool
+    from harness.tools import default_tools, list_files_tool, read_file_tool, search_text_tool
     from harness.workspace import edit_file_tool, write_file_tool
 
     root = str(workspace.root)
@@ -657,11 +658,15 @@ def _coding_tools(
         """
         registry = default_tools()
         registry.register(read_file_tool(root))
+        registry.register(list_files_tool(root))
+        registry.register(search_text_tool(root))
         registry.register(search_memory_tool(memory_dir, exclude=exclude_session))
         return registry
 
     tools = default_tools()
     tools.register(read_file_tool(root))
+    tools.register(list_files_tool(root))
+    tools.register(search_text_tool(root))
     tools.register(write_file_tool(workspace))
     tools.register(edit_file_tool(workspace))
     tools.register(bash_tool(Sandbox(trusted=True, timeout=120), workdir=root))

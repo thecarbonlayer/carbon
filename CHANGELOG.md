@@ -37,7 +37,9 @@ tuning to bounded strategy selection, so Refinery has more to work with.
   landing together as config v3.
 - `surface_manifest()`, separating editable choices, locked fields, and immutable
   correctness/trust invariants.
-- Ranged `read_file` access with line counts and continuation hints.
+- Ranged `read_file` access with line counts and continuation hints, plus
+  workspace-confined `list_files` and `search_text` so a read-only agent can
+  explore a tree without shell access.
 - Tool-argument validation, explicit incomplete-response handling, and read-only
   worker binding to the parent's workspace, provider, and model.
 - Forced compaction-and-retry recovery for context-window overflow.

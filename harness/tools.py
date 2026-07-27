@@ -258,6 +258,106 @@ def read_file_tool(root: str | Path | None = None) -> Tool:
     )
 
 
+def _confined(root: str | Path | None) -> Path:
+    return Path(root).resolve() if root else Path.cwd().resolve()
+
+
+def _visible_files(base: Path, pattern: str) -> list[Path]:
+    """Files under ``base`` matching ``pattern``, minus secrets and VCS/venv noise."""
+    skip = {".git", ".venv", "venv", "node_modules", "__pycache__", ".mypy_cache", ".ruff_cache"}
+    out = []
+    for p in sorted(base.glob(pattern)):
+        if not p.is_file() or _is_secret_file(p):
+            continue
+        if skip & set(p.relative_to(base).parts):
+            continue
+        out.append(p)
+    return out
+
+
+def list_files(pattern: str = "**/*", root: str | Path | None = None, limit: int = 200) -> str:
+    """List workspace files matching a glob — the read-only way to find a path.
+
+    Without this, a read-only agent can only open files whose exact paths it was
+    already told, which is not enough to explore a repository.
+    """
+    base = _confined(root)
+    if Path(pattern).is_absolute() or ".." in Path(pattern).parts:
+        return f"error: pattern must stay inside the workspace: {pattern}"
+    files = _visible_files(base, pattern)
+    if not files:
+        return f"no files match {pattern}"
+    shown = [str(p.relative_to(base)) for p in files[:limit]]
+    more = f"\n…[{len(files) - limit} more; narrow the pattern]" if len(files) > limit else ""
+    return "\n".join(shown) + more
+
+
+def search_text(
+    query: str,
+    root: str | Path | None = None,
+    pattern: str = "**/*",
+    limit: int = 100,
+) -> str:
+    """Grep the workspace for a literal string, returning ``path:line: text`` hits."""
+    base = _confined(root)
+    if not query:
+        return "error: query must be non-empty"
+    if Path(pattern).is_absolute() or ".." in Path(pattern).parts:
+        return f"error: pattern must stay inside the workspace: {pattern}"
+    hits: list[str] = []
+    for p in _visible_files(base, pattern):
+        try:
+            body = p.read_text()
+        except (OSError, UnicodeDecodeError):
+            continue  # binary or unreadable — skip, don't fail the search
+        for i, line in enumerate(body.splitlines(), 1):
+            if query in line:
+                hits.append(f"{p.relative_to(base)}:{i}: {line.strip()[:200]}")
+                if len(hits) > limit:
+                    return "\n".join(hits[:limit]) + f"\n…[more than {limit} hits; narrow it]"
+    return "\n".join(hits) if hits else f"no matches for {query!r}"
+
+
+def list_files_tool(root: str | Path | None = None) -> Tool:
+    def _list(pattern: str = "**/*") -> str:
+        return list_files(pattern, root=root)
+
+    return Tool(
+        name="list_files",
+        description=(
+            "List workspace files matching a glob (default '**/*'). Use this to find "
+            "a path before read_file. Secrets and VCS/venv directories are excluded."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {"pattern": {"type": "string"}},
+            "required": [],
+            "additionalProperties": False,
+        },
+        func=_list,
+    )
+
+
+def search_text_tool(root: str | Path | None = None) -> Tool:
+    def _search(query: str, pattern: str = "**/*") -> str:
+        return search_text(query, root=root, pattern=pattern)
+
+    return Tool(
+        name="search_text",
+        description=(
+            "Search workspace files for a literal string; returns 'path:line: text' hits. "
+            "Optionally restrict to a glob via `pattern`."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {"query": {"type": "string"}, "pattern": {"type": "string"}},
+            "required": ["query"],
+            "additionalProperties": False,
+        },
+        func=_search,
+    )
+
+
 def default_tools() -> ToolRegistry:
     reg = ToolRegistry()
     reg.register(
