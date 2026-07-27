@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Callable
+from copy import deepcopy
 from dataclasses import asdict, dataclass, field, fields
 
 from harness import events
@@ -45,6 +46,10 @@ class Event:
     turn: int = 0  # which user turn this step belongs to
 
 
+# Message fields beyond role/content that link a tool call to the result it produced.
+_TOOL_LINK_KEYS = ("tool_calls", "tool_call_id", "name")
+
+
 def _capture_content_default() -> bool:
     """OTel makes message content opt-in and off by default (privacy)."""
     flag = os.environ.get("OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT", "")
@@ -64,9 +69,13 @@ class Tracer:
     server_port: int | None = None
     conversation_id: str | None = None  # our session id → gen_ai.conversation.id
     capture_content: bool = field(default_factory=_capture_content_default)
+    # Tool defs don't change within a turn, so the default records them once. Set
+    # False to repeat them on every chat span, making each span replayable alone.
+    tool_definitions_once_per_turn: bool = True
     _turn: int = 0
     _span_seq: int = 0
     _turn_span_id: str | None = None  # current invoke_agent parent
+    _turn_tool_defs_emitted: bool = False  # tool defs are captured once per turn
 
     def turn_start(self) -> None:
         """Begin a new user turn; subsequent events nest under it.
@@ -93,6 +102,7 @@ class Tracer:
             )
         )
         self._turn_span_id = span_id
+        self._turn_tool_defs_emitted = False
 
     def _next_span_id(self) -> str:
         self._span_seq += 1
@@ -113,6 +123,7 @@ class Tracer:
         response_id: str | None = None,
         messages: list[dict] | None = None,
         output: str | None = None,
+        tool_definitions: list[dict] | None = None,
     ) -> None:
         # Price with the model actually called; ``self.model`` is the fallback when
         # the caller doesn't pass one. (A model-less tracer would otherwise cost $0.)
@@ -137,6 +148,7 @@ class Tracer:
             response_id=response_id,
             messages=messages,
             output=output,
+            tool_definitions=tool_definitions,
         )
 
     def _add_chat_span(
@@ -150,6 +162,7 @@ class Tracer:
         response_id: str | None,
         messages: list[dict] | None,
         output: str | None,
+        tool_definitions: list[dict] | None = None,
     ) -> None:
         model = request_model or self.model
         in_tokens = int(usage.get("prompt_tokens", 0) or 0)
@@ -184,6 +197,13 @@ class Tracer:
                     attrs[events.SYSTEM_INSTRUCTIONS] = sys_text
             if output is not None:
                 attrs[events.OUTPUT_MESSAGES] = output
+            # The tool menu is identical for every call in a turn, so by default
+            # record it on the turn's first chat span rather than once per
+            # tool-loop iteration. Opt out for span-level self-containment.
+            once = self.tool_definitions_once_per_turn
+            if tool_definitions and not (once and self._turn_tool_defs_emitted):
+                attrs[events.TOOL_DEFINITIONS] = deepcopy(tool_definitions)
+                self._turn_tool_defs_emitted = True
         self.spans.append(
             Span(
                 span_id=self._next_span_id(),
@@ -199,7 +219,21 @@ class Tracer:
 
     @staticmethod
     def _content_messages(messages: list[dict]) -> list[dict]:
-        return [{"role": m.get("role", ""), "content": m.get("content", "")} for m in messages]
+        """Role and content, plus the fields that pair a tool call to its result.
+
+        Dropping ``tool_calls``/``tool_call_id`` would flatten every tool-using turn
+        into an assistant message with empty content, so the captured request would
+        not replay. Copied rather than aliased: the live history stays out of reach
+        of whatever the exporter does with the span.
+        """
+        rows = []
+        for m in messages:
+            row = {"role": m.get("role", ""), "content": m.get("content", "")}
+            for key in _TOOL_LINK_KEYS:
+                if key in m:
+                    row[key] = deepcopy(m[key])
+            rows.append(row)
+        return rows
 
     def record_tool(
         self,

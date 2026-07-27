@@ -28,6 +28,9 @@ def _run_with_tool(tracer: Tracer) -> None:
                 content="",
                 tool_calls=[
                     {
+                        # Shape matches what an OpenAI-compatible server actually
+                        # returns, `type` included — verified live against gemma.
+                        "type": "function",
                         "id": "call-1",
                         "function": {"name": "calculator", "arguments": '{"expression": "6 * 7"}'},
                     }
@@ -141,6 +144,52 @@ def test_content_on_when_enabled():
     tool = next(s for s in tr.get_spans() if s.operation == events.EXECUTE_TOOL)
     assert tool.attributes[events.INPUT_MESSAGES]
     assert tool.attributes[events.OUTPUT_MESSAGES]
+
+
+def test_tool_definitions_captured_once_per_turn():
+    # The tool schemas handed to the model are part of the request. Capture them
+    # on the turn's first chat span only — they don't change within a turn, and
+    # repeating them on every tool-loop iteration just bloats the trace.
+    tr = Tracer(model="m", capture_content=True)
+    _run_with_tool(tr)
+    chats = [s for s in tr.get_spans() if s.operation == events.CHAT]
+
+    assert len(chats) == 2
+    defs = chats[0].attributes[events.TOOL_DEFINITIONS]
+    assert {d["function"]["name"] for d in defs} >= {"calculator"}
+    assert events.TOOL_DEFINITIONS not in chats[1].attributes
+
+
+def test_tool_definitions_on_every_call_when_once_per_turn_is_off():
+    # The once-per-turn default is a preference, not a constraint: a consumer that
+    # wants each span self-contained for replay flips one flag.
+    tr = Tracer(model="m", capture_content=True, tool_definitions_once_per_turn=False)
+    _run_with_tool(tr)
+    chats = [s for s in tr.get_spans() if s.operation == events.CHAT]
+
+    assert len(chats) == 2
+    assert all(events.TOOL_DEFINITIONS in c.attributes for c in chats)
+
+
+def test_tool_definitions_absent_when_content_capture_off():
+    tr = Tracer(model="m")
+    _run_with_tool(tr)
+    for chat in (s for s in tr.get_spans() if s.operation == events.CHAT):
+        assert events.TOOL_DEFINITIONS not in chat.attributes
+
+
+def test_captured_messages_preserve_tool_calls():
+    # A turn that used tools has to round-trip: an assistant message carrying
+    # tool_calls kept them, and its tool result kept the id that pairs them.
+    tr = Tracer(model="m", capture_content=True)
+    _run_with_tool(tr)
+    chats = [s for s in tr.get_spans() if s.operation == events.CHAT]
+    messages = chats[1].attributes[events.INPUT_MESSAGES]
+
+    assistant = next(m for m in messages if m["role"] == "assistant")
+    assert assistant["tool_calls"][0]["id"] == "call-1"
+    result = next(m for m in messages if m["role"] == "tool")
+    assert result["tool_call_id"] == "call-1"
 
 
 def test_orchestrator_emits_plan_span_nested_under_turn():
