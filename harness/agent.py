@@ -430,7 +430,10 @@ class Agent:
                     name = fn.get("name", "")
                     args = fn.get("arguments", "")
                     t1 = time.perf_counter()
-                    allowed, marker = self.policy.decision(name, args)
+                    # Pass the Tool: read_only reads its declared effect, so a
+                    # custom tool the mutator name-list has never heard of is
+                    # refused rather than assumed harmless.
+                    allowed, marker = self.policy.decision(name, args, tool=self.tools.get(name))
                     if not allowed:
                         result = marker
                         status = "denied"

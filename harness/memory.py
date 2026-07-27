@@ -183,4 +183,5 @@ def search_memory_tool(base: str | Path = DEFAULT_DIR, *, exclude: str | None = 
             "required": ["query"],
         },
         func=search_memory,
+        mutates=False,
     )

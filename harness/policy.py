@@ -35,16 +35,23 @@ class Policy:
     approve: Callable[[str, str], bool] | None = None  # approval backend
     mutators: frozenset[str] = DEFAULT_MUTATORS
 
-    def decision(self, name: str, args: str) -> tuple[bool, str]:
+    def decision(self, name: str, args: str, tool: object | None = None) -> tuple[bool, str]:
         """Return ``(allowed, marker)``. ``marker`` is the tool-result string to
         record when a call is refused, so a denial reads clearly in the transcript
         (and empty when the call is allowed). Fail closed: a gated tool with no
-        approver is denied."""
+        approver is denied.
+
+        ``tool`` is the registered ``Tool``, when the caller has it. ``read_only``
+        needs it: ``mutators`` only knows carbon's own built-in names, so a custom
+        tool called ``save_report`` would slip past a name-only check. A Tool
+        declares its own effect via ``mutates`` (default ``True``), so an
+        undeclared consumer tool is refused rather than assumed harmless. Callers
+        without a registry (a standalone Policy) keep the name-only behavior."""
         if self.allow is not None and name not in self.allow:
             return False, "[denied: not permitted by policy]"
         if name in self.deny:
             return False, "[denied: not permitted by policy]"
-        if self.read_only and name in self.mutators:
+        if self.read_only and (name in self.mutators or getattr(tool, "mutates", False)):
             return False, "[denied: read-only policy]"
         if name in self.require_approval:
             ok = self.approve(name, args) if self.approve else False

@@ -120,6 +120,14 @@ class Tool:
     # v0.2: this tool's own result budget. ``None`` uses the global door clamp
     # (CONFIG.max_item_chars); set it to truncate a chatty tool at its own size.
     max_result_chars: int | None = None
+    # v0.4: does this tool change anything outside the conversation? A read-only
+    # policy consults it. The default is ``True`` — carbon cannot inspect a
+    # consumer's callable to find out, and a permission boundary that guesses
+    # "harmless" about code it has never seen is not a boundary. A tool named
+    # ``save_report`` is not in ``DEFAULT_MUTATORS``, so name-matching alone
+    # would have let it write. Declare ``mutates=False`` to let a read-only
+    # agent use it.
+    mutates: bool = True
 
 
 class ToolRegistry:
@@ -255,6 +263,7 @@ def read_file_tool(root: str | Path | None = None) -> Tool:
             "additionalProperties": False,
         },
         func=_read,
+        mutates=False,
     )
 
 
@@ -263,11 +272,21 @@ def _confined(root: str | Path | None) -> Path:
 
 
 def _visible_files(base: Path, pattern: str) -> list[Path]:
-    """Files under ``base`` matching ``pattern``, minus secrets and VCS/venv noise."""
+    """Files under ``base`` matching ``pattern``, minus secrets and VCS/venv noise.
+
+    Confinement is judged on the *resolved* target, not the apparent path. A
+    symlink inside the workspace can name anything on the host — ``innocent.txt``
+    pointing at a file outside the root, or at ``.env`` — so checking the link's
+    own name would leak the content it points to. ``read_file`` already resolves
+    before its containment check; these have to agree with it.
+    """
     skip = {".git", ".venv", "venv", "node_modules", "__pycache__", ".mypy_cache", ".ruff_cache"}
     out = []
     for p in sorted(base.glob(pattern)):
-        if not p.is_file() or _is_secret_file(p):
+        target = p.resolve()
+        if target != base and base not in target.parents:
+            continue  # symlink (or traversal) out of the workspace
+        if not target.is_file() or _is_secret_file(p) or _is_secret_file(target):
             continue
         if skip & set(p.relative_to(base).parts):
             continue
@@ -335,6 +354,7 @@ def list_files_tool(root: str | Path | None = None) -> Tool:
             "additionalProperties": False,
         },
         func=_list,
+        mutates=False,
     )
 
 
@@ -355,6 +375,7 @@ def search_text_tool(root: str | Path | None = None) -> Tool:
             "additionalProperties": False,
         },
         func=_search,
+        mutates=False,
     )
 
 
@@ -370,6 +391,7 @@ def default_tools() -> ToolRegistry:
                 "required": ["expression"],
             },
             func=calculator,
+            mutates=False,
         )
     )
     reg.register(read_file_tool())

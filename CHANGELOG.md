@@ -46,6 +46,14 @@ tuning to bounded strategy selection, so Refinery has more to work with.
 
 ### Changed
 
+- **`Tool.mutates` (default `True`) — a behavior change for read-only policies.**
+  `Policy(read_only=True)` previously denied only carbon's own mutator *names*,
+  so a consumer tool called `save_report` ran freely. A tool now declares its
+  own effect, and an undeclared one is refused: carbon cannot inspect a
+  callable, and a boundary that guesses "harmless" is not a boundary. Existing
+  read-only consumers must add `mutates=False` to tools that only read.
+- `list_files`/`search_text` judge workspace confinement and secret refusal on
+  the *resolved* target, so a symlink cannot name its way out of the root.
 - Tool and sandbox output preserve both head and tail by default.
 - Compaction uses a cumulative, structured, tool-aware checkpoint at 80% of the
   configured context limit.

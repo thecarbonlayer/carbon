@@ -23,14 +23,15 @@ def _calls(script) -> Provider:
     return Provider("fake://delegation", "fake", responder=script)
 
 
-def _tool_call(name: str, **args) -> LLMResponse:
+def _tool_call(tool: str, **args) -> LLMResponse:  # `tool`, not `name` — a tool
+    # argument may itself be called "name" (see save_report below).
     return LLMResponse(
         content="",
         tool_calls=[
             {
                 "id": "1",
                 "type": "function",
-                "function": {"name": name, "arguments": json.dumps(args)},
+                "function": {"name": tool, "arguments": json.dumps(args)},
             }
         ],
     )
@@ -268,3 +269,102 @@ def test_read_only_workers_can_still_explore_the_repository():
     assert "outside" in list_files("../**", root=root) or "must stay inside" in list_files(
         "/etc/**", root=root
     )
+
+
+def test_read_only_refuses_a_custom_tool_that_never_declared_its_effect():
+    """`Policy.mutators` only knows carbon's own built-in names.
+
+    A consumer tool called `save_report` is not `write_file`, so a name-only check
+    waves it through. carbon cannot inspect a callable to find out what it does, so
+    `Tool.mutates` defaults to True and an undeclared tool is refused.
+    """
+    root = Path(tempfile.mkdtemp())
+
+    def save_report(name: str) -> str:
+        (root / name).write_text("written")
+        return "saved"
+
+    registry = ToolRegistry()
+    registry.register(
+        Tool(
+            name="save_report",  # deliberately not in DEFAULT_MUTATORS
+            description="save a report",
+            parameters={
+                "type": "object",
+                "properties": {"name": {"type": "string"}},
+                "required": ["name"],
+            },
+            func=save_report,
+        )
+    )
+    state = {"n": 0}
+
+    def script(messages, **kwargs):
+        state["n"] += 1
+        if state["n"] == 1:
+            return _tool_call("save_report", name="report.txt")
+        return LLMResponse(content="done")
+
+    run_subagent("save it", tools=registry, provider=_calls(script))  # no policy
+
+    assert not (root / "report.txt").exists()
+
+
+def test_a_tool_declaring_itself_read_only_still_runs_under_a_read_only_policy():
+    """Fail-closed must not mean useless — a declared read-only tool is allowed."""
+    registry = ToolRegistry()
+    registry.register(
+        Tool(
+            name="describe",
+            description="describe something",
+            parameters={"type": "object", "properties": {}, "required": []},
+            func=lambda: "DESCRIBED",
+            mutates=False,
+        )
+    )
+    state = {"n": 0}
+
+    def script(messages, **kwargs):
+        state["n"] += 1
+        if state["n"] == 1:
+            return _tool_call("describe")
+        return LLMResponse(content="done")
+
+    result = Agent(provider=_calls(script), tools=registry, policy=Policy(read_only=True)).run(
+        "describe it"
+    )
+
+    assert result.tool_calls[0].result == "DESCRIBED"
+
+
+def test_exploration_tools_refuse_symlinks_that_leave_the_workspace():
+    """Confinement is judged on the resolved target, not the link's own name.
+
+    `read_file` already resolves before its containment check; list_files and
+    search_text have to agree with it or they become the exfiltration path.
+    """
+    outside = Path(tempfile.mkdtemp())
+    workspace = outside / "ws"
+    workspace.mkdir()
+    (outside / "secret_outside.txt").write_text("EXFILTRATED")
+    (workspace / "innocent.txt").symlink_to(outside / "secret_outside.txt")
+    (workspace / "real.txt").write_text("legitimate")
+
+    from harness.tools import list_files, search_text
+
+    listing = list_files("**/*", root=workspace)
+    assert "real.txt" in listing
+    assert "innocent.txt" not in listing
+    assert "no matches" in search_text("EXFILTRATED", root=workspace)
+
+
+def test_exploration_tools_refuse_symlinks_to_secret_files():
+    """A link inside the workspace pointing at .env is still a secret read."""
+    workspace = Path(tempfile.mkdtemp())
+    (workspace / ".env").write_text("LLM_API_KEY=secret")
+    (workspace / "harmless.txt").symlink_to(workspace / ".env")
+
+    from harness.tools import list_files, search_text
+
+    assert "harmless.txt" not in list_files("**/*", root=workspace)
+    assert "no matches" in search_text("LLM_API_KEY", root=workspace)
