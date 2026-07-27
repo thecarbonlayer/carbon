@@ -399,6 +399,7 @@ class Agent:
                     request_model=self.model,
                     messages=payload,  # optional content; captured only when enabled
                     output=resp.content,
+                    tool_definitions=specs,  # the same list already sent to chat()
                 )
             if resp.tool_calls and self.tools is not None:
                 self.messages.append(
