@@ -153,7 +153,15 @@ class Agent:
         # ch-08: prefer the model's reported usage; fall back to an estimate on turn one.
         self.just_compacted = False
         window = self._last_tokens or estimate_tokens(self.messages)
-        trigger = int(self.context_limit * CONFIG.compaction.trigger_fraction)
+        policy = CONFIG.compaction
+        trigger = int(self.context_limit * policy.trigger_fraction)
+        if policy.completion_reserve:
+            # An explicit reserve for the reply. `trigger_fraction` scales with the
+            # window, but the completion does not — the reply that has to fit is about
+            # the same size at 4k and at 128k, so a fraction that leaves room at one
+            # leaves far too little or absurdly much at the other. Whichever door is
+            # tighter wins, so adding a reserve can only ever compact earlier.
+            trigger = min(trigger, self.context_limit - policy.completion_reserve)
         if window > trigger:
             managed = compact(self.messages, model=self.model, provider=self.provider)
             if managed is self.messages:
