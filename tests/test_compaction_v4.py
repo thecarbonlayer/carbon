@@ -7,10 +7,12 @@ mechanism is removed rather than merely if the output changes shape.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from unittest.mock import patch
 
 from harness import checkpoint, compaction
-from model import LLMResponse
+from harness.harness_config import CONFIG
+from model import LLMResponse, Provider
 
 
 def _reply(text: str = "CHECKPOINT"):
@@ -295,6 +297,69 @@ def test_empty_middle_carries_the_checkpoint_forward_without_calling_the_model()
     note = next(m["content"] for m in out if str(m.get("content", "")).startswith("[summary"))
     assert "KEEP-ME-7" in note, "the carried-forward checkpoint lost its content"
     assert note.count("[summary of earlier conversation") == 1, "note header was nested"
+
+
+def test_overflow_recovery_still_compacts_a_short_prefix_under_token_budgeting():
+    """Regression: found live, not in review, in a full-suite delta run (H2 went
+    1.0 -> 0.0 — a catastrophic regression, and the acceptance rule correctly
+    refused the candidate over it).
+
+    ``_compact_active_history()`` (the overflow-RECOVERY call, distinct from the
+    steady-state pre-turn door) used to call ``compact()`` with no override, so it
+    inherited whatever ``recent_token_reserve`` was configured. A prefix that is
+    many messages but few TOKENS — exactly this fixture, and exactly what a real
+    session can produce after a burst of short tool-call acknowledgements — fits
+    entirely inside a real reserve, so the token-budgeted cut correctly finds no
+    middle to summarize. Correct as a general policy; wrong for this one caller,
+    whose job is to guarantee SOME reduction happens or the identical overflow
+    recurs on retry with no path forward.
+
+    The fix passes ``recent_token_reserve=0`` at this ONE call site, which by
+    ``_token_budget_cut``'s own design falls back to the guaranteed-progress
+    message-count cut — restoring the pre-v4 robustness property for this path
+    while leaving steady-state compaction fully token-budgeted everywhere else.
+    """
+    state = {"main_calls": 0, "summary_calls": 0}
+
+    def responder(messages, **kwargs):
+        is_summary = bool(
+            messages
+            and messages[0].get("role") == "system"
+            and "checkpoint" in str(messages[0].get("content", "")).lower()
+        )
+        if is_summary:
+            state["summary_calls"] += 1
+            return LLMResponse(content="CHECKPOINT")
+        state["main_calls"] += 1
+        if state["main_calls"] == 1:
+            raise RuntimeError("maximum context length exceeded")
+        return LLMResponse(content="OVERFLOW-RECOVERED")
+
+    provider = Provider("fake://overflow", "fake", responder=responder)
+    budgeted = replace(
+        CONFIG,
+        compaction=replace(
+            CONFIG.compaction, strategy="token_budget_checkpoint", recent_token_reserve=200
+        ),
+    )
+    from harness.agent import Agent
+
+    # Patched in BOTH modules' namespaces: `from harness.harness_config import CONFIG`
+    # binds a name in each importing module, so patching the origin alone would not
+    # reach either module's already-bound reference.
+    with patch("harness.compaction.CONFIG", budgeted), patch("harness.agent.CONFIG", budgeted):
+        agent = Agent(provider=provider)
+        # Many small messages, few tokens — the exact shape that made compaction a
+        # silent no-op: comfortably under a 200-token reserve regardless of count.
+        agent.messages = [{"role": "user", "content": f"old-{i}"} for i in range(10)]
+        result = agent.run("continue")
+
+    assert result.text == "OVERFLOW-RECOVERED", (
+        f"overflow was not recovered under token_budget_checkpoint; "
+        f"calls={state} reply={result.text!r}"
+    )
+    assert state == {"main_calls": 2, "summary_calls": 1}
+    assert agent.compaction_count == 1
 
 
 def test_unknown_strategy_is_refused():
