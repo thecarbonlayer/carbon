@@ -27,11 +27,12 @@ import json
 import sys
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 from harness.compaction import compact, estimate_tokens
 from harness.context import deliver
-from harness.harness_config import CONFIG
+from harness.harness_config import CONFIG, RetryPolicy
 from harness.instructions import load_agents_md, test_command
 from harness.limits import truncate
 from harness.memory import DEFAULT_DIR, load_session, load_trace, save_session, save_trace
@@ -50,6 +51,41 @@ DEFAULT_CONTEXT_LIMIT = CONFIG.default_context_limit  # ~tokens; compact above t
 APPROVAL_TOOLS = CONFIG.approval_tools  # tools the gate guards
 # a write/edit of one of these arms the test gate (a code change to verify)
 CODE_EXTENSIONS = CONFIG.code_extensions
+
+
+# --- retry strategies, registry-shaped to match compaction.py and limits.py --------
+#
+# `fail_fast` has no behavior of its own — it IS the absence of `backoff`'s — so a
+# registry is not needed for either function to stay simple. It exists anyway so
+# every strategy-shaped config knob (compaction, tool_output/file_injection, retry)
+# looks up its dispatch the same way, rather than three different shapes plus a note
+# explaining why this one is an exception.
+def _backoff_delay(attempt: int, policy: RetryPolicy) -> float | None:
+    """Delay in seconds before the NEXT try, or None if there is no next try.
+
+    `attempt` is 1-indexed and incremented before this is consulted, so
+    `max_attempts` bounds total tries, not retries: with max_attempts=3, a delay is
+    offered at attempt=1 and attempt=2 (two retries), refused at attempt=3 — three
+    tries total, matching the field's name.
+    """
+    if attempt >= policy.max_attempts:
+        return None
+    return policy.base_delay_ms * (2 ** (attempt - 1)) / 1000
+
+
+def _fail_fast_delay(_attempt: int, _policy: RetryPolicy) -> float | None:
+    return None
+
+
+@dataclass(frozen=True)
+class _RetryStrategy:
+    next_delay: Callable[[int, RetryPolicy], float | None]
+
+
+_RETRY_STRATEGIES: dict[str, _RetryStrategy] = {
+    "backoff": _RetryStrategy(_backoff_delay),
+    "fail_fast": _RetryStrategy(_fail_fast_delay),
+}
 
 
 class Agent:
@@ -544,7 +580,18 @@ class Agent:
         """
         prefix = self.messages[: self._active_turn_start]
         current_turn = self.messages[self._active_turn_start :]
-        managed = compact(prefix, model=self.model, provider=self.provider)
+        # recent_token_reserve=0 forces the guaranteed-progress message-count cut
+        # regardless of the configured steady-state strategy. Token budgeting is a
+        # legitimate policy for the ordinary pre-turn door — "everything within the
+        # reserve counts as recent, leave it" — but this call has a stronger, different
+        # requirement: an overflow just happened, and returning the prefix unchanged
+        # means the identical request overflows again with no path forward. A short
+        # prefix (many small messages, few tokens — exactly a fault-injection fixture,
+        # but not only that) can fit entirely inside a real token reserve and make
+        # compact() correctly report nothing to summarize; here that correctness is a
+        # regression, so this caller opts out of the reserve rather than the reserve
+        # quietly making an exception for it.
+        managed = compact(prefix, model=self.model, provider=self.provider, recent_token_reserve=0)
         compacted = managed is not prefix
         if compacted:
             self.messages = managed + current_turn
@@ -612,15 +659,15 @@ class Agent:
                     overflow_recovered = True
                     self.retry_count += 1
                     continue
-                can_retry = (
-                    policy.strategy == "backoff"
-                    and self._transient_error(exc)
-                    and attempt < policy.max_attempts
+                strat = _RETRY_STRATEGIES.get(policy.strategy)
+                delay = (
+                    strat.next_delay(attempt, policy)
+                    if strat and self._transient_error(exc)
+                    else None
                 )
-                if not can_retry:
+                if delay is None:
                     raise
                 self.retry_count += 1
-                delay = policy.base_delay_ms * (2 ** (attempt - 1)) / 1000
                 if delay:
                     time.sleep(delay)
 
