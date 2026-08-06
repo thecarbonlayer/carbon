@@ -249,6 +249,7 @@ def test_config_schema_describes_the_surface():
     assert by["compaction"]["strategies"] == [
         "structured_checkpoint",
         "summarize_middle",
+        "token_budget_checkpoint",
     ]
     assert by["retry"]["strategies"] == ["backoff", "fail_fast"]
 

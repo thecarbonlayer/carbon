@@ -54,13 +54,27 @@ class TruncationPolicy:
 
 @dataclass(frozen=True)
 class CompactionPolicy:
-    """When and how conversation history is compacted."""
+    """When and how conversation history is compacted.
+
+    The last three fields are the ``token_budget_checkpoint`` surface and default to
+    values that reproduce the previous behavior exactly, so adding them is additive and
+    default-neutral: an existing config file omits them, gets these defaults, and
+    computes the same ``config_version``. That matters because an external improver
+    pins its recorded baselines to that version — a default that shifted behavior would
+    silently invalidate every one of them.
+    """
 
     strategy: str
     keep_head: int
     keep_tail: int
     trigger_fraction: float
     summary_max_tokens: int
+    # 0 disables token budgeting and falls back to the ``keep_tail`` message count.
+    recent_token_reserve: int = 0
+    # 0 disables the reserve; the trigger is then ``trigger_fraction`` alone.
+    completion_reserve: int = 0
+    # Bounded door for a checkpoint that outgrows ``summary_max_tokens``.
+    checkpoint_fallback: str = "head_tail"
 
 
 @dataclass(frozen=True)
@@ -130,7 +144,14 @@ _POSITIVE_INT_FIELDS = {
 }
 
 _TRUNCATION_STRATEGIES = frozenset({"keep_head", "head_tail"})
-_COMPACTION_STRATEGIES = frozenset({"summarize_middle", "structured_checkpoint"})
+_COMPACTION_STRATEGIES = frozenset(
+    {"summarize_middle", "structured_checkpoint", "token_budget_checkpoint"}
+)
+# Additive `token_budget_checkpoint` knobs. Optional so an existing config file stays
+# valid and its ``config_version`` — which external baselines pin to — does not move.
+_COMPACTION_OPTIONAL = frozenset(
+    {"recent_token_reserve", "completion_reserve", "checkpoint_fallback"}
+)
 _RETRY_STRATEGIES = frozenset({"fail_fast", "backoff"})
 
 # These are correctness and trust properties, not optimization choices. They
@@ -231,8 +252,17 @@ def _check_field(key: str, value: object, expected: type) -> None:
         )
 
 
-def _object_keys(name: str, value: dict, expected: set[str]) -> None:
-    unknown = sorted(set(value) - expected)
+def _object_keys(
+    name: str, value: dict, expected: set[str], optional: frozenset[str] = frozenset()
+) -> None:
+    """Exact key check, with an allowance for additive fields.
+
+    ``optional`` exists so a new bounded strategy can ship its knobs without forcing
+    every existing config file — and every baseline pinned to its version — through a
+    rewrite. Optional keys are still type-validated when present; they are simply not
+    required to be there.
+    """
+    unknown = sorted(set(value) - expected - optional)
     missing = sorted(expected - set(value))
     if unknown or missing:
         raise ValueError(
@@ -268,6 +298,7 @@ def _compaction_policy(value: dict) -> CompactionPolicy:
         name,
         value,
         {"strategy", "keep_head", "keep_tail", "trigger_fraction", "summary_max_tokens"},
+        _COMPACTION_OPTIONAL,
     )
     strategy = value["strategy"]
     if strategy not in _COMPACTION_STRATEGIES:
@@ -279,6 +310,21 @@ def _compaction_policy(value: dict) -> CompactionPolicy:
         item = value[key]
         if not isinstance(item, int) or isinstance(item, bool) or item <= 0:
             raise ValueError(f"harness config: field {name!r}.{key} must be a positive integer")
+    # Reserves may be 0 — that is how they are switched off — so they are validated as
+    # non-negative, unlike the required fields above.
+    for key in ("recent_token_reserve", "completion_reserve"):
+        if key in value:
+            item = value[key]
+            if not isinstance(item, int) or isinstance(item, bool) or item < 0:
+                raise ValueError(
+                    f"harness config: field {name!r}.{key} must be a non-negative integer"
+                )
+    fallback = value.get("checkpoint_fallback", "head_tail")
+    if fallback not in _TRUNCATION_STRATEGIES:
+        raise ValueError(
+            f"harness config: field {name!r}.checkpoint_fallback must be one of "
+            f"{sorted(_TRUNCATION_STRATEGIES)}, got {_short(fallback)}"
+        )
     fraction = value["trigger_fraction"]
     if (
         not isinstance(fraction, int | float)
@@ -294,6 +340,9 @@ def _compaction_policy(value: dict) -> CompactionPolicy:
         value["keep_tail"],
         float(fraction),
         value["summary_max_tokens"],
+        value.get("recent_token_reserve", 0),
+        value.get("completion_reserve", 0),
+        fallback,
     )
 
 
