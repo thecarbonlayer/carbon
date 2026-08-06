@@ -96,6 +96,7 @@ _SEAM: dict[str, str] = {
     "sandbox": "tool execution",
     "subagents": "orchestration",
     "workspace": "tool execution",
+    "patch": "tool execution",
     "observability": "observability",
     "agent": "loop",
     "extensions": "tool execution",

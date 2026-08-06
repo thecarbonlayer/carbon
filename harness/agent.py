@@ -707,7 +707,7 @@ def _coding_tools(
     from harness.sandbox import Sandbox, bash_tool
     from harness.subagents import delegate_tool, fan_out_tool
     from harness.tools import default_tools
-    from harness.workspace import edit_file_tool, write_file_tool
+    from harness.workspace import apply_patch_tool, edit_file_tool, write_file_tool
 
     root = str(workspace.root)
     memory_dir = sessions_dir if sessions_dir is not None else DEFAULT_DIR
@@ -728,6 +728,7 @@ def _coding_tools(
     tools = default_tools(root)
     tools.register(write_file_tool(workspace))
     tools.register(edit_file_tool(workspace))
+    tools.register(apply_patch_tool(workspace))
     tools.register(bash_tool(Sandbox(trusted=True, timeout=120), workdir=root))
     tools.register(search_memory_tool(memory_dir, exclude=exclude_session))
     workers = worker_tools()

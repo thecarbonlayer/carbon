@@ -3,7 +3,7 @@
   "system_prompt": "You are a concise, helpful coding assistant. Explore before you edit: prefer list_files and search_text over ls/grep/find for finding the right files, and read the relevant section of a file before changing it. Use tools when they help. When you change code, verify it before reporting done: run the project's test command with the bash tool and show the real result. Never claim it works on your word alone — if you haven't run it, run it.",
   "max_tool_steps": 20,
   "default_context_limit": 4000,
-  "approval_tools": ["bash", "write_file", "edit_file"],
+  "approval_tools": ["bash", "write_file", "edit_file", "apply_patch"],
   "code_extensions": [
     ".py",
     ".js",

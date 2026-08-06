@@ -94,6 +94,37 @@ class Workspace:
         )
         return f"edited {path}\n{diff}".rstrip()
 
+    def apply_patch(self, diff: str) -> str:
+        """Apply a multi-hunk, multi-file unified diff — all its files together,
+        or none of them. See ``harness/patch.py`` for the parsing and hunk-
+        matching (exact context match at the claimed location; a mismatch
+        anywhere refuses the WHOLE patch, matching ``edit``'s own "reject rather
+        than guess" contract for a single hunk).
+
+        Returns an ``error: ...`` string on any failure, matching ``write``/
+        ``edit``'s own convention — never raises to the caller.
+        """
+        from harness.patch import PatchError, parse_patch, plan_changes
+
+        try:
+            files = parse_patch(diff)
+            if not files:
+                return "no changes: empty patch"
+            for fd in files:
+                self._safe(fd.target)  # confinement check for every file up front
+            planned = plan_changes(files, self.read, lambda p: self._safe(p).is_file())
+        except (PatchError, ValueError) as exc:
+            return f"error: {exc}"
+
+        touched = []
+        for path, content in planned:
+            if content is None:
+                self._safe(path).unlink()
+                touched.append(f"deleted {path}")
+            else:
+                touched.append(self.write(path, content))
+        return "\n".join(touched)
+
 
 def write_file_tool(ws: Workspace) -> Tool:
     return Tool(
@@ -126,6 +157,25 @@ def edit_file_tool(ws: Workspace) -> Tool:
             "required": ["path", "old", "new"],
         },
         func=ws.edit,
+    )
+
+
+def apply_patch_tool(ws: Workspace) -> Tool:
+    return Tool(
+        name="apply_patch",
+        description=(
+            "Apply a unified diff (as produced by `git diff` or `diff -u`) covering one or "
+            "more hunks across one or more files. All files apply together or none do: if "
+            "any hunk's context does not match the file's current content exactly, the "
+            "whole patch is refused and nothing is written. Prefer this over `edit_file` "
+            "for a change that spans multiple files or multiple locations in one file."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {"diff": {"type": "string"}},
+            "required": ["diff"],
+        },
+        func=ws.apply_patch,
     )
 
 
