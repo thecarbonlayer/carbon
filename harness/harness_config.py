@@ -330,11 +330,6 @@ def config_schema() -> list[dict]:
     """
     out: list[dict] = []
     for name, typ in _SCHEMA.items():
-        # Extensions are loaded from disk via harness/extensions.py and must
-        # never be discoverable or configurable through the editable surface
-        # (dev-notes/adr/0003), so code_extensions is excluded from this manifest.
-        if name == "code_extensions":
-            continue
         item = {
             "name": name,
             "type": "list[str]" if typ is list else typ.__name__,

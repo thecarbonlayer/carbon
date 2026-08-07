@@ -110,4 +110,9 @@ def test_surface_manifest_has_no_extension_field():
 
     manifest = surface_manifest()
     names = {item["name"] for item in manifest["editable"] + manifest["locked_fields"]}
-    assert not any("extension" in n for n in names)
+    # code_extensions (file suffixes like .py that arm the test gate) is a real,
+    # unrelated field — this checks for the plugin-loader surface specifically,
+    # not any field whose name happens to contain "extension".
+    assert "extensions_dir" not in names
+    assert "extension_dirs" not in names
+    assert "extensions" not in names
