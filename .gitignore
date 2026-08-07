@@ -12,3 +12,6 @@ build/
 .sessions/
 .agent_state/
 docs/superpowers/
+# extension directory convention (dev-notes/adr/0003) — user- or project-local
+# .py files loaded via --extensions, plus example output like .carbon/audit.log
+.carbon/
