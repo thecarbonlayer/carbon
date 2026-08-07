@@ -394,6 +394,7 @@ def calculator_tool() -> Tool:
             "type": "object",
             "properties": {"expression": {"type": "string"}},
             "required": ["expression"],
+            "additionalProperties": False,
         },
         func=calculator,
         mutates=False,

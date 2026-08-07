@@ -91,6 +91,10 @@ class Orchestrator:
 def _tools():
     from harness.tools import calculator_tool, default_tools
 
+    # calculator is opt-in everywhere else; it's hardcoded here (not exposed
+    # as an Orchestrator param) because ch-10's own worked examples in
+    # tasks/checks.py are arithmetic tasks, and Orchestrator.run() has no
+    # tools= injection point to give them calculator any other way.
     tools = default_tools()
     tools.register(calculator_tool())
     return tools

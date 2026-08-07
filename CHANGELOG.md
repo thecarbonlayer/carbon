@@ -24,6 +24,17 @@ One entry per release; commits stay fine-grained under a `feat(surface)` or
 - The `gemma_sha` key in `provenance()` is deliberately **not** renamed. It is a
   wire format, and every measurement record ever written carries it; renaming
   would orphan committed evidence. New keys use the new name.
+- **`default_tools()` drops `calculator`, gains `list_files`/`search_text`.** The
+  default registry only ever exposed `calculator` + `read_file`, while
+  `list_files_tool()` and `search_text_tool()` — hardened the same way as
+  `read_file` (workspace-confined, secrets excluded, symlink-escape checked) —
+  sat implemented but unregistered, and the system prompt left exploration to
+  the model's own judgment instead of pointing at a workspace-confined tool
+  for it. `calculator` was a ch-05 teaching artifact a coding agent doesn't
+  need by default; it remains available via the new `calculator_tool()`
+  factory in `harness.tools` (not re-exported through the `carbon` façade)
+  for callers (tests, `Orchestrator`, demos) that want a deterministic,
+  easily-verified arithmetic tool call.
 
 ## [0.4.0] - 2026-07-26
 
