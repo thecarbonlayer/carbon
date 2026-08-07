@@ -223,7 +223,6 @@ def test_config_schema_describes_the_surface():
         "max_tool_steps",
         "default_context_limit",
         "approval_tools",
-        "code_extensions",
         "verify_attempts",
         "require_run",
         "max_item_chars",
