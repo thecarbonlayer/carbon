@@ -10,45 +10,15 @@ contract narrow, and validate arguments. ``read_file`` returns a file's
 contents, and ``list_files``/``search_text`` explore the tree — and as of
 ch-08 all three are confined to the workspace: a model-invoked tool must not
 wander the host filesystem, so paths are resolved and must live under the
-working directory. ``calculator`` (evaluates arithmetic without ``eval``)
-still exists for callers that want a deterministic, easily-verified tool call,
-but it is not part of ``default_tools()`` — a coding agent doesn't need
-arithmetic.
+working directory.
 """
 
 from __future__ import annotations
 
-import ast
 import json
-import operator
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-
-_BINOPS = {
-    ast.Add: operator.add,
-    ast.Sub: operator.sub,
-    ast.Mult: operator.mul,
-    ast.Div: operator.truediv,
-    ast.Pow: operator.pow,
-    ast.Mod: operator.mod,
-}
-
-
-def calculator(expression: str) -> str:
-    """Evaluate a basic arithmetic expression safely (no eval, just numbers + + - * / % **)."""
-
-    def ev(node: ast.AST) -> float:
-        if isinstance(node, ast.Constant) and isinstance(node.value, int | float):
-            return node.value
-        if isinstance(node, ast.BinOp) and type(node.op) in _BINOPS:
-            return _BINOPS[type(node.op)](ev(node.left), ev(node.right))
-        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
-            return -ev(node.operand)
-        raise ValueError("unsupported expression")
-
-    result = ev(ast.parse(expression, mode="eval").body)
-    return str(int(result) if result == int(result) else result)
 
 
 def _is_secret_file(p: Path) -> bool:
@@ -379,24 +349,6 @@ def search_text_tool(root: str | Path | None = None) -> Tool:
             "additionalProperties": False,
         },
         func=_search,
-        mutates=False,
-    )
-
-
-def calculator_tool() -> Tool:
-    """A ``calculator`` tool — not part of ``default_tools()``. Registered
-    explicitly by callers (tests, ``Orchestrator``, demos) that want a
-    deterministic, easily-verified arithmetic tool call."""
-    return Tool(
-        name="calculator",
-        description="Evaluate an arithmetic expression like '47 * 89'.",
-        parameters={
-            "type": "object",
-            "properties": {"expression": {"type": "string"}},
-            "required": ["expression"],
-            "additionalProperties": False,
-        },
-        func=calculator,
         mutates=False,
     )
 

@@ -17,7 +17,7 @@ from harness.harness_config import CONFIG, config_schema
 from harness.policy import Policy
 from harness.provenance import provenance
 from harness.result import RunResult
-from harness.tools import Tool, ToolRegistry, calculator_tool, default_tools
+from harness.tools import Tool, ToolRegistry, default_tools
 from model import LLMResponse, Provider, chat, fake
 
 _EMPTY_PARAMS = {"type": "object", "properties": {}}
@@ -39,33 +39,40 @@ def _scripted(responses: list[LLMResponse]) -> Provider:
     return Provider(base_url="fake://x", model="fake", api_key="x", responder=responder)
 
 
-def _calc_call(expr: str) -> LLMResponse:
+def _double_call(n: int) -> LLMResponse:
     return LLMResponse(
         content="",
-        tool_calls=[
-            {
-                "id": "1",
-                "function": {"name": "calculator", "arguments": f'{{"expression": "{expr}"}}'},
-            }
-        ],
+        tool_calls=[{"id": "1", "function": {"name": "double", "arguments": f'{{"n": {n}}}'}}],
     )
 
 
 def _tool_then_done() -> Provider:
-    return _scripted([_calc_call("6*7"), LLMResponse(content="done", finish_reason="stop")])
+    return _scripted([_double_call(21), LLMResponse(content="done", finish_reason="stop")])
 
 
-def _tools_with_calculator() -> ToolRegistry:
-    """calculator is opt-in (not a default tool) — tests exercising it via the
-    scripted ``_calc_call`` provider register it explicitly."""
-    reg = default_tools()
-    reg.register(calculator_tool())
+def _tools_with_double() -> ToolRegistry:
+    """A minimal scripted tool for exercising generic Agent tool-loop mechanics
+    (budget, approvals, structured results) — unrelated to any specific
+    default tool, so it has no dependency on what default_tools() contains."""
+    reg = ToolRegistry()
+    reg.register(
+        Tool(
+            name="double",
+            description="",
+            parameters={
+                "type": "object",
+                "properties": {"n": {"type": "integer"}},
+                "required": ["n"],
+            },
+            func=lambda n: str(n * 2),
+        )
+    )
     return reg
 
 
 # --- T1.1 structured run result ----------------------------------------------
 def test_run_returns_structured_result_and_events():
-    a = Agent(provider=_tool_then_done(), tools=_tools_with_calculator())
+    a = Agent(provider=_tool_then_done(), tools=_tools_with_double())
     events: list[dict] = []
     a.subscribe(events.append)
 
@@ -76,7 +83,7 @@ def test_run_returns_structured_result_and_events():
     assert r.turns == 2 and r.stop_reason == "stop"
     assert len(r.tool_calls) == 1
     tc = r.tool_calls[0]
-    assert tc.name == "calculator" and tc.result == "42"
+    assert tc.name == "double" and tc.result == "42"
     assert tc.is_error is False and tc.attributes == {}  # carbon leaves the bag empty
 
     kinds = [e["type"] for e in events]
@@ -91,10 +98,10 @@ def test_send_still_returns_text():
 
 def test_tool_budget_stop_reason():
     def always_tool(messages, **k) -> LLMResponse:
-        return _calc_call("1+1")
+        return _double_call(1)
 
     p = Provider(base_url="fake://x", model="fake", api_key="x", responder=always_tool)
-    r = Agent(provider=p, tools=_tools_with_calculator()).run("loop forever")
+    r = Agent(provider=p, tools=_tools_with_double()).run("loop forever")
     assert r.stop_reason == "tool_budget"
 
 
@@ -104,10 +111,10 @@ def test_max_tool_steps_overrides_the_module_global():
 
     def always_tool(messages, **k) -> LLMResponse:
         calls["n"] += 1
-        return _calc_call("1+1")
+        return _double_call(1)
 
     p = Provider(base_url="fake://x", model="fake", api_key="x", responder=always_tool)
-    r = Agent(provider=p, tools=_tools_with_calculator(), max_tool_steps=3).run("loop forever")
+    r = Agent(provider=p, tools=_tools_with_double(), max_tool_steps=3).run("loop forever")
 
     assert r.stop_reason == "tool_budget"
     assert calls["n"] == 3
@@ -178,8 +185,8 @@ def test_policy_decisions():
 def test_approvals_counted_via_backcompat_args():
     a = Agent(
         provider=_tool_then_done(),
-        tools=_tools_with_calculator(),
-        approval_required={"calculator"},
+        tools=_tools_with_double(),
+        approval_required={"double"},
         approve=lambda n, a: True,
     )
     r = a.run("compute it")
@@ -201,14 +208,11 @@ def test_registry_get_names_wrap():
 
 
 def test_default_tools_are_read_only_exploration_and_reading():
-    """calculator is a teaching artifact, not a coding-agent need — it must be
-    opt-in via calculator_tool(), not silently present in the default registry."""
+    """The default registry is exactly the three read-only exploration/reading
+    tools — no arithmetic, nothing a coding agent doesn't need."""
     reg = default_tools()
     assert set(reg.names()) == {"read_file", "list_files", "search_text"}
     assert all(reg.get(name).mutates is False for name in reg.names())
-
-    reg.register(calculator_tool())
-    assert reg.call("calculator", '{"expression": "6 * 7"}') == "42"
 
     assert "harness/tools.py" in reg.call("list_files", '{"pattern": "harness/tools.py"}')
     assert "def default_tools" in reg.call("search_text", '{"query": "def default_tools"}')
