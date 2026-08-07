@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 import harness.agent as agent_mod
 from harness.observability import Tracer
-from harness.tools import calculator_tool, default_tools
+from harness.tools import ToolRegistry, read_file_tool
 from model import LLMResponse
 
 
@@ -41,7 +41,8 @@ def test_event_captures_args_and_result():
     assert "expression" in tr.timeline() and "-> 4" in tr.timeline()
 
 
-def test_agent_trace_records_tool_io():
+def test_agent_trace_records_tool_io(tmp_path):
+    (tmp_path / "note.txt").write_text("42")
     replies = iter(
         [
             LLMResponse(
@@ -49,15 +50,15 @@ def test_agent_trace_records_tool_io():
                 tool_calls=[
                     {
                         "id": "1",
-                        "function": {"name": "calculator", "arguments": '{"expression": "6 * 7"}'},
+                        "function": {"name": "read_file", "arguments": '{"path": "note.txt"}'},
                     }
                 ],
             ),
             LLMResponse(content="done"),
         ]
     )
-    tools = default_tools()
-    tools.register(calculator_tool())
+    tools = ToolRegistry()
+    tools.register(read_file_tool(root=tmp_path))
     tr = Tracer()
     with patch.object(agent_mod, "chat", side_effect=lambda *a, **k: next(replies)):
         a = agent_mod.Agent(tools=tools, tracer=tr)
@@ -65,5 +66,5 @@ def test_agent_trace_records_tool_io():
 
     tool_events = [e for e in tr.events if e.kind == "tool"]
     assert tool_events
-    assert "6 * 7" in tool_events[0].args
+    assert "note.txt" in tool_events[0].args
     assert tool_events[0].result == "42"

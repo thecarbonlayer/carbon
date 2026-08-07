@@ -47,10 +47,13 @@ One entry per release; commits stay fine-grained under a `feat(surface)` or
   sat implemented but unregistered, and the system prompt left exploration to
   the model's own judgment instead of pointing at a workspace-confined tool
   for it. `calculator` was a ch-05 teaching artifact a coding agent doesn't
-  need by default; it remains available via the new `calculator_tool()`
-  factory in `harness.tools` (not re-exported through the `carbon` façade)
-  for callers (tests, `Orchestrator`, demos) that want a deterministic,
-  easily-verified arithmetic tool call.
+  need — every check and test that used it as a stand-in for "some tool with
+  a verifiable exact result" now uses `read_file`/`list_files`/`search_text`
+  (or a small local fake) instead, so `calculator()` and its `Tool` wrapper
+  were deleted outright rather than kept around as a permanently-unused
+  opt-in. `Orchestrator` gained a real `tools=` constructor param in the same
+  pass, closing the one place that previously had no way to give a worker
+  anything other than the process-wide default.
 
 ## [0.4.0] - 2026-07-26
 
