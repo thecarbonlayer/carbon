@@ -693,6 +693,7 @@ def run_once(
     provider: Provider | None = None,
     fmt: str = "plain",
     yes: bool = False,
+    extensions: bool = False,
     on_delta: OnDelta | None = None,
     session: str | None = None,
     sessions_dir: str = DEFAULT_DIR,
@@ -706,7 +707,8 @@ def run_once(
     no history accumulates across calls — a one-shot is independent. Unlike the REPL
     (which works in a throwaway git worktree), print mode operates on
     ``workspace_root`` (the real project by default) — the deliberate one-shot
-    posture: it's your command, gated by approval unless you pass ``--yes``."""
+    posture: it's your command, gated by approval unless you pass ``--yes``, and
+    loads no extensions unless ``extensions=True``."""
     from harness.extensions import load_extensions
     from harness.render import render_json, render_plain, render_transcript
     from harness.skills import load_skills
@@ -722,7 +724,8 @@ def run_once(
         model=provider.model,
         sessions_dir=sessions_dir,
     )
-    load_extensions(tools, *_extension_dirs(workspace.root))
+    if extensions:
+        load_extensions(tools, *_extension_dirs(workspace.root))
     agent = Agent(
         system=DEFAULT_SYSTEM,
         provider=provider,
@@ -785,6 +788,14 @@ def main() -> None:
         help="token budget before the window is compacted (default: %(default)s). "
         "Set it low, e.g. 400, to watch compaction fire live.",
     )
+    parser.add_argument(
+        "--extensions",
+        action="store_true",
+        help="load .py extensions from ~/.carbon/extensions/ and .carbon/extensions/ "
+        "(off by default: a file the agent's own write_file tool writes into "
+        ".carbon/extensions/ would otherwise auto-run, unsandboxed and unapproved, "
+        "on every future invocation).",
+    )
     args = parser.parse_args()
 
     if args.prompt is not None:
@@ -798,10 +809,25 @@ def _run_print_mode(args: argparse.Namespace) -> None:
     provider = Provider.from_env()
     if args.format == "plain":
         # Stream the answer live to stdout; the returned render is what we streamed.
-        run_once(args.prompt, provider=provider, fmt="plain", yes=args.yes, on_delta=_stdout_sink)
+        run_once(
+            args.prompt,
+            provider=provider,
+            fmt="plain",
+            yes=args.yes,
+            extensions=args.extensions,
+            on_delta=_stdout_sink,
+        )
         print()  # terminate the streamed line
     else:
-        print(run_once(args.prompt, provider=provider, fmt=args.format, yes=args.yes))
+        print(
+            run_once(
+                args.prompt,
+                provider=provider,
+                fmt=args.format,
+                yes=args.yes,
+                extensions=args.extensions,
+            )
+        )
 
 
 def _run_repl(args: argparse.Namespace) -> None:
@@ -831,7 +857,8 @@ def _run_repl(args: argparse.Namespace) -> None:
     tools = _coding_tools(
         workspace, exclude_session="repl", provider=provider, model=provider.model
     )
-    load_extensions(tools, *_extension_dirs(workspace.root))
+    if args.extensions:
+        load_extensions(tools, *_extension_dirs(workspace.root))
     agent = Agent(
         system=DEFAULT_SYSTEM,
         provider=provider,

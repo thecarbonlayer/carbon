@@ -6,10 +6,10 @@ already public — ``register()`` for a new tool, ``wrap()`` to layer behavior
 onto an existing one (logging, caching, fault injection) — so nothing new is
 added to the tool-call path itself (dev-notes/adr/0003). Extension
 directories are always given explicitly by the caller (the CLI's ``main()``,
-or an SDK consumer building its own ``ToolRegistry``); extension discovery
-never reads the configuration files, and extensions are never visible in the
-editable or locked configuration surface — there is no field for the
-self-improving loop to discover, create, or point somewhere.
+or an SDK consumer building its own ``ToolRegistry``); nothing here reads
+``harness/harness_config.json`` or ``CONFIG``, and extensions are never
+visible in the editable or locked configuration surface — there is no field
+for the self-improving loop to discover, create, or point somewhere.
 """
 
 from __future__ import annotations
