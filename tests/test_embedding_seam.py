@@ -17,7 +17,7 @@ from harness.harness_config import CONFIG, config_schema
 from harness.policy import Policy
 from harness.provenance import provenance
 from harness.result import RunResult
-from harness.tools import Tool, ToolRegistry, default_tools
+from harness.tools import Tool, ToolRegistry, calculator_tool, default_tools
 from model import LLMResponse, Provider, chat, fake
 
 _EMPTY_PARAMS = {"type": "object", "properties": {}}
@@ -58,8 +58,6 @@ def _tool_then_done() -> Provider:
 def _tools_with_calculator() -> ToolRegistry:
     """calculator is opt-in (not a default tool) — tests exercising it via the
     scripted ``_calc_call`` provider register it explicitly."""
-    from harness.tools import calculator_tool
-
     reg = default_tools()
     reg.register(calculator_tool())
     return reg
@@ -205,14 +203,15 @@ def test_registry_get_names_wrap():
 def test_default_tools_are_read_only_exploration_and_reading():
     """calculator is a teaching artifact, not a coding-agent need — it must be
     opt-in via calculator_tool(), not silently present in the default registry."""
-    from harness.tools import calculator_tool
-
     reg = default_tools()
     assert set(reg.names()) == {"read_file", "list_files", "search_text"}
     assert all(reg.get(name).mutates is False for name in reg.names())
 
     reg.register(calculator_tool())
     assert reg.call("calculator", '{"expression": "6 * 7"}') == "42"
+
+    assert "harness/tools.py" in reg.call("list_files", '{"pattern": "harness/tools.py"}')
+    assert "def default_tools" in reg.call("search_text", '{"query": "def default_tools"}')
 
 
 # --- T1.6 config schema -------------------------------------------------------

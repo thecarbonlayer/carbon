@@ -11,3 +11,4 @@ build/
 # durable state written by the agent in later chapters
 .sessions/
 .agent_state/
+docs/superpowers/
