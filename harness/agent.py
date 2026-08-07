@@ -625,6 +625,13 @@ def _approver(yes: bool) -> Callable[[str, str], bool] | None:
     return (lambda name, args: True) if yes else None
 
 
+def _extension_dirs(workspace_root: str | Path) -> tuple[Path, Path]:
+    """Where extensions load from: a user-level directory, then a project-local
+    one — always explicit paths at the construction site, never a config-file
+    field (dev-notes/adr/0003)."""
+    return Path.home() / ".carbon" / "extensions", Path(workspace_root) / ".carbon" / "extensions"
+
+
 def _coding_tools(
     workspace,
     *,
@@ -700,6 +707,7 @@ def run_once(
     (which works in a throwaway git worktree), print mode operates on
     ``workspace_root`` (the real project by default) — the deliberate one-shot
     posture: it's your command, gated by approval unless you pass ``--yes``."""
+    from harness.extensions import load_extensions
     from harness.render import render_json, render_plain, render_transcript
     from harness.skills import load_skills
     from harness.workspace import Workspace
@@ -707,17 +715,19 @@ def run_once(
     provider = provider or Provider.from_env()
     workspace = Workspace(root=workspace_root)
     tracer = Tracer(model=provider.model)
+    tools = _coding_tools(
+        workspace,
+        exclude_session=session,
+        provider=provider,
+        model=provider.model,
+        sessions_dir=sessions_dir,
+    )
+    load_extensions(tools, *_extension_dirs(workspace.root))
     agent = Agent(
         system=DEFAULT_SYSTEM,
         provider=provider,
         model=provider.model,
-        tools=_coding_tools(
-            workspace,
-            exclude_session=session,
-            provider=provider,
-            model=provider.model,
-            sessions_dir=sessions_dir,
-        ),
+        tools=tools,
         approve=_approver(yes),
         approval_required=APPROVAL_TOOLS,
         skills=load_skills("skills"),
@@ -795,6 +805,7 @@ def _run_print_mode(args: argparse.Namespace) -> None:
 
 
 def _run_repl(args: argparse.Namespace) -> None:
+    from harness.extensions import load_extensions
     from harness.orchestrator import Orchestrator
     from harness.skills import load_skills
     from harness.workspace import Workspace, git_worktree
@@ -820,6 +831,7 @@ def _run_repl(args: argparse.Namespace) -> None:
     tools = _coding_tools(
         workspace, exclude_session="repl", provider=provider, model=provider.model
     )
+    load_extensions(tools, *_extension_dirs(workspace.root))
     agent = Agent(
         system=DEFAULT_SYSTEM,
         provider=provider,
