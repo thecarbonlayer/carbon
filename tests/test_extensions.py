@@ -164,3 +164,10 @@ def test_run_once_loads_project_local_extensions(tmp_path, monkeypatch):
     )
 
     assert "LOUD" in out
+
+
+def test_carbon_package_exports_the_extension_loader():
+    import carbon
+
+    assert carbon.load_extensions is load_extensions
+    assert carbon.discover_extensions is discover_extensions
