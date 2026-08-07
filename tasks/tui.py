@@ -3,6 +3,7 @@
     uv run tui                                    # resume the default 'cli' session
     uv run tui chat-1751130000                    # resume a session by name
     uv run tui .sessions/chat-1751130000.jsonl    # ...or by file path
+    uv run tui --extensions                       # also load .carbon/extensions/
 
 There is no in-app session switcher (the UI is one agent). The session argument is
 how you reopen a specific run — including the ones a `/new` command created.
@@ -32,12 +33,14 @@ def _resolve_session(arg: str | None) -> tuple[str, str | None]:
 
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
+    extensions = "--extensions" in argv
+    argv = [a for a in argv if a != "--extensions"]
 
     from harness.workspace import Workspace, git_worktree
     from ui.tui import AgentTUI
 
     session, sessions_dir = _resolve_session(argv[0] if argv else None)
-    kwargs: dict = {"session": session}
+    kwargs: dict = {"session": session, "extensions": extensions}
     if sessions_dir is not None:
         kwargs["sessions_dir"] = sessions_dir
 

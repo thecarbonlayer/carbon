@@ -24,7 +24,7 @@ def main(argv: list[str] | None = None) -> int:
         failed.append("ruff-format")
     if _run(["ruff", "check", "."]) != 0:
         failed.append("ruff-check")
-    if _run(["mypy", "model", "harness", "ui", "tasks", "carbon"]) != 0:
+    if _run(["mypy", "model", "harness", "ui", "tasks", "carbon", "extensions"]) != 0:
         failed.append("mypy")
 
     rc = _run(["pytest"])

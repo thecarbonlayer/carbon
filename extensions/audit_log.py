@@ -12,6 +12,7 @@ a workspace-aware audit log is a consumer's own extension to write.
 
 from __future__ import annotations
 
+import functools
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -21,12 +22,22 @@ from harness.tools import Tool, ToolRegistry
 _LOG_PATH = Path(".carbon") / "audit.log"
 
 
+def _log(name: str, kwargs: dict[str, object], outcome: str) -> None:
+    _LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with _LOG_PATH.open("a") as f:
+        f.write(f"{time.time():.0f} {name} {kwargs!r} -> {outcome[:200]!r}\n")
+
+
 def _audited(name: str, func: Callable[..., str]) -> Callable[..., str]:
     def wrapped(**kwargs: object) -> str:
-        result = func(**kwargs)
-        _LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with _LOG_PATH.open("a") as f:
-            f.write(f"{time.time():.0f} {name} {kwargs!r} -> {result[:200]!r}\n")
+        try:
+            result = func(**kwargs)
+        except Exception as exc:
+            # A failed call still leaves a receipt — an audit log that only
+            # records successes would be backwards.
+            _log(name, kwargs, f"error: {exc}")
+            raise
+        _log(name, kwargs, result)
         return result
 
     return wrapped
@@ -40,7 +51,9 @@ def _read_audit_log() -> str:
 
 def setup(registry: ToolRegistry) -> None:
     for name in registry.names():
-        registry.wrap(name, lambda func, name=name: _audited(name, func))
+        registry.wrap(name, functools.partial(_audited, name))
+    # read_audit_log is registered after the wrap loop above, so it is
+    # deliberately not wrapped and does not appear in its own audit trail.
     registry.register(
         Tool(
             name="read_audit_log",

@@ -185,11 +185,13 @@ class AgentTUI(App):
         workspace: Workspace | None = None,
         sessions_dir: str = DEFAULT_DIR,
         session: str = "cli",
+        extensions: bool = False,
     ) -> None:
         super().__init__()
         self.provider = provider or Provider.from_env()
         self.workspace = workspace or Workspace()
         self.sessions_dir = sessions_dir
+        self.extensions = extensions
         self._busy = False
         # Streaming state: the live agent block being filled this turn (None between
         # turns). ``_stream_delta`` mounts it on the first token; ``_turn_done``
@@ -214,6 +216,10 @@ class AgentTUI(App):
             model=self.provider.model,
             sessions_dir=self.sessions_dir,
         )
+        if self.extensions:
+            from harness.extensions import load_extensions
+
+            load_extensions(tools, *agent_mod._extension_dirs(self.workspace.root))
         tracer = Tracer(model=self.provider.model)
         return agent_mod.Agent(
             system=agent_mod.DEFAULT_SYSTEM,

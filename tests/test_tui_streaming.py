@@ -9,9 +9,11 @@ the model is mocked to fire the streaming callback.
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from unittest.mock import patch
 
 import harness.agent as agent_mod
+from harness.workspace import Workspace
 from model import LLMResponse
 from ui.tui import AgentTUI
 
@@ -39,6 +41,67 @@ def test_streaming_builds_a_live_block_then_finalizes_without_duplicating(tmp_pa
             await pilot.pause()
             assert len(app.query(".msg-agent")) == 1  # finalized in place, not duplicated
             assert app._live_body is None  # live state reset for the next turn
+
+    asyncio.run(run())
+
+
+def test_extensions_flag_loads_project_local_extensions(tmp_path, monkeypatch):
+    """The TUI's ``--extensions`` wiring (final whole-branch review — the earlier
+    plan wired print mode and the REPL but missed the TUI entirely): the flag
+    must reach ``_build_agent`` and actually load a `.carbon/extensions/` tool,
+    not just be stored and ignored."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
+    ext_dir = tmp_path / "workspace" / ".carbon" / "extensions"
+    ext_dir.mkdir(parents=True)
+    (ext_dir / "hello.py").write_text(
+        "from harness.tools import Tool\n\n"
+        "def setup(registry):\n"
+        "    registry.register(Tool(\n"
+        "        name='hello', description='d',\n"
+        "        parameters={'type': 'object', 'properties': {}, 'required': []},\n"
+        "        func=lambda: 'hi',\n"
+        "        mutates=False,\n"
+        "    ))\n"
+    )
+
+    async def run():
+        app = AgentTUI(
+            workspace=Workspace(root=str(tmp_path / "workspace")),
+            sessions_dir=str(tmp_path / "sessions"),
+            extensions=True,
+        )
+        async with app.run_test():
+            assert app.extensions is True
+            assert "hello" in app.agent.tools.names()
+
+    asyncio.run(run())
+
+
+def test_extensions_flag_defaults_to_off(tmp_path, monkeypatch):
+    """Without the flag, the same `.carbon/extensions/` tool must not load —
+    extensions are opt-in, not auto-discovered."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
+    ext_dir = tmp_path / "workspace" / ".carbon" / "extensions"
+    ext_dir.mkdir(parents=True)
+    (ext_dir / "hello.py").write_text(
+        "from harness.tools import Tool\n\n"
+        "def setup(registry):\n"
+        "    registry.register(Tool(\n"
+        "        name='hello', description='d',\n"
+        "        parameters={'type': 'object', 'properties': {}, 'required': []},\n"
+        "        func=lambda: 'hi',\n"
+        "        mutates=False,\n"
+        "    ))\n"
+    )
+
+    async def run():
+        app = AgentTUI(
+            workspace=Workspace(root=str(tmp_path / "workspace")),
+            sessions_dir=str(tmp_path / "sessions"),
+        )
+        async with app.run_test():
+            assert app.extensions is False
+            assert "hello" not in app.agent.tools.names()
 
     asyncio.run(run())
 
