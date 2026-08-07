@@ -128,6 +128,17 @@ domain and policy live in the consumer, and no knob becomes editable until an
 external miner and guard can distinguish its choices. The reasoning behind these
 decisions lives in [dev-notes/](dev-notes/).
 
+The library surface also grows through extensions: a Python file under
+`~/.carbon/extensions/` or a project's `.carbon/extensions/` exposing
+`setup(registry: ToolRegistry) -> None`, which registers new tools or wraps
+existing ones through the same `ToolRegistry` seam every consumer already
+uses (`harness/extensions.py`; see
+[dev-notes/adr/0003](dev-notes/adr/0003-extensions-tools-only-outside-the-editable-surface.md)).
+Extensions load new code, so they sit outside `surface_manifest()` on
+purpose — the self-improving loop can pick from the config door's bounded
+menus, but it cannot point Carbon at an extensions directory, because no
+such field exists for it to find.
+
 ## How it is built (and verified)
 
 Two gates, because "the tests pass" and "the agent actually works" are different claims.
