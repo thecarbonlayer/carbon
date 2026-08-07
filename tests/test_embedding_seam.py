@@ -65,6 +65,7 @@ def _tools_with_double() -> ToolRegistry:
                 "required": ["n"],
             },
             func=lambda n: str(n * 2),
+            mutates=False,
         )
     )
     return reg

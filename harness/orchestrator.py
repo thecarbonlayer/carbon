@@ -13,10 +13,12 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from harness.tools import default_tools
 from model import chat
 
 if TYPE_CHECKING:
     from harness.observability import Tracer
+    from harness.tools import ToolRegistry
 
 _PLANNER = (
     "You are a planner. Break the task into 2-4 short imperative steps. "
@@ -32,9 +34,15 @@ class OrchestratorResult:
 
 
 class Orchestrator:
-    def __init__(self, model: str | None = None, tracer: Tracer | None = None) -> None:
+    def __init__(
+        self,
+        model: str | None = None,
+        tracer: Tracer | None = None,
+        tools: ToolRegistry | None = None,
+    ) -> None:
         self.model = model
         self.tracer = tracer  # optional; default None => no behavior change (ch-10)
+        self.tools = tools  # optional; default None => default_tools() (ch-10 -> now)
 
     def _plan(self, task: str) -> list[str]:
         # ch-13: wrap the planner's LLM call in a `plan` span when a tracer is given.
@@ -66,7 +74,7 @@ class Orchestrator:
         plan = self._plan(task)
         worker = Agent(
             system="Execute each step using tools when needed. Be concise.",
-            tools=_tools(),
+            tools=self.tools if self.tools is not None else default_tools(),
             model=self.model,
         )
         results: list[str] = []
@@ -86,15 +94,3 @@ class Orchestrator:
             except Exception as exc:  # noqa: BLE001 — retry on any execution failure
                 last = f"error: {exc}"
         return last
-
-
-def _tools():
-    from harness.tools import calculator_tool, default_tools
-
-    # calculator is opt-in everywhere else; it's hardcoded here (not exposed
-    # as an Orchestrator param) because ch-10's own worked examples in
-    # tasks/checks.py are arithmetic tasks, and Orchestrator.run() has no
-    # tools= injection point to give them calculator any other way.
-    tools = default_tools()
-    tools.register(calculator_tool())
-    return tools

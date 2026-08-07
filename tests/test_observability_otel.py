@@ -17,7 +17,7 @@ import harness.agent as agent_mod
 from harness import events
 from harness.events import JsonlExporter, NullExporter, Span
 from harness.observability import Event, Tracer
-from harness.tools import calculator_tool, default_tools
+from harness.tools import Tool, ToolRegistry
 from model import LLMResponse
 
 
@@ -32,7 +32,7 @@ def _run_with_tool(tracer: Tracer) -> None:
                         # returns, `type` included — verified live against gemma.
                         "type": "function",
                         "id": "call-1",
-                        "function": {"name": "calculator", "arguments": '{"expression": "6 * 7"}'},
+                        "function": {"name": "double", "arguments": '{"n": 21}'},
                     }
                 ],
                 usage={"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7},
@@ -45,8 +45,20 @@ def _run_with_tool(tracer: Tracer) -> None:
             ),
         ]
     )
-    tools = default_tools()
-    tools.register(calculator_tool())
+    tools = ToolRegistry()
+    tools.register(
+        Tool(
+            name="double",
+            description="",
+            parameters={
+                "type": "object",
+                "properties": {"n": {"type": "integer"}},
+                "required": ["n"],
+            },
+            func=lambda n: str(n * 2),
+            mutates=False,
+        )
+    )
     with patch.object(agent_mod, "chat", side_effect=lambda *a, **k: next(replies)):
         agent_mod.Agent(tools=tools, tracer=tracer).send("compute it")
 
@@ -95,7 +107,7 @@ def test_run_produces_otel_spans_with_operation_names_and_attrs():
     assert tool.parent_id == parent.span_id
     assert tool.kind == events.INTERNAL
     assert tool.attributes[events.OPERATION_NAME] == events.EXECUTE_TOOL
-    assert tool.attributes[events.TOOL_NAME] == "calculator"
+    assert tool.attributes[events.TOOL_NAME] == "double"
     assert tool.attributes[events.TOOL_TYPE] == "function"
 
 
@@ -158,7 +170,7 @@ def test_tool_definitions_captured_once_per_turn():
 
     assert len(chats) == 2
     defs = chats[0].attributes[events.TOOL_DEFINITIONS]
-    assert {d["function"]["name"] for d in defs} >= {"calculator"}
+    assert {d["function"]["name"] for d in defs} == {"double"}
     assert events.TOOL_DEFINITIONS not in chats[1].attributes
 
 

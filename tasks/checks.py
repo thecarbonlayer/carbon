@@ -187,19 +187,32 @@ DEMOS["ch-04"] = _demo_ch04
 # ----------------------------------------------------------------------------
 # ch-05 — Tools (a tool interface + approval gate + file editing over a workspace)
 # ----------------------------------------------------------------------------
-def _accept_ch05_tools() -> bool:
-    """The real model calls the calculator tool and reports the exact product."""
-    from harness import agent
-    from harness.tools import calculator_tool, default_tools
+def _exploration_tools(root):
+    from harness.tools import ToolRegistry, list_files_tool, read_file_tool, search_text_tool
 
-    tools = default_tools()
-    tools.register(calculator_tool())
-    a = agent.Agent(system="Use tools when they help.", tools=tools)
-    reply = a.send("Use the calculator to compute 47 * 89, then reply with just the number.")
+    reg = ToolRegistry()
+    reg.register(read_file_tool(root))
+    reg.register(list_files_tool(root))
+    reg.register(search_text_tool(root))
+    return reg
+
+
+def _accept_ch05_tools() -> bool:
+    """The real model uses a workspace tool to find real information and reports it exactly."""
+    from harness import agent
+    from harness.workspace import Workspace
+
+    ws = Workspace()
+    ws.write("clue.txt", "The passphrase is GRANITE-4471.\n")
+    a = agent.Agent(system="Use tools when they help.", tools=_exploration_tools(ws.root))
+    reply = a.send(
+        "There is a file somewhere in this workspace with a passphrase in it. "
+        "Find it using your tools, then reply with just the passphrase."
+    )
     print("model replied:", repr(reply))
     used_tool = any(m.get("role") == "tool" for m in a.messages)
     print("used a tool:", used_tool)
-    return "4183" in reply and used_tool
+    return "GRANITE-4471" in reply and used_tool
 
 
 def _accept_ch05_approval() -> bool:
@@ -268,13 +281,21 @@ def _accept_ch05() -> bool:
 def _demo_ch05() -> None:
     from harness import agent
     from harness.sandbox import Sandbox, bash_tool
-    from harness.tools import calculator_tool, default_tools
+    from harness.tools import default_tools
+    from harness.workspace import Workspace
 
-    calc_tools = default_tools()
-    calc_tools.register(calculator_tool())
-    a = agent.Agent(tools=calc_tools)
+    ws = Workspace()
+    ws.write("code.txt", "The launch code is BLUE-42.\n")
+    a = agent.Agent(tools=_exploration_tools(ws.root))
     print("— a tool the model calls —")
-    print("bot>", a.send("What is 1234 * 5678? Use the calculator."), "\n")
+    print(
+        "bot>",
+        a.send(
+            "There is a file somewhere in this workspace with a launch code in it. "
+            "Find it using your tools, then reply with just the code."
+        ),
+        "\n",
+    )
 
     tools = default_tools()
     tools.register(bash_tool(Sandbox()))
@@ -609,19 +630,31 @@ DEMOS["ch-09"] = _demo_ch09
 def _accept_ch10() -> bool:
     """The orchestrator plans a multi-step task and executes it to the right answer."""
     from harness.orchestrator import Orchestrator
+    from harness.workspace import Workspace
 
-    res = Orchestrator().run(
-        "Compute (12 + 8), then multiply that result by 3. Use the calculator tool."
+    ws = Workspace()
+    ws.write("first.txt", "ALPHA\n")
+    ws.write("second.txt", "BRAVO\n")
+    res = Orchestrator(tools=_exploration_tools(ws.root)).run(
+        "Read first.txt and second.txt in this workspace using your tools, "
+        "then reply with both words you found, in order."
     )
     print("plan:", res.plan)
     print("final:", repr(res.final))
-    return len(res.plan) >= 1 and "60" in res.final
+    return len(res.plan) >= 1 and "ALPHA" in res.final and "BRAVO" in res.final
 
 
 def _demo_ch10() -> None:
     from harness.orchestrator import Orchestrator
+    from harness.workspace import Workspace
 
-    res = Orchestrator().run("Compute 15 * 4, then subtract 10. Use the calculator.")
+    ws = Workspace()
+    ws.write("a.txt", "RED\n")
+    ws.write("b.txt", "BLUE\n")
+    res = Orchestrator(tools=_exploration_tools(ws.root)).run(
+        "Read a.txt and b.txt in this workspace using your tools, "
+        "then reply with both words you found, in order."
+    )
     for i, (step, out) in enumerate(zip(res.plan, res.results, strict=False)):
         print(f"[{i}] {step}\n    -> {out}")
     print("final:", res.final)
@@ -637,20 +670,21 @@ DEMOS["ch-10"] = _demo_ch10
 def _accept_ch11() -> bool:
     """Two independent subtasks fan out to isolated subagents; both come back right."""
     from harness.subagents import fan_out
-    from harness.tools import calculator_tool, default_tools
+    from harness.workspace import Workspace
 
-    tools = default_tools()
-    tools.register(calculator_tool())
+    ws = Workspace()
+    ws.write("code.txt", "The reference code is DOUBLE-8842.\n")
     results = fan_out(
         [
-            "Compute 6 * 7 using the calculator. Reply with just the number.",
+            "Read code.txt in this workspace using your tools, "
+            "then reply with just the reference code.",
             "What is the capital of Japan? Reply with just the city.",
         ],
-        tools=tools,
+        tools=_exploration_tools(ws.root),
     )
     print("results:", results)
     joined = " ".join(results).lower()
-    return "42" in joined and "tokyo" in joined
+    return "double-8842" in joined and "tokyo" in joined
 
 
 def _demo_ch11() -> None:
@@ -763,13 +797,13 @@ def _accept_ch13_observability() -> bool:
     """A real run produces a trace with model calls (tokens) and tool calls."""
     from harness import agent
     from harness.observability import Tracer
-    from harness.tools import calculator_tool, default_tools
+    from harness.workspace import Workspace
 
-    tools = default_tools()
-    tools.register(calculator_tool())
+    ws = Workspace()
+    ws.write("note.txt", "The status code is OBS-4471.\n")
     tr = Tracer()
-    a = agent.Agent(system="Use tools when helpful.", tools=tools, tracer=tr)
-    a.send("Use the calculator to compute 123 * 9, then report the result.")
+    a = agent.Agent(system="Use tools when helpful.", tools=_exploration_tools(ws.root), tracer=tr)
+    a.send("Read note.txt in this workspace using your tools, then report the status code exactly.")
     print(tr.timeline())
     t = tr.totals()
     return t["llm_calls"] >= 1 and t["tokens"] > 0 and t["tool_calls"] >= 1
@@ -779,17 +813,17 @@ def _accept_ch13_depth() -> bool:
     """A real tool-using run records the tool's args AND result in the trace."""
     from harness import agent
     from harness.observability import Tracer
-    from harness.tools import calculator_tool, default_tools
+    from harness.workspace import Workspace
 
-    tools = default_tools()
-    tools.register(calculator_tool())
+    ws = Workspace()
+    ws.write("note.txt", "The status code is DEPTH-7731.\n")
     tr = Tracer()
-    a = agent.Agent(system="Use tools when helpful.", tools=tools, tracer=tr)
-    a.send("Use the calculator to compute 111 * 11, then report it.")
+    a = agent.Agent(system="Use tools when helpful.", tools=_exploration_tools(ws.root), tracer=tr)
+    a.send("Read note.txt in this workspace using your tools, then report the status code exactly.")
     print(tr.timeline())
     tool_events = [e for e in tr.events if e.kind == "tool"]
     captured = bool(tool_events) and bool(tool_events[0].args) and bool(tool_events[0].result)
-    has_value = any("1221" in e.result for e in tool_events)
+    has_value = any("7731" in e.result for e in tool_events)
     return captured and has_value
 
 
@@ -801,13 +835,15 @@ def _accept_ch13() -> bool:
 def _demo_ch13() -> None:
     from harness import agent
     from harness.observability import Tracer
-    from harness.tools import calculator_tool, default_tools
+    from harness.workspace import Workspace
 
-    tools = default_tools()
-    tools.register(calculator_tool())
+    ws = Workspace()
+    ws.write("note.txt", "The access token is DEMO-8899.\n")
     tr = Tracer()
-    a = agent.Agent(tools=tools, tracer=tr)
-    a.send("Compute 256 / 8 with the calculator, then say the result.")
+    a = agent.Agent(tools=_exploration_tools(ws.root), tracer=tr)
+    a.send(
+        "Read note.txt in this workspace using your tools, then report the access token exactly."
+    )
     print(tr.timeline())
 
 
