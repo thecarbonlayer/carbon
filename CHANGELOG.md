@@ -14,6 +14,18 @@ One entry per release; commits stay fine-grained under a `feat(surface)` or
 
 ## [Unreleased]
 
+### Added
+
+- `harness/extensions.py`: a tools-only extension loader. A Python file under
+  `~/.carbon/extensions/` or a project's `.carbon/extensions/` exposing
+  `setup(registry: ToolRegistry) -> None` can register new tools or `wrap()`
+  existing ones, using the same `ToolRegistry` seam consumers already use —
+  no new hook system, no `Agent` change. Deliberately outside
+  `surface_manifest()`: refinery cannot discover, create, or point at an
+  extensions directory (dev-notes/adr/0003). Ships one example,
+  `extensions/audit_log.py`. Exported from `carbon` as `load_extensions` /
+  `discover_extensions`.
+
 ### Changed
 
 - **Renamed the project and package `gemma` → `carbon`.** The repo was named
