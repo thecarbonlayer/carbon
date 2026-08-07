@@ -108,13 +108,44 @@ extensions path in, and adding one would require a source change, which is
 exactly the category of edit refinery is barred from making. The boundary
 isn't a runtime check — it's the absence of a knob.
 
-**Example.** `extensions/audit_log.py`, one real extension mirroring how
-`skills/sign-off/SKILL.md` is the one shipped example skill. It wraps every
-tool already in the registry to append a timestamped `tool, args, result`
-line to `.carbon/audit.log`, and registers a new `read_audit_log` tool to
-read that log back — exercising `register()` and `wrap()` in the same file,
+**Example.** `extensions/audit_log.py`, one real extension echoing how
+`skills/sign-off/SKILL.md` is the one shipped example skill — with a
+deliberate asymmetry, not a mirror: a skill auto-loads from `skills/`,
+while an extension requires both explicit placement under `.carbon/extensions/`
+*and* `--extensions` at the command line (see below). It wraps every tool
+already in the registry to append a timestamped `tool, args, result` line
+to `.carbon/audit.log`, and registers a new `read_audit_log` tool to read
+that log back — exercising `register()` and `wrap()` in the same file,
 which is also the evidence for this ADR's central claim that the existing
 `ToolRegistry` seam is sufficient without a hook system.
+
+**Loading is opt-in, off by default.** A final whole-branch review surfaced
+a gap this ADR's original Decision missed: the project-local extensions
+directory (`.carbon/extensions/`) sits *inside* the agent's own writable
+workspace. Every other mutating tool in Carbon is approval-gated fresh, each
+time its effect occurs — `write_file`, `edit_file`, `bash` all re-prompt on
+every call. An extension file is qualitatively different: once a `write_file`
+call plants one there, it auto-executes, unsandboxed, on every subsequent
+`carbon` invocation, with no further approval at all. That is a standing
+write vector the agent's own tools can arm against future runs, not a single
+gated action.
+
+The resolution: extension loading — both the user-level and the
+project-local directories — sits behind an explicit `--extensions` CLI flag,
+off by default, wired identically across all three entrypoints (print mode,
+the REPL, the TUI). When the flag is absent, `load_extensions` is never
+called and `_extension_dirs`/`Path.home()` are never even touched — loading
+is a true no-op, not merely an empty result.
+
+A container-isolated execution model for extensions was considered and
+deferred. Extensions currently work by calling `registry.wrap()`/`register()`
+directly on the harness's in-process `ToolRegistry`; a sandboxed process
+couldn't reach that registry without inventing a serialization/RPC boundary
+for tool dispatch, which is a materially larger redesign than this ADR's
+scope. It also wouldn't by itself solve the no-re-approval property above —
+a sandboxed extension could still auto-load and run unattended every time.
+Out of scope for this iteration; the flag is the fix that matches the actual
+risk.
 
 ## Consequences
 

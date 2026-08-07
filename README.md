@@ -137,7 +137,16 @@ uses (`harness/extensions.py`; see
 Extensions load new code, so they sit outside `surface_manifest()` on
 purpose — the self-improving loop can pick from the config door's bounded
 menus, but it cannot point Carbon at an extensions directory, because no
-such field exists for it to find.
+such field exists for it to find. Loading is also off by default at
+runtime: pass `--extensions` to opt in, in print mode, the REPL, and the
+TUI alike. The project-local directory sits inside the agent's own writable
+workspace, so without the flag, the agent's own `write_file` tool could
+otherwise plant a file there that auto-runs, unsandboxed and with no
+re-approval, on every future invocation. To try the shipped example in
+print mode, the only entrypoint where the project-local directory is the
+real checkout's (the REPL and TUI both run in an ephemeral git worktree, so
+use `~/.carbon/extensions/` there instead):
+`mkdir -p .carbon/extensions && cp extensions/audit_log.py .carbon/extensions/ && uv run agent --extensions "list the tools you have"`.
 
 ## How it is built (and verified)
 
