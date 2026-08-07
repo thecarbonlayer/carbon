@@ -100,6 +100,14 @@ class Provider:
     model: str
     api_key: str = "x"
     responder: Callable[..., LLMResponse] | None = None
+    # OpenRouter's unified reasoning-effort control (forwarded verbatim as
+    # ``{"reasoning": {"effort": ...}}`` — see model/openai_compatible.py). Provider-
+    # level, not a per-call chat() kwarg, because it's a property of WHICH model is
+    # being measured (like base_url/model), not of an individual request. None means
+    # "don't send it" — most models/providers neither support nor need it, and a
+    # provider that doesn't recognize the field would otherwise get a silently
+    # ignored (or rejected) parameter on every call.
+    reasoning_effort: str | None = None
 
     @classmethod
     def from_env(cls, root: str | Path = ".") -> Provider:
@@ -108,6 +116,7 @@ class Provider:
             base_url=os.environ.get("LLM_BASE_URL", DEFAULT_BASE_URL),
             model=os.environ.get("LLM_MODEL", DEFAULT_MODEL),
             api_key=os.environ.get("LLM_API_KEY", DEFAULT_API_KEY),
+            reasoning_effort=os.environ.get("LLM_REASONING_EFFORT") or None,
         )
 
 

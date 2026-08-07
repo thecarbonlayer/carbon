@@ -58,6 +58,8 @@ def complete_openai(
         payload["tools"] = tools
     if response_format:
         payload["response_format"] = response_format
+    if provider.reasoning_effort:
+        payload["reasoning"] = {"effort": provider.reasoning_effort}
 
     if on_delta is not None:
         return _stream_openai(base_url, api_key, payload, timeout, on_delta)

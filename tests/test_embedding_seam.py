@@ -299,6 +299,78 @@ def test_response_format_reaches_the_http_payload(monkeypatch):
     assert captured["response_format"] == {"type": "json_object"}
 
 
+def test_reasoning_effort_reaches_the_http_payload_as_a_nested_object(monkeypatch):
+    """OpenRouter's unified reasoning control is `{"reasoning": {"effort": ...}}`,
+    not a flat `reasoning_effort` field — confirmed against OpenRouter's own docs
+    before wiring this up, not guessed."""
+    captured: dict = {}
+
+    class _Resp:
+        def raise_for_status(self) -> None: ...
+
+        def json(self) -> dict:
+            return {
+                "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+                "usage": {},
+            }
+
+    def fake_post(url, json, headers, timeout):  # noqa: A002 — mirrors httpx.post kwarg
+        captured.update(json)
+        return _Resp()
+
+    monkeypatch.setattr(oc.httpx, "post", fake_post)
+    oc.complete_openai(
+        Provider("http://x/v1", "m", "k", reasoning_effort="high"),
+        [{"role": "user", "content": "hi"}],
+    )
+    assert captured["reasoning"] == {"effort": "high"}
+
+
+def test_reasoning_effort_omitted_from_payload_when_not_set(monkeypatch):
+    """Most models/providers neither support nor need this field — sending it
+    unconditionally would risk a rejected/ignored parameter on every other call."""
+    captured: dict = {}
+
+    class _Resp:
+        def raise_for_status(self) -> None: ...
+
+        def json(self) -> dict:
+            return {
+                "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+                "usage": {},
+            }
+
+    def fake_post(url, json, headers, timeout):  # noqa: A002 — mirrors httpx.post kwarg
+        captured.update(json)
+        return _Resp()
+
+    monkeypatch.setattr(oc.httpx, "post", fake_post)
+    oc.complete_openai(Provider("http://x/v1", "m", "k"), [{"role": "user", "content": "hi"}])
+    assert "reasoning" not in captured
+
+
+def test_provider_from_env_reads_llm_reasoning_effort(monkeypatch, tmp_path):
+    monkeypatch.setenv("LLM_BASE_URL", "http://x/v1")
+    monkeypatch.setenv("LLM_MODEL", "m")
+    monkeypatch.setenv("LLM_API_KEY", "k")
+    monkeypatch.setenv("LLM_REASONING_EFFORT", "high")
+    from model.provider import Provider as ProviderCls
+
+    p = ProviderCls.from_env(root=tmp_path)
+    assert p.reasoning_effort == "high"
+
+
+def test_provider_from_env_defaults_reasoning_effort_to_none(monkeypatch, tmp_path):
+    monkeypatch.setenv("LLM_BASE_URL", "http://x/v1")
+    monkeypatch.setenv("LLM_MODEL", "m")
+    monkeypatch.setenv("LLM_API_KEY", "k")
+    monkeypatch.delenv("LLM_REASONING_EFFORT", raising=False)
+    from model.provider import Provider as ProviderCls
+
+    p = ProviderCls.from_env(root=tmp_path)
+    assert p.reasoning_effort is None
+
+
 # --- T1.7 curated façade ------------------------------------------------------
 def test_carbon_facade_exports_the_surface():
     import carbon
