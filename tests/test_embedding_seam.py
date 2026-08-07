@@ -46,6 +46,18 @@ def _double_call(n: int) -> LLMResponse:
     )
 
 
+def _calc_call(expr: str) -> LLMResponse:
+    return LLMResponse(
+        content="",
+        tool_calls=[
+            {
+                "id": "1",
+                "function": {"name": "calculator", "arguments": f'{{"expression": "{expr}"}}'},
+            }
+        ],
+    )
+
+
 def _tool_then_done() -> Provider:
     return _scripted([_double_call(21), LLMResponse(content="done", finish_reason="stop")])
 
@@ -123,6 +135,46 @@ def test_max_tool_steps_overrides_the_module_global():
 
 def test_max_tool_steps_default_none_leaves_behavior_unchanged():
     a = Agent(provider=fake(scripted=lambda m: "PONG"), max_tool_steps=None)
+    r = a.run("hi")
+    assert r.text == "PONG" and r.stop_reason == "stop"
+
+
+# --- deadline_s: wall-clock bound, parallel to max_tool_steps -----------------
+def test_deadline_stops_the_loop_before_starting_a_new_turn(monkeypatch):
+    """Found needed live: an eval suite comparing this loop against a harness that
+    DOES have a wall-clock bound (pi's 600s) needs the same bound here, or a raised
+    tool-step budget just moves the ceiling from "turns" to "however long turns
+    take" instead of adding a real one. The check runs BEFORE each new turn, not
+    mid-turn — a blocking model call already in flight finishes rather than being
+    torn down, mirroring how the tool-step budget has always worked."""
+    import harness.agent as agent_mod
+
+    calls = {"n": 0}
+
+    def always_tool(messages, **k) -> LLMResponse:
+        calls["n"] += 1
+        return _calc_call("1+1")
+
+    # Call 1 computes the deadline (t=0, deadline=0+5=5). Call 2 is the loop-top
+    # check before turn 1 (t=0, under deadline — turn 1 runs). Call 3 is the
+    # loop-top check before what would be turn 2 (t=10, past deadline — stop).
+    seen = {"n": 0}
+
+    def fake_monotonic():
+        seen["n"] += 1
+        return 0.0 if seen["n"] <= 2 else 10.0
+
+    monkeypatch.setattr(agent_mod.time, "monotonic", fake_monotonic)
+
+    p = Provider(base_url="fake://x", model="fake", api_key="x", responder=always_tool)
+    r = Agent(provider=p, tools=default_tools(), deadline_s=5.0).run("loop forever")
+
+    assert r.stop_reason == "deadline"
+    assert calls["n"] == 1  # the one turn already in flight completed; no second
+
+
+def test_deadline_default_none_leaves_behavior_unchanged():
+    a = Agent(provider=fake(scripted=lambda m: "PONG"), deadline_s=None)
     r = a.run("hi")
     assert r.text == "PONG" and r.stop_reason == "stop"
 
