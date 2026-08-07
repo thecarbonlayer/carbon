@@ -3,8 +3,9 @@
 The curriculum builds the harness one primitive per chapter across ``model/``,
 ``harness/``, and ``ui/``. This package is the curated, versioned surface external
 code builds on: ``import carbon`` gives you exactly the agent, its structured
-result, tools and their registry, the permission policy, the provider and model
-seam, the editable-config door and its schema, and provenance — and nothing else.
+result, tools and their registry, an extension loader, the permission policy, the
+provider and model seam, the editable-config door and its schema, and provenance
+— and nothing else.
 
 The internal module paths (``from harness.agent import Agent``) keep working, so
 adopting this façade is opt-in. What is exported here is the contract that
@@ -16,6 +17,7 @@ chapters. See dev-notes/adr/0001 (why this evolves on its own axis) and 0002
 from __future__ import annotations
 
 from harness.agent import Agent, run_once
+from harness.extensions import discover_extensions, load_extensions
 from harness.harness_config import (
     CONFIG,
     CompactionPolicy,
@@ -54,9 +56,11 @@ __all__ = [
     "chat",
     "config_schema",
     "default_tools",
+    "discover_extensions",
     "fake",
     "load_config",
     "load_env",
+    "load_extensions",
     "provenance",
     "run_once",
     "surface_manifest",
