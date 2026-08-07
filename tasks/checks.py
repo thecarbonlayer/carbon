@@ -190,9 +190,11 @@ DEMOS["ch-04"] = _demo_ch04
 def _accept_ch05_tools() -> bool:
     """The real model calls the calculator tool and reports the exact product."""
     from harness import agent
-    from harness.tools import default_tools
+    from harness.tools import calculator_tool, default_tools
 
-    a = agent.Agent(system="Use tools when they help.", tools=default_tools())
+    tools = default_tools()
+    tools.register(calculator_tool())
+    a = agent.Agent(system="Use tools when they help.", tools=tools)
     reply = a.send("Use the calculator to compute 47 * 89, then reply with just the number.")
     print("model replied:", repr(reply))
     used_tool = any(m.get("role") == "tool" for m in a.messages)
@@ -266,9 +268,11 @@ def _accept_ch05() -> bool:
 def _demo_ch05() -> None:
     from harness import agent
     from harness.sandbox import Sandbox, bash_tool
-    from harness.tools import default_tools
+    from harness.tools import calculator_tool, default_tools
 
-    a = agent.Agent(tools=default_tools())
+    calc_tools = default_tools()
+    calc_tools.register(calculator_tool())
+    a = agent.Agent(tools=calc_tools)
     print("— a tool the model calls —")
     print("bot>", a.send("What is 1234 * 5678? Use the calculator."), "\n")
 
@@ -633,12 +637,16 @@ DEMOS["ch-10"] = _demo_ch10
 def _accept_ch11() -> bool:
     """Two independent subtasks fan out to isolated subagents; both come back right."""
     from harness.subagents import fan_out
+    from harness.tools import calculator_tool, default_tools
 
+    tools = default_tools()
+    tools.register(calculator_tool())
     results = fan_out(
         [
             "Compute 6 * 7 using the calculator. Reply with just the number.",
             "What is the capital of Japan? Reply with just the city.",
-        ]
+        ],
+        tools=tools,
     )
     print("results:", results)
     joined = " ".join(results).lower()
@@ -755,10 +763,12 @@ def _accept_ch13_observability() -> bool:
     """A real run produces a trace with model calls (tokens) and tool calls."""
     from harness import agent
     from harness.observability import Tracer
-    from harness.tools import default_tools
+    from harness.tools import calculator_tool, default_tools
 
+    tools = default_tools()
+    tools.register(calculator_tool())
     tr = Tracer()
-    a = agent.Agent(system="Use tools when helpful.", tools=default_tools(), tracer=tr)
+    a = agent.Agent(system="Use tools when helpful.", tools=tools, tracer=tr)
     a.send("Use the calculator to compute 123 * 9, then report the result.")
     print(tr.timeline())
     t = tr.totals()
@@ -769,10 +779,12 @@ def _accept_ch13_depth() -> bool:
     """A real tool-using run records the tool's args AND result in the trace."""
     from harness import agent
     from harness.observability import Tracer
-    from harness.tools import default_tools
+    from harness.tools import calculator_tool, default_tools
 
+    tools = default_tools()
+    tools.register(calculator_tool())
     tr = Tracer()
-    a = agent.Agent(system="Use tools when helpful.", tools=default_tools(), tracer=tr)
+    a = agent.Agent(system="Use tools when helpful.", tools=tools, tracer=tr)
     a.send("Use the calculator to compute 111 * 11, then report it.")
     print(tr.timeline())
     tool_events = [e for e in tr.events if e.kind == "tool"]
@@ -789,10 +801,12 @@ def _accept_ch13() -> bool:
 def _demo_ch13() -> None:
     from harness import agent
     from harness.observability import Tracer
-    from harness.tools import default_tools
+    from harness.tools import calculator_tool, default_tools
 
+    tools = default_tools()
+    tools.register(calculator_tool())
     tr = Tracer()
-    a = agent.Agent(tools=default_tools(), tracer=tr)
+    a = agent.Agent(tools=tools, tracer=tr)
     a.send("Compute 256 / 8 with the calculator, then say the result.")
     print(tr.timeline())
 

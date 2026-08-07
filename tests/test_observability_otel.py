@@ -17,7 +17,7 @@ import harness.agent as agent_mod
 from harness import events
 from harness.events import JsonlExporter, NullExporter, Span
 from harness.observability import Event, Tracer
-from harness.tools import default_tools
+from harness.tools import calculator_tool, default_tools
 from model import LLMResponse
 
 
@@ -45,8 +45,10 @@ def _run_with_tool(tracer: Tracer) -> None:
             ),
         ]
     )
+    tools = default_tools()
+    tools.register(calculator_tool())
     with patch.object(agent_mod, "chat", side_effect=lambda *a, **k: next(replies)):
-        agent_mod.Agent(tools=default_tools(), tracer=tracer).send("compute it")
+        agent_mod.Agent(tools=tools, tracer=tracer).send("compute it")
 
 
 def test_run_produces_otel_spans_with_operation_names_and_attrs():
