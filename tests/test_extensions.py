@@ -4,6 +4,7 @@ proof that none of it touches the editable config surface."""
 
 from __future__ import annotations
 
+import ast
 from pathlib import Path
 
 from harness.agent import _extension_dirs, run_once
@@ -102,9 +103,15 @@ def test_later_directory_overrides_earlier_same_named_tool(tmp_path):
 
 
 def test_extensions_module_never_imports_harness_config():
-    source = Path("harness/extensions.py").read_text()
-    assert "harness_config" not in source
-    assert "CONFIG" not in source
+    path = Path(__file__).resolve().parents[1] / "harness" / "extensions.py"
+    tree = ast.parse(path.read_text())
+    imported_modules = {
+        alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    } | {node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom) and node.module}
+    assert not any("harness_config" in m for m in imported_modules)
 
 
 def test_surface_manifest_has_no_extension_field():
@@ -112,12 +119,30 @@ def test_surface_manifest_has_no_extension_field():
 
     manifest = surface_manifest()
     names = {item["name"] for item in manifest["editable"] + manifest["locked_fields"]}
-    # code_extensions (file suffixes like .py that arm the test gate) is a real,
-    # unrelated field — this checks for the plugin-loader surface specifically,
-    # not any field whose name happens to contain "extension".
-    assert "extensions_dir" not in names
-    assert "extension_dirs" not in names
-    assert "extensions" not in names
+    # Frozen set: the config surface's full field list as of this feature's landing.
+    # Any addition or removal must be a deliberate edit to this test — that's the
+    # point (dev-notes/adr/0003): no extension-related field should ever appear here
+    # silently.
+    assert names == {
+        "version",
+        "system_prompt",
+        "max_tool_steps",
+        "default_context_limit",
+        "approval_tools",
+        "code_extensions",
+        "verify_attempts",
+        "require_run",
+        "max_item_chars",
+        "file_injection",
+        "tool_output",
+        "compaction",
+        "retry",
+        "compaction_prompt",
+        "memory_search_limit",
+        "attach_pattern",
+        "temperature",
+        "max_tokens",
+    }
 
 
 # --- CLI wiring ----------------------------------------------------------
@@ -161,9 +186,34 @@ def test_run_once_loads_project_local_extensions(tmp_path, monkeypatch):
         sessions_dir=str(tmp_path / "sessions"),
         workspace_root=str(tmp_path),
         agents_dir=str(tmp_path),
+        extensions=True,
     )
 
     assert "LOUD" in out
+
+
+def test_run_once_does_not_load_extensions_by_default(tmp_path, monkeypatch):
+    # Off-by-default (final review): the project-local extensions dir sits inside
+    # the agent's own writable workspace, so loading it unconditionally would let
+    # write_file plant a file that auto-runs, unapproved, on every future call.
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
+    ext_dir = tmp_path / ".carbon" / "extensions"
+    _write(ext_dir, "shout.py", _REGISTER_TOOL.format(name="shout", value="LOUD"))
+
+    out = run_once(
+        "shout something",
+        provider=_tool_then_text("shout", "{}", "done"),
+        fmt="transcript",
+        session="ext-off-by-default-test",
+        sessions_dir=str(tmp_path / "sessions"),
+        workspace_root=str(tmp_path),
+        agents_dir=str(tmp_path),
+    )
+
+    # The tool was never registered, so the call comes back as a tool error in
+    # the transcript rather than raising — run_once must not crash doing this.
+    assert "LOUD" not in out
+    assert "error: unknown tool 'shout'" in out
 
 
 def test_carbon_package_exports_the_extension_loader():
