@@ -11,7 +11,7 @@ import pytest
 
 import harness.agent as agent_mod
 from harness.sandbox import Sandbox, bash_tool
-from harness.tools import Tool, ToolRegistry, calculator, default_tools
+from harness.tools import Tool, ToolRegistry, calculator, calculator_tool, default_tools
 from harness.workspace import Workspace, edit_file_tool, write_file_tool
 from model import LLMResponse
 
@@ -40,8 +40,10 @@ def test_tool_call_loop_executes_and_returns():
     def fake_chat(messages, **kwargs):
         return next(replies)
 
+    tools = default_tools()
+    tools.register(calculator_tool())
     with patch.object(agent_mod, "chat", side_effect=fake_chat):
-        a = agent_mod.Agent(tools=default_tools())
+        a = agent_mod.Agent(tools=tools)
         out = a.send("what is 6 * 7?")
 
     assert "42" in out

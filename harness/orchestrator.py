@@ -89,6 +89,8 @@ class Orchestrator:
 
 
 def _tools():
-    from harness.tools import default_tools
+    from harness.tools import calculator_tool, default_tools
 
-    return default_tools()
+    tools = default_tools()
+    tools.register(calculator_tool())
+    return tools

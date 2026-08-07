@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 import harness.agent as agent_mod
 from harness.observability import Tracer
-from harness.tools import default_tools
+from harness.tools import calculator_tool, default_tools
 from model import LLMResponse
 
 
@@ -56,9 +56,11 @@ def test_agent_trace_records_tool_io():
             LLMResponse(content="done"),
         ]
     )
+    tools = default_tools()
+    tools.register(calculator_tool())
     tr = Tracer()
     with patch.object(agent_mod, "chat", side_effect=lambda *a, **k: next(replies)):
-        a = agent_mod.Agent(tools=default_tools(), tracer=tr)
+        a = agent_mod.Agent(tools=tools, tracer=tr)
         a.send("compute it")
 
     tool_events = [e for e in tr.events if e.kind == "tool"]

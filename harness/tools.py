@@ -6,10 +6,14 @@ dispatches the calls by name, parsing arguments and returning a string result �
 or an error string the model can read and recover from.
 
 Tools are an API surface you expose to a model: keep the list small, keep each
-contract narrow, and validate arguments. ``calculator`` evaluates arithmetic
-without ``eval``; ``read_file`` returns a file's contents — and as of ch-08 it
-is confined to the workspace: a model-invoked tool must not wander the host
-filesystem, so paths are resolved and must live under the working directory.
+contract narrow, and validate arguments. ``read_file`` returns a file's
+contents, and ``list_files``/``search_text`` explore the tree — and as of
+ch-08 all three are confined to the workspace: a model-invoked tool must not
+wander the host filesystem, so paths are resolved and must live under the
+working directory. ``calculator`` (evaluates arithmetic without ``eval``)
+still exists for callers that want a deterministic, easily-verified tool call,
+but it is not part of ``default_tools()`` — a coding agent doesn't need
+arithmetic.
 """
 
 from __future__ import annotations
@@ -379,20 +383,26 @@ def search_text_tool(root: str | Path | None = None) -> Tool:
     )
 
 
+def calculator_tool() -> Tool:
+    """A ``calculator`` tool — not part of ``default_tools()``. Registered
+    explicitly by callers (tests, ``Orchestrator``, demos) that want a
+    deterministic, easily-verified arithmetic tool call."""
+    return Tool(
+        name="calculator",
+        description="Evaluate an arithmetic expression like '47 * 89'.",
+        parameters={
+            "type": "object",
+            "properties": {"expression": {"type": "string"}},
+            "required": ["expression"],
+        },
+        func=calculator,
+        mutates=False,
+    )
+
+
 def default_tools() -> ToolRegistry:
     reg = ToolRegistry()
-    reg.register(
-        Tool(
-            name="calculator",
-            description="Evaluate an arithmetic expression like '47 * 89'.",
-            parameters={
-                "type": "object",
-                "properties": {"expression": {"type": "string"}},
-                "required": ["expression"],
-            },
-            func=calculator,
-            mutates=False,
-        )
-    )
     reg.register(read_file_tool())
+    reg.register(list_files_tool())
+    reg.register(search_text_tool())
     return reg
