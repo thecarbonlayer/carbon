@@ -112,6 +112,17 @@ def test_extensions_module_never_imports_harness_config():
         for alias in node.names
     } | {node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom) and node.module}
     assert not any("harness_config" in m for m in imported_modules)
+    # Also catch `from harness import harness_config` (module-name check above only
+    # sees "harness") and any re-exported `CONFIG` import (e.g. `from harness.agent
+    # import CONFIG`), the predecessor string check's equivalent.
+    imported_names = {
+        alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom)
+        for alias in node.names
+    }
+    assert not any("harness_config" in n for n in imported_names)
+    assert "CONFIG" not in imported_names
 
 
 def test_surface_manifest_has_no_extension_field():
