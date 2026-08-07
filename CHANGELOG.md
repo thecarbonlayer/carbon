@@ -24,7 +24,11 @@ One entry per release; commits stay fine-grained under a `feat(surface)` or
   `surface_manifest()`: refinery cannot discover, create, or point at an
   extensions directory (dev-notes/adr/0003). Ships one example,
   `extensions/audit_log.py`. Exported from `carbon` as `load_extensions` /
-  `discover_extensions`.
+  `discover_extensions`. Off by default: loading requires an explicit
+  `--extensions` flag on every entrypoint (print mode, the REPL, the TUI) —
+  the project-local directory lives inside the agent's own writable
+  workspace, so loading it unconditionally would let `write_file` plant a
+  file that auto-runs, unapproved, on every later invocation.
 
 ### Changed
 

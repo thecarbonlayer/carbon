@@ -3,7 +3,10 @@
     uv run tui                                    # resume the default 'cli' session
     uv run tui chat-1751130000                    # resume a session by name
     uv run tui .sessions/chat-1751130000.jsonl    # ...or by file path
-    uv run tui --extensions                       # also load .carbon/extensions/
+    uv run tui --extensions                       # also load ~/.carbon/extensions/ (the TUI runs
+                                                   # in an ephemeral worktree, so a workspace-
+                                                   # relative .carbon/extensions/ won't resolve to
+                                                   # the real checkout's directory)
 
 There is no in-app session switcher (the UI is one agent). The session argument is
 how you reopen a specific run — including the ones a `/new` command created.
