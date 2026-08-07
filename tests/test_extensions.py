@@ -6,8 +6,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from harness.agent import _extension_dirs, run_once
 from harness.extensions import discover_extensions, load_extensions
 from harness.tools import Tool, ToolRegistry
+from model import LLMResponse, Provider
 
 
 def _write(directory: Path, name: str, body: str) -> Path:
@@ -116,3 +118,49 @@ def test_surface_manifest_has_no_extension_field():
     assert "extensions_dir" not in names
     assert "extension_dirs" not in names
     assert "extensions" not in names
+
+
+# --- CLI wiring ----------------------------------------------------------
+
+
+def test_extension_dirs_are_user_then_project(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
+    user_dir, project_dir = _extension_dirs(tmp_path / "project")
+    assert user_dir == tmp_path / "home" / ".carbon" / "extensions"
+    assert project_dir == tmp_path / "project" / ".carbon" / "extensions"
+
+
+def _tool_then_text(name: str, args_json: str, text: str) -> Provider:
+    responses = iter(
+        [
+            LLMResponse(
+                content="",
+                tool_calls=[{"id": "1", "function": {"name": name, "arguments": args_json}}],
+            ),
+            LLMResponse(content=text, finish_reason="stop"),
+        ]
+    )
+
+    def responder(messages, **kwargs):
+        return next(responses)
+
+    return Provider(base_url="fake://x", model="fake", api_key="x", responder=responder)
+
+
+def test_run_once_loads_project_local_extensions(tmp_path, monkeypatch):
+    # Keep the real ~/.carbon out of this test regardless of the host machine.
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
+    ext_dir = tmp_path / ".carbon" / "extensions"
+    _write(ext_dir, "shout.py", _REGISTER_TOOL.format(name="shout", value="LOUD"))
+
+    out = run_once(
+        "shout something",
+        provider=_tool_then_text("shout", "{}", "done"),
+        fmt="transcript",
+        session="ext-wiring-test",
+        sessions_dir=str(tmp_path / "sessions"),
+        workspace_root=str(tmp_path),
+        agents_dir=str(tmp_path),
+    )
+
+    assert "LOUD" in out
