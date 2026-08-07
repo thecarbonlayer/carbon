@@ -36,6 +36,10 @@ def _resolve_session(arg: str | None) -> tuple[str, str | None]:
 
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
+    unknown = [a for a in argv if a.startswith("--") and a != "--extensions"]
+    if unknown:
+        print(f"unknown flag: {unknown[0]!r} (did you mean --extensions?)", file=sys.stderr)
+        return 1
     extensions = "--extensions" in argv
     argv = [a for a in argv if a != "--extensions"]
 
