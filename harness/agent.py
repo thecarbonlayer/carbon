@@ -105,6 +105,7 @@ class Agent:
         session: str | None = None,
         sessions_dir: str = DEFAULT_DIR,
         max_tool_steps: int | None = None,
+        deadline_s: float | None = None,
         verify_attempts: int = CONFIG.verify_attempts,
         require_run: bool = CONFIG.require_run,
         tracer: Tracer | None = None,
@@ -143,6 +144,12 @@ class Agent:
         # here instead of reaching into the module global (adr/0002: a generic seam,
         # not a consumer's config format).
         self.max_tool_steps = max_tool_steps
+        # No wall-clock bound by default (None): `_run`'s only stop condition has
+        # always been `max_tool_steps`, and every existing caller is unchanged unless
+        # it opts in. A consumer with a real wall-clock budget (an eval suite pitting
+        # this loop against a harness that DOES have one) passes it here — same
+        # reasoning as `max_tool_steps` just above.
+        self.deadline_s = deadline_s
         self.skills = skills or []
         self._last_tokens = 0  # model-reported usage from the last call (ch-08)
         self.session = session
@@ -432,7 +439,15 @@ class Agent:
         tool_step_budget = (
             self.max_tool_steps if self.max_tool_steps is not None else MAX_TOOL_STEPS
         )
+        deadline = time.monotonic() + self.deadline_s if self.deadline_s is not None else None
         for _ in range(tool_step_budget):
+            # Checked before starting a new turn, not mid-turn: a turn already in
+            # flight (a blocking model call, a running tool) completes rather than
+            # being torn down partway — the same "let in-flight work finish, just
+            # start nothing new" posture the tool-step budget has always had.
+            if deadline is not None and time.monotonic() >= deadline:
+                self._stop_reason = "deadline"
+                return "error: exceeded wall-clock deadline"
             resp, payload, t0 = self._model_call_with_recovery(specs, on_delta)
             self._last_tokens = int(resp.usage.get("total_tokens", 0)) or self._last_tokens
             if self.tracer:
