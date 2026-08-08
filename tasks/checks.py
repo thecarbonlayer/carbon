@@ -187,24 +187,15 @@ DEMOS["ch-04"] = _demo_ch04
 # ----------------------------------------------------------------------------
 # ch-05 — Tools (a tool interface + approval gate + file editing over a workspace)
 # ----------------------------------------------------------------------------
-def _exploration_tools(root):
-    from harness.tools import ToolRegistry, list_files_tool, read_file_tool, search_text_tool
-
-    reg = ToolRegistry()
-    reg.register(read_file_tool(root))
-    reg.register(list_files_tool(root))
-    reg.register(search_text_tool(root))
-    return reg
-
-
 def _accept_ch05_tools() -> bool:
     """The real model uses a workspace tool to find real information and reports it exactly."""
     from harness import agent
+    from harness.tools import default_tools
     from harness.workspace import Workspace
 
     ws = Workspace()
     ws.write("clue.txt", "The passphrase is GRANITE-4471.\n")
-    a = agent.Agent(system="Use tools when they help.", tools=_exploration_tools(ws.root))
+    a = agent.Agent(system="Use tools when they help.", tools=default_tools(ws.root))
     reply = a.send(
         "There is a file somewhere in this workspace with a passphrase in it. "
         "Find it using your tools, then reply with just the passphrase."
@@ -286,7 +277,7 @@ def _demo_ch05() -> None:
 
     ws = Workspace()
     ws.write("code.txt", "The launch code is BLUE-42.\n")
-    a = agent.Agent(tools=_exploration_tools(ws.root))
+    a = agent.Agent(tools=default_tools(ws.root))
     print("— a tool the model calls —")
     print(
         "bot>",
@@ -630,12 +621,13 @@ DEMOS["ch-09"] = _demo_ch09
 def _accept_ch10() -> bool:
     """The orchestrator plans a multi-step task and executes it to the right answer."""
     from harness.orchestrator import Orchestrator
+    from harness.tools import default_tools
     from harness.workspace import Workspace
 
     ws = Workspace()
     ws.write("first.txt", "ALPHA\n")
     ws.write("second.txt", "BRAVO\n")
-    res = Orchestrator(tools=_exploration_tools(ws.root)).run(
+    res = Orchestrator(tools=default_tools(ws.root)).run(
         "Read first.txt and second.txt in this workspace using your tools, "
         "then reply with both words you found, in order."
     )
@@ -646,12 +638,13 @@ def _accept_ch10() -> bool:
 
 def _demo_ch10() -> None:
     from harness.orchestrator import Orchestrator
+    from harness.tools import default_tools
     from harness.workspace import Workspace
 
     ws = Workspace()
     ws.write("a.txt", "RED\n")
     ws.write("b.txt", "BLUE\n")
-    res = Orchestrator(tools=_exploration_tools(ws.root)).run(
+    res = Orchestrator(tools=default_tools(ws.root)).run(
         "Read a.txt and b.txt in this workspace using your tools, "
         "then reply with both words you found, in order."
     )
@@ -670,6 +663,7 @@ DEMOS["ch-10"] = _demo_ch10
 def _accept_ch11() -> bool:
     """Two independent subtasks fan out to isolated subagents; both come back right."""
     from harness.subagents import fan_out
+    from harness.tools import default_tools
     from harness.workspace import Workspace
 
     ws = Workspace()
@@ -680,7 +674,7 @@ def _accept_ch11() -> bool:
             "then reply with just the reference code.",
             "What is the capital of Japan? Reply with just the city.",
         ],
-        tools=_exploration_tools(ws.root),
+        tools=default_tools(ws.root),
     )
     print("results:", results)
     joined = " ".join(results).lower()
@@ -797,12 +791,13 @@ def _accept_ch13_observability() -> bool:
     """A real run produces a trace with model calls (tokens) and tool calls."""
     from harness import agent
     from harness.observability import Tracer
+    from harness.tools import default_tools
     from harness.workspace import Workspace
 
     ws = Workspace()
     ws.write("note.txt", "The status code is OBS-4471.\n")
     tr = Tracer()
-    a = agent.Agent(system="Use tools when helpful.", tools=_exploration_tools(ws.root), tracer=tr)
+    a = agent.Agent(system="Use tools when helpful.", tools=default_tools(ws.root), tracer=tr)
     a.send("Read note.txt in this workspace using your tools, then report the status code exactly.")
     print(tr.timeline())
     t = tr.totals()
@@ -813,12 +808,13 @@ def _accept_ch13_depth() -> bool:
     """A real tool-using run records the tool's args AND result in the trace."""
     from harness import agent
     from harness.observability import Tracer
+    from harness.tools import default_tools
     from harness.workspace import Workspace
 
     ws = Workspace()
     ws.write("note.txt", "The status code is DEPTH-7731.\n")
     tr = Tracer()
-    a = agent.Agent(system="Use tools when helpful.", tools=_exploration_tools(ws.root), tracer=tr)
+    a = agent.Agent(system="Use tools when helpful.", tools=default_tools(ws.root), tracer=tr)
     a.send("Read note.txt in this workspace using your tools, then report the status code exactly.")
     print(tr.timeline())
     tool_events = [e for e in tr.events if e.kind == "tool"]
@@ -835,12 +831,13 @@ def _accept_ch13() -> bool:
 def _demo_ch13() -> None:
     from harness import agent
     from harness.observability import Tracer
+    from harness.tools import default_tools
     from harness.workspace import Workspace
 
     ws = Workspace()
     ws.write("note.txt", "The access token is DEMO-8899.\n")
     tr = Tracer()
-    a = agent.Agent(tools=_exploration_tools(ws.root), tracer=tr)
+    a = agent.Agent(tools=default_tools(ws.root), tracer=tr)
     a.send(
         "Read note.txt in this workspace using your tools, then report the access token exactly."
     )

@@ -54,6 +54,14 @@ One entry per release; commits stay fine-grained under a `feat(surface)` or
   opt-in. `Orchestrator` gained a real `tools=` constructor param in the same
   pass, closing the one place that previously had no way to give a worker
   anything other than the process-wide default.
+- **`default_tools()` takes an optional `root`.** `harness/agent.py`'s
+  `_coding_tools()` and `tasks/checks.py` had each grown their own copy of
+  "register `read_file_tool(root)`, `list_files_tool(root)`,
+  `search_text_tool(root)` on a fresh registry" — `_coding_tools()` even
+  called the unrooted `default_tools()` first and then immediately
+  overwrote all three of its tools with rooted ones, making that first call
+  a no-op. `default_tools(root=None)` now does the rooting itself, and all
+  three call sites use it directly.
 
 ## [0.4.0] - 2026-07-26
 

@@ -353,9 +353,9 @@ def search_text_tool(root: str | Path | None = None) -> Tool:
     )
 
 
-def default_tools() -> ToolRegistry:
+def default_tools(root: str | Path | None = None) -> ToolRegistry:
     reg = ToolRegistry()
-    reg.register(read_file_tool())
-    reg.register(list_files_tool())
-    reg.register(search_text_tool())
+    reg.register(read_file_tool(root))
+    reg.register(list_files_tool(root))
+    reg.register(search_text_tool(root))
     return reg

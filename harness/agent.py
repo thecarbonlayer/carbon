@@ -651,7 +651,7 @@ def _coding_tools(
     from harness.memory import search_memory_tool
     from harness.sandbox import Sandbox, bash_tool
     from harness.subagents import delegate_tool, fan_out_tool
-    from harness.tools import default_tools, list_files_tool, read_file_tool, search_text_tool
+    from harness.tools import default_tools
     from harness.workspace import edit_file_tool, write_file_tool
 
     root = str(workspace.root)
@@ -666,17 +666,11 @@ def _coding_tools(
         delegation has a composite approval design, workers observe and report; the
         parent makes the changes.
         """
-        registry = default_tools()
-        registry.register(read_file_tool(root))
-        registry.register(list_files_tool(root))
-        registry.register(search_text_tool(root))
+        registry = default_tools(root)
         registry.register(search_memory_tool(memory_dir, exclude=exclude_session))
         return registry
 
-    tools = default_tools()
-    tools.register(read_file_tool(root))
-    tools.register(list_files_tool(root))
-    tools.register(search_text_tool(root))
+    tools = default_tools(root)
     tools.register(write_file_tool(workspace))
     tools.register(edit_file_tool(workspace))
     tools.register(bash_tool(Sandbox(trusted=True, timeout=120), workdir=root))
