@@ -29,6 +29,44 @@ One entry per release; commits stay fine-grained under a `feat(surface)` or
   the project-local directory lives inside the agent's own writable
   workspace, so loading it unconditionally would let `write_file` plant a
   file that auto-runs, unapproved, on every later invocation.
+- `apply_patch`: atomic, multi-hunk, multi-file unified-diff application
+  (`harness/patch.py` + `Workspace.apply_patch`). `edit_file` already
+  guarantees exact-match-or-refuse for one location; `apply_patch` gives the
+  same guarantee — validate every file first with zero writes, commit all of
+  them only once every file in the patch has validated — for a change
+  spanning several files or several locations in one file, which is most
+  real changes. Renames, copies, binary patches, and fuzzy/nearby context
+  matching are refused outright rather than approximated: a hunk's context
+  must match exactly at the claimed location or the whole patch is refused.
+  Wired into `_coding_tools` and `approval_tools` alongside `write_file`/
+  `edit_file` — it can touch several files in one call, so it gets the same
+  approval gate.
+- `token_budget_checkpoint`: a fourth compaction strategy alongside the two
+  existing message-count ones, additive and default-neutral (the shipped
+  default stays `structured_checkpoint`; `config_version` does not move for
+  this entry). Cuts by token budget rather than a fixed message count — a
+  `keep_tail` count is nearly nothing after a turn of acknowledgements and
+  far over budget after a turn that read a file — snaps mid-turn cuts
+  earlier so a summarizer is never handed half an exchange, carries the
+  previous checkpoint forward as its own message rather than re-summarizing
+  it (re-summarizing a checkpoint against no new material is exactly how a
+  fact erodes across repeated compactions), and deterministically
+  re-attaches read/modified file paths extracted from tool calls rather
+  than trusting the summarizer's prose to keep them. An explicit
+  `completion_reserve` replaces a pure trigger-fraction, since a reply is
+  about the same size at 4k context and at 128k. A bounded oversize
+  fallback reuses the existing truncation door rather than a private clamp.
+- `Agent(deadline_s=...)`: a wall-clock bound on `Agent.run()`, parallel to
+  `max_tool_steps`. Checked at the top of each loop iteration — a turn
+  already in flight completes rather than being torn down mid-call, no new
+  turn starts once the deadline has passed. `None` by default; every
+  existing caller is unchanged. New `stop_reason` value: `"deadline"`.
+- `LLM_REASONING_EFFORT`: requests a reasoning-effort level from models that
+  support one (OpenAI's GPT-5.x series via OpenRouter, among others).
+  Provider-level, like `LLM_MODEL`/`LLM_BASE_URL` — a property of which
+  model is being measured, not of an individual call. Forwarded as
+  OpenRouter's own wire format (`{"reasoning": {"effort": ...}}`) only when
+  set; every other provider's requests are unaffected.
 
 ### Changed
 
@@ -62,6 +100,26 @@ One entry per release; commits stay fine-grained under a `feat(surface)` or
   overwrote all three of its tools with rooted ones, making that first call
   a no-op. `default_tools(root=None)` now does the rooting itself, and all
   three call sites use it directly.
+- Default system prompt now explicitly points at `list_files`/`search_text`
+  ahead of shelling out to `ls`/`grep`/`find` ("Explore before you edit:
+  prefer list_files and search_text over ls/grep/find for finding the right
+  files..."), rather than leaving exploration to the model's own judgment.
+  `config_version` 3 → 5, also covering the retry-policy change below.
+- **Default retry policy widened: 3 attempts/100ms base delay → 5
+  attempts/2000ms.** Found live: an unattended batch run lost 35% of
+  attempts to the same transient provider 502, and 3 attempts at a 100ms
+  base delay adds up to well under a second of patience — nowhere near
+  enough to survive a sustained provider-side hiccup. 5/2000ms (exponential
+  backoff, ~30s total patience across 4 retries) was tuned for unattended
+  runs, not interactive use, where fast failure still matters more than
+  patience.
+- `compact()` dispatches through a `_Strategy` registry instead of
+  branching on strategy name inline at five separate points.
+  Behavior-preserving — adding a future strategy now means one dict entry,
+  not re-reading `compact()` for every place an old strategy name was
+  checked. `truncate()` and the retry dispatch are now registry-shaped the
+  same way, for consistency across every strategy-shaped config knob
+  (compaction, tool_output/file_injection, retry).
 
 ## [0.4.0] - 2026-07-26
 

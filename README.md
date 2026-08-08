@@ -117,6 +117,12 @@ menu and the explicit immutable invariants. The loop can pick vetted mechanisms;
 it cannot inject code, weaken verification, relax workspace boundaries, or make
 ambiguous edits legal.
 
+The tool belt grows the same deliberate way. `apply_patch` gives the same
+exact-match-or-refuse, atomic-write guarantee `edit_file` already gives for one
+location, extended to a change spanning several files or several locations in
+one file — validated everywhere before anything is written anywhere. See
+[CHANGELOG.md](CHANGELOG.md) for the full surface, chapter by chapter.
+
 To keep these two rhythms honest, the repo versions them on separate axes. The
 curriculum stays frozen and tagged `ch-00` through `ch-14`. The library and
 editable surface evolve under semantic versions on the `carbon` package, recorded
