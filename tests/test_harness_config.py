@@ -54,7 +54,7 @@ def test_config_loads_and_is_typed():
     assert isinstance(CONFIG.compaction_prompt, str)
     assert isinstance(CONFIG.memory_search_limit, int)
     assert isinstance(CONFIG.attach_pattern, str)
-    assert isinstance(CONFIG.temperature, float)
+    assert CONFIG.temperature is None or isinstance(CONFIG.temperature, float)
     assert isinstance(CONFIG.max_tokens, int)
 
 

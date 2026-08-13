@@ -106,7 +106,7 @@ class HarnessConfig:
     compaction_prompt: str  # the summarizer's instructions (compaction.py)
     memory_search_limit: int  # max hits returned by cross-session recall
     attach_pattern: str  # regex (as a string) for @path references; compiled in context.py
-    temperature: float  # default sampling temperature
+    temperature: float | None  # sampling temperature; None sends no field (provider default)
     max_tokens: int  # default completion budget
 
 
@@ -215,6 +215,11 @@ def _check_field(key: str, value: object, expected: type) -> None:
     ``bool`` fields accept only real booleans, which isinstance already ensures).
     Count/budget knobs must be positive, and the attach pattern must be a regex
     that compiles with a capture group — well-formedness checks, not value pins."""
+    if key == "temperature" and value is None:
+        # null is "send no temperature at all", deferring to the provider's own
+        # default — the only way to match a harness that never pins the knob,
+        # since every number (including 0.0) is a pin.
+        return
     if expected is int:
         ok = isinstance(value, int) and not isinstance(value, bool)
     elif expected is float:
@@ -459,7 +464,8 @@ def load_config(path: str | Path = CONFIG_PATH) -> HarnessConfig:
         elif key == "retry":
             kwargs[key] = _retry_policy(raw[key])
         elif expected is float:
-            kwargs[key] = float(raw[key])  # a JSON `1` is a valid temperature
+            # a JSON `1` is a valid temperature; null stays None (no field sent)
+            kwargs[key] = None if raw[key] is None else float(raw[key])
         else:
             kwargs[key] = raw[key]
     return HarnessConfig(**kwargs)

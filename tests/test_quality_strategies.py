@@ -282,6 +282,20 @@ def test_temperature_out_of_range_is_still_rejected(tmp_path):
         load_config(path)
 
 
+def test_temperature_null_defers_to_the_provider(tmp_path):
+    """null is not a value pin — it means the request carries no temperature
+    field, so the provider's own default applies (parity with harnesses that
+    never send the knob)."""
+    raw = json.loads(CONFIG_PATH.read_text())
+    raw["temperature"] = None
+    path = tmp_path / "harness_config.json"
+    path.write_text(json.dumps(raw))
+
+    loaded = load_config(path)
+
+    assert loaded.temperature is None
+
+
 def test_truncated_empty_response_does_not_leak_none():
     provider = _scripted([LLMResponse(content=None, finish_reason="length")])
 

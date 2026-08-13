@@ -378,6 +378,33 @@ def test_reasoning_effort_reaches_the_http_payload_as_a_nested_object(monkeypatc
     assert captured["reasoning"] == {"effort": "high"}
 
 
+def test_temperature_none_omits_the_field_entirely(monkeypatch):
+    """temperature=None must not serialize as `"temperature": null` — the key
+    itself is absent, so the provider applies its own default."""
+    captured: dict = {}
+
+    class _Resp:
+        def raise_for_status(self) -> None: ...
+
+        def json(self) -> dict:
+            return {
+                "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+                "usage": {},
+            }
+
+    def fake_post(url, json, headers, timeout):  # noqa: A002 — mirrors httpx.post kwarg
+        captured.update(json)
+        return _Resp()
+
+    monkeypatch.setattr(oc.httpx, "post", fake_post)
+    oc.complete_openai(
+        Provider("http://x/v1", "m", "k"),
+        [{"role": "user", "content": "hi"}],
+        temperature=None,
+    )
+    assert "temperature" not in captured
+
+
 def test_reasoning_effort_omitted_from_payload_when_not_set(monkeypatch):
     """Most models/providers neither support nor need this field — sending it
     unconditionally would risk a rejected/ignored parameter on every other call."""
