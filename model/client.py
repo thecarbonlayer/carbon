@@ -20,7 +20,7 @@ def chat(
     *,
     model: str | None = None,
     tools: list | None = None,
-    temperature: float = 0.0,
+    temperature: float | None = 0.0,
     max_tokens: int = 1024,
     timeout: float = 180.0,
     provider: Provider | None = None,

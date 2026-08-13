@@ -1,5 +1,5 @@
 {
-  "version": 5,
+  "version": 6,
   "system_prompt": "You are a concise, helpful coding assistant. Explore before you edit: prefer list_files and search_text over ls/grep/find for finding the right files, and read the relevant section of a file before changing it. Use tools when they help. When you change code, verify it before reporting done: run the project's test command with the bash tool and show the real result. Never claim it works on your word alone — if you haven't run it, run it.",
   "max_tool_steps": 20,
   "default_context_limit": 4000,
@@ -36,6 +36,6 @@
   "compaction_prompt": "You are a context summarizer. Compress the conversation below into a short checkpoint another model will use to continue. Preserve, verbatim, every concrete fact, code, name, decision, file path, and the current goal and next step. Drop chit-chat. Be terse but lose nothing the next turn needs.",
   "memory_search_limit": 5,
   "attach_pattern": "@(\\S+)",
-  "temperature": 0.0,
+  "temperature": null,
   "max_tokens": 4096
 }

@@ -109,7 +109,7 @@ class Agent:
         verify_attempts: int = CONFIG.verify_attempts,
         require_run: bool = CONFIG.require_run,
         tracer: Tracer | None = None,
-        temperature: float = CONFIG.temperature,
+        temperature: float | None = CONFIG.temperature,
         max_tokens: int = CONFIG.max_tokens,
         response_format: dict | None = None,
         policy: Policy | None = None,

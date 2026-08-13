@@ -26,13 +26,16 @@ def complete_openai(
     *,
     model: str | None = None,
     tools: list | None = None,
-    temperature: float = 0.0,
+    temperature: float | None = 0.0,
     max_tokens: int = 1024,
     timeout: float = 180.0,
     on_delta: OnDelta | None = None,
     response_format: dict | None = None,
 ) -> LLMResponse:
     """One call to an OpenAI-compatible model, through a provider.
+
+    ``temperature=None`` sends no temperature field at all, so the provider's own
+    default applies — the same behavior as a harness that never pins the knob.
 
     ``max_tokens`` is generous on purpose: Gemma is a reasoning model and spends
     tokens thinking (``reasoning_content``) before it produces visible content.
@@ -51,9 +54,10 @@ def complete_openai(
     payload: dict = {
         "model": model,
         "messages": messages,
-        "temperature": temperature,
         "max_tokens": max_tokens,
     }
+    if temperature is not None:
+        payload["temperature"] = temperature
     if tools:
         payload["tools"] = tools
     if response_format:
