@@ -9,11 +9,15 @@ All offline: the model is scripted through the provider's ``responder`` seam.
 
 from __future__ import annotations
 
+from dataclasses import replace
+from unittest.mock import patch
+
 import pytest
 
+import harness.harness_config as agent_config
 import model.openai_compatible as oc
 from harness.agent import Agent
-from harness.harness_config import CONFIG, config_schema
+from harness.harness_config import CONFIG, TruncationPolicy, config_schema
 from harness.policy import Policy
 from harness.provenance import provenance
 from harness.result import RunResult
@@ -214,7 +218,16 @@ def test_per_tool_truncation_budget():
     )
     p = _scripted([_tool_call("big"), LLMResponse(content="done", finish_reason="stop")])
 
-    r = Agent(provider=p, tools=reg).run("go")
+    # The subject is the per-tool BUDGET overriding the global one, so the strategy
+    # that decides the SHAPE is named here rather than inherited. Read off the live
+    # config, the head/tail assertion pins whatever ships: it fails under `keep_head`
+    # (no tail), under `offload_to_file` (a footer lands last), and at either end of
+    # the legal `tail_fraction` interval — four legal values, nothing broken.
+    with patch(
+        "harness.agent.CONFIG",
+        replace(agent_config.CONFIG, tool_output=TruncationPolicy("head_tail", 4000, 0.6)),
+    ):
+        r = Agent(provider=p, tools=reg).run("go")
 
     res = r.tool_calls[0].result
     assert res.startswith("X" * 4) and res.endswith("X" * 6)

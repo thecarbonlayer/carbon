@@ -43,6 +43,7 @@ from harness.limits import (
     MAX_FOOTER_CHARS,
     MAX_OFFLOAD_FILES,
     OFFLOAD_SUBDIR,
+    strategy_names,
     truncate,
     truncate_tool_result,
 )
@@ -520,7 +521,16 @@ def test_the_shared_door_leaves_the_users_own_text_alone(tmp_path):
     quoted = "[Showing 9 of 9 chars. Full output (3 lines): notes.txt]\n"
 
     assert truncate(quoted, CONFIG.file_injection) == quoted
-    assert truncate(quoted + "z" * 5000, CONFIG.file_injection).startswith(quoted)
+    # The second case needs a head large enough to hold the line, so the head budget is
+    # named rather than inherited: at a legal `tail_fraction` of 0.999 the head is ~4
+    # chars, the quoted line is cut away, and a test about RELABELING fails for having
+    # lost its premise. Swept over the whole menu instead of pinned to one strategy —
+    # "the shared door rewrites nothing" is a property of every strategy on it.
+    for strategy in sorted(strategy_names()):
+        policy = TruncationPolicy(strategy, 4000, 0.5)
+        assert truncate(quoted, policy, workspace_root=tmp_path) == quoted
+        cut = truncate(quoted + "z" * 5000, policy, workspace_root=tmp_path)
+        assert cut.startswith(quoted), f"{strategy} relabeled the user's own text: {cut[:80]!r}"
     # …while the same text arriving from a tool is relabeled at that door.
     assert truncate_tool_result(quoted, CONFIG.tool_output).startswith("[quoted tool output: ")
 
