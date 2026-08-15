@@ -206,8 +206,14 @@ def test_structured_compaction_serializes_tool_names_arguments_and_prior_summary
 
 
 def test_checked_in_strategy_defaults_are_quality_oriented():
-    assert CONFIG.tool_output.strategy == "head_tail"
-    assert CONFIG.compaction.strategy == "structured_checkpoint"
+    # Membership, not equality, for the two fields the improvement loop may edit.
+    # Pinning a literal there asserts "the loop has never accepted anything", so every
+    # accepted candidate would land this suite red — which is exactly what happened when
+    # the compaction switch merged. What this test is actually for is ruling out the
+    # DEGENERATE choices (a prefix-only cut; a summariser that carries no state), and a
+    # set says that directly while leaving the loop the room the surface promises it.
+    assert CONFIG.tool_output.strategy in {"head_tail", "offload_to_file"}
+    assert CONFIG.compaction.strategy in {"structured_checkpoint", "token_budget_checkpoint"}
     assert CONFIG.compaction.trigger_fraction < 1
     assert CONFIG.retry.strategy == "backoff"
     assert CONFIG.retry.max_attempts <= 5
