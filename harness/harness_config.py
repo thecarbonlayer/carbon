@@ -367,12 +367,20 @@ def _compaction_policy(value: dict) -> CompactionPolicy:
         )
     fraction = value["trigger_fraction"]
     if (
+        # Both ends EXCLUSIVE. At exactly 1 the pre-turn door fires only once the window
+        # has already passed the whole limit — for a real provider, after the request
+        # overflowed. The agent still recovers through the overflow door, but it pays a
+        # wasted provider call and spends its one recovery attempt to reach a state it
+        # could have reached before calling. That is not a strategy anything measures,
+        # so the surface stops offering it rather than a test forbidding what the door
+        # allows: the door and the published menu have to say the same thing.
         not isinstance(fraction, int | float)
         or isinstance(fraction, bool)
-        or not 0 < float(fraction) <= 1
+        or not 0 < float(fraction) < 1
     ):
         raise ValueError(
-            f"harness config: field {name!r}.trigger_fraction must be greater than 0 and at most 1"
+            f"harness config: field {name!r}.trigger_fraction must be greater than 0 "
+            f"and less than 1"
         )
     return CompactionPolicy(
         strategy,
@@ -448,7 +456,7 @@ def config_schema() -> list[dict]:
             item["parameters"] = {
                 "keep_head": {"type": "int", "positive": True},
                 "keep_tail": {"type": "int", "positive": True},
-                "trigger_fraction": {"type": "float", "exclusive_min": 0, "max": 1},
+                "trigger_fraction": {"type": "float", "exclusive_min": 0, "exclusive_max": 1},
                 "summary_max_tokens": {"type": "int", "positive": True},
             }
         elif name == "retry":
