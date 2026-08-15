@@ -233,6 +233,7 @@ class AgentTUI(App):
             approve=self._approve,
             approval_required=APPROVAL_TOOLS,
             agents_dir=str(self.workspace.root),  # AGENTS.md lives where the agent works
+            workspace_root=str(self.workspace.root),  # …and so does anything it spills
         )
 
     # --- layout -------------------------------------------------------------

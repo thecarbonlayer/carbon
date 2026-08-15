@@ -160,6 +160,77 @@ def test_content_on_when_enabled():
     assert tool.attributes[events.OUTPUT_MESSAGES]
 
 
+def test_captured_content_keeps_the_tail_and_is_bounded_by_the_door_that_ran():
+    """Two things the retention copies owe the person reading them.
+
+    The tail, because a 24KB failing build ends in ``FATAL: undefined reference to
+    main`` and content capture is opt-in precisely for debugging — head-only kept the
+    compiler's banner and dropped the error. And the door's own bound, because a bare
+    per-item clamp is faithful to nothing: it ignored both the configured tool_output
+    budget and the tool's declared ``max_result_chars``, so the span could hold less
+    than the model was given (a wider tool budget) or more (a narrower one).
+
+    These are documented seams — ``subscribe()`` and the ``Tracer`` (adr/0002) — so this
+    is what consumers are promised, not trace-size housekeeping.
+    """
+    from harness.harness_config import TruncationPolicy
+    from harness.limits import MAX_ITEM_CHARS
+
+    big = "BANNER\n" + "x" * 24_000 + "\nFATAL: undefined reference to main"
+    replies = iter(
+        [
+            LLMResponse(
+                content="",
+                tool_calls=[{"id": "c1", "function": {"name": "build", "arguments": '{"n": 1}'}}],
+                finish_reason="tool_calls",
+            ),
+            LLMResponse(content="done", finish_reason="stop"),
+        ]
+    )
+    tools = ToolRegistry()
+    tools.register(
+        Tool(
+            name="build",
+            description="",
+            parameters={"type": "object", "properties": {"n": {"type": "integer"}}},
+            func=lambda n: big,
+            mutates=False,
+        )
+    )
+    tr = Tracer(model="m", capture_content=True)
+    seen: list[dict] = []
+    door = TruncationPolicy("head_tail", 6_000, 0.5)  # deliberately not MAX_ITEM_CHARS
+    with patch.object(agent_mod, "chat", side_effect=lambda *a, **k: next(replies)):
+        a = agent_mod.Agent(tools=tools, tracer=tr, tool_output=door)
+        a.subscribe(seen.append)
+        a.send("build it")
+
+    event = next(e for e in seen if e["type"] == "tool_call")["result"]
+    span = next(s for s in tr.get_spans() if s.operation == events.EXECUTE_TOOL)
+    captured = span.attributes[events.OUTPUT_MESSAGES]
+    model_saw = next(m["content"] for m in a.messages if m.get("role") == "tool")
+
+    for copy in (event, captured):
+        assert copy.startswith("BANNER")
+        assert copy.endswith("FATAL: undefined reference to main")  # the line that matters
+        assert len(copy) <= door.budget + 100  # the door's budget, not a constant
+        assert len(copy) > MAX_ITEM_CHARS  # …and this door was wider than that constant
+    assert model_saw.endswith("FATAL: undefined reference to main")
+
+
+def test_captured_args_are_bounded_the_same_way_as_the_result():
+    """The other half of the same span. Bounding only the result left a 33MB write_file
+    sitting in ``gen_ai.input.messages`` whole while its two-word result was trimmed —
+    asymmetric, and the wrong way round."""
+    tr = Tracer(model="m", capture_content=True)
+
+    tr.record_tool("write_file", 0.1, args="A" * 50_000, result="wrote it", max_chars=1_000)
+
+    span = next(s for s in tr.get_spans() if s.operation == events.EXECUTE_TOOL)
+    assert len(span.attributes[events.INPUT_MESSAGES]) <= 1_100
+    assert span.attributes[events.OUTPUT_MESSAGES] == "wrote it"
+
+
 def test_tool_definitions_captured_once_per_turn():
     # The tool schemas handed to the model are part of the request. Capture them
     # on the turn's first chat span only — they don't change within a turn, and

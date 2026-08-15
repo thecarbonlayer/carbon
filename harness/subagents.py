@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 
+from harness.harness_config import TruncationPolicy
 from harness.policy import Policy
 from harness.tools import Tool, ToolRegistry, default_tools
 from model import Provider
@@ -25,6 +26,7 @@ def run_subagent(
     tools: ToolRegistry | None = None,
     agents_dir: str = ".",
     policy: Policy | None = None,
+    tool_output: TruncationPolicy | None = None,
 ) -> str:
     """Run one subtask in an isolated Agent. Read-only unless told otherwise.
 
@@ -34,16 +36,24 @@ def run_subagent(
     running fail-closed could delegate the very write it would refuse. The default
     is therefore ``Policy(read_only=True)``: mutation is opt-in, and a caller that
     wants a worker to write must hand it a policy that says so.
+
+    ``tool_output`` is the parent's truncation policy. A worker reading the same
+    workspace hits the same oversized files; inheriting the door means a parent
+    running ``offload_to_file`` doesn't spawn workers that silently drop the middle.
     """
     from harness.agent import Agent  # lazy: avoids an import cycle at module load
 
     sub = Agent(
         system=system or DEFAULT_WORKER_SYSTEM,
-        tools=tools or default_tools(),
+        # Default tools are rooted where this worker writes, not at the process cwd:
+        # the worker's own offloaded output lands under ``agents_dir``, and a read_file
+        # resolving anywhere else makes every footer it is handed a dead path.
+        tools=tools or default_tools(agents_dir),
         model=model,
         provider=provider,
         agents_dir=agents_dir,
         policy=policy or Policy(read_only=True),
+        tool_output=tool_output,
     )
     return sub.send(task)
 
@@ -56,6 +66,7 @@ def fan_out(
     tools: ToolRegistry | None = None,
     agents_dir: str = ".",
     policy: Policy | None = None,
+    tool_output: TruncationPolicy | None = None,
     max_workers: int = 4,
 ) -> list[str]:
     """Run subtasks in parallel, each in its own isolated subagent. Order preserved."""
@@ -71,6 +82,7 @@ def fan_out(
                     tools=tools,
                     agents_dir=agents_dir,
                     policy=policy,
+                    tool_output=tool_output,
                 ),
                 tasks,
             )
@@ -84,6 +96,7 @@ def delegate_tool(
     tools: ToolRegistry | None = None,
     agents_dir: str = ".",
     policy: Policy | None = None,
+    tool_output: TruncationPolicy | None = None,
 ) -> Tool:
     """A tool that lets a main agent delegate a self-contained subtask to a subagent."""
 
@@ -95,6 +108,7 @@ def delegate_tool(
             tools=tools,
             agents_dir=agents_dir,
             policy=policy,
+            tool_output=tool_output,
         )
 
     return Tool(
@@ -116,6 +130,7 @@ def fan_out_tool(
     tools: ToolRegistry | None = None,
     agents_dir: str = ".",
     policy: Policy | None = None,
+    tool_output: TruncationPolicy | None = None,
 ) -> Tool:
     """A tool that lets the model split work into independent subtasks and run them
     in parallel, each in its own isolated subagent. Results come back labeled and
@@ -133,6 +148,7 @@ def fan_out_tool(
             tools=tools,
             agents_dir=agents_dir,
             policy=policy,
+            tool_output=tool_output,
         )
         return "\n\n".join(
             f"[subtask {i}] {task}\n{result}"
