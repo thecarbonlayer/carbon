@@ -12,9 +12,11 @@ import harness.agent as agent_mod
 from harness import compaction
 from harness.compaction import compact, estimate_tokens
 from harness.context import deliver
+from harness.harness_config import CONFIG
 from harness.limits import MAX_ITEM_CHARS, clamp
 from harness.tools import Tool, ToolRegistry
 from model import LLMResponse
+from tasks.checks import _ceiling
 
 
 def test_estimate_tokens():
@@ -91,5 +93,9 @@ def test_tool_result_is_clamped():
         a = agent_mod.Agent(tools=reg)
         a.send("dump it")
     tool_msg = next(m for m in a.messages if m.get("role") == "tool")
-    assert len(tool_msg["content"]) <= MAX_ITEM_CHARS + 100
+    # The allowance follows the SELECTED strategy — `offload_to_file` adds a footer
+    # naming the complete copy, which is the point of it, not door-control slack. A
+    # fixed `+ 100` read one legal menu choice as a regression. `tasks.checks` already
+    # derives this for the live accept check; the offline test hardcoded it.
+    assert len(tool_msg["content"]) <= _ceiling(CONFIG.tool_output)
     assert "truncated" in tool_msg["content"]

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import stat
 from dataclasses import replace
@@ -27,6 +28,26 @@ from model import LLMResponse, Provider
 def _scripted(responses: list[LLMResponse]) -> Provider:
     items = iter(responses)
     return Provider("fake://quality", "fake", responder=lambda messages, **kwargs: next(items))
+
+
+@contextlib.contextmanager
+def _pinned(**fields):
+    """Run the loop under an explicitly named policy instead of whatever ships.
+
+    A test whose SUBJECT is a mechanism must name the policy that exercises it. Read
+    off the live config instead and the test silently changes what it asserts every
+    time the improvement loop moves a knob — and since the loop now runs this suite
+    before a candidate is measured, a test that merely disagrees with a legal value
+    vetoes that candidate and reports it as a harness break.
+
+    ``test_every_retry_strategy_behaves_distinctly`` already did this; the three retry
+    tests below and the two compaction-count tests did not, so 7 of the 16 legal
+    surface points turned this suite red with nothing broken.
+
+    ``harness.agent.CONFIG`` is the binding the loop reads at call time.
+    """
+    with patch("harness.agent.CONFIG", replace(CONFIG, **fields)):
+        yield
 
 
 def test_head_tail_retains_both_failure_contexts():
@@ -205,18 +226,28 @@ def test_structured_compaction_serializes_tool_names_arguments_and_prior_summary
     assert "strategy=structured_checkpoint" in out[1]["content"]
 
 
-def test_checked_in_strategy_defaults_are_quality_oriented():
-    # Membership, not equality, for the two fields the improvement loop may edit.
-    # Pinning a literal there asserts "the loop has never accepted anything", so every
-    # accepted candidate would land this suite red — which is exactly what happened when
-    # the compaction switch merged. What this test is actually for is ruling out the
-    # DEGENERATE choices (a prefix-only cut; a summariser that carries no state), and a
-    # set says that directly while leaving the loop the room the surface promises it.
-    assert CONFIG.tool_output.strategy in {"head_tail", "offload_to_file"}
-    assert CONFIG.compaction.strategy in {"structured_checkpoint", "token_budget_checkpoint"}
-    assert CONFIG.compaction.trigger_fraction < 1
-    assert CONFIG.retry.strategy == "backoff"
-    assert CONFIG.retry.max_attempts <= 5
+def test_unbounded_scalars_have_a_quality_floor():
+    """A floor under the knobs whose only validation is "positive".
+
+    This started as a set of strategy assertions, and every one of them has since been
+    withdrawn — but for two different reasons worth keeping straight.
+
+    The strategy conjuncts were withdrawn because they DUPLICATED a decision that
+    belongs elsewhere. Each named value is on carbon's published menu, and refinery
+    already measures what it costs on real tasks: E2's tag sits at the end of the
+    output, so ``keep_head`` loses it; H1 cannot recover a transient failure, so
+    ``fail_fast`` fails it. Those are verdicts with evidence, and the acceptance rule
+    acts on them. A second veto here only meant a legal candidate was rejected before
+    it was ever measured, reported as a harness break rather than as a worse agent.
+
+    ``trigger_fraction < 1`` and ``max_attempts <= 5`` were withdrawn because the
+    validator now says both, and it is the door — a test restating a door's rule adds
+    no coverage and goes stale on the day the door moves.
+
+    What remains is the part nothing else says. ``max_tokens`` is validated only as a
+    positive integer, so 1 loads cleanly and truncates every reply the agent writes.
+    That is a knob the loop may edit with no floor under it anywhere else.
+    """
     assert CONFIG.max_tokens >= 4096
 
 
@@ -230,7 +261,10 @@ def test_transient_provider_failure_retries_then_recovers():
         return LLMResponse(content="RECOVERED")
 
     provider = Provider("fake://retry", "fake", responder=responder)
-    with patch("harness.agent.time.sleep"):
+    with (
+        _pinned(retry=RetryPolicy("backoff", 3, 0)),
+        patch("harness.agent.time.sleep"),
+    ):
         result = Agent(provider=provider).run("go")
     assert result.text == "RECOVERED"
     assert state["calls"] == 2
@@ -243,13 +277,19 @@ def test_transient_retry_is_bounded():
         state["calls"] += 1
         raise RuntimeError("429 rate limit")
 
+    bound = 3
     provider = Provider("fake://retry", "fake", responder=responder)
     with (
+        _pinned(retry=RetryPolicy("backoff", bound, 0)),
         patch("harness.agent.time.sleep"),
         pytest.raises(RuntimeError, match="rate limit"),
     ):
         Agent(provider=provider).run("go")
-    assert state["calls"] == CONFIG.retry.max_attempts
+    # The bound under test is the CONFIGURED one, not the shipped one. Reading
+    # `CONFIG.retry.max_attempts` looks like it derives from config but does not:
+    # carbon gates retry on `strategy == "backoff"`, so under a legal `fail_fast`
+    # policy the call count is 1 while `max_attempts` still reads 5.
+    assert state["calls"] == bound
 
 
 def test_context_overflow_compacts_active_history_and_retries():
@@ -272,7 +312,11 @@ def test_context_overflow_compacts_active_history_and_retries():
     provider = Provider("fake://overflow", "fake", responder=responder)
     agent = Agent(provider=provider)
     agent.messages = [{"role": "user", "content": f"old-{i}"} for i in range(10)]
-    result = agent.run("continue")
+    # Exact call counts are the assertion, so the PRE-TURN door has to be pinned shut:
+    # at a legal `trigger_fraction` of 0.001 it fires as well and adds a second
+    # summary call, which is correct behaviour reading as a broken harness.
+    with _pinned(compaction=replace(CONFIG.compaction, trigger_fraction=0.8)):
+        result = agent.run("continue")
     assert result.text == "OVERFLOW-RECOVERED"
     assert state == {"main_calls": 2, "summary_calls": 1}
     assert agent.compaction_count == 1
@@ -357,7 +401,8 @@ def test_retries_do_not_inflate_the_reported_turn_count():
         return LLMResponse(content="RECOVERED")
 
     agent = Agent(provider=Provider("fake://flaky", "fake", responder=responder))
-    result = agent.run("go")
+    with _pinned(retry=RetryPolicy("backoff", 3, 0)), patch("harness.agent.time.sleep"):
+        result = agent.run("go")
 
     assert result.text == "RECOVERED"
     assert state["calls"] == 2  # one failed attempt, one success

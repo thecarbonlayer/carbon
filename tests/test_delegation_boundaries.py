@@ -9,9 +9,12 @@ from __future__ import annotations
 
 import json
 import tempfile
+from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 from harness.agent import Agent, _coding_tools
+from harness.harness_config import CONFIG
 from harness.policy import Policy
 from harness.subagents import run_subagent
 from harness.tools import Tool, ToolRegistry
@@ -231,7 +234,15 @@ def test_mixed_history_overflow_compacts_and_shrinks_in_one_pass():
     agent = Agent(provider=_calls(script), tools=registry)
     agent.messages = [{"role": "user", "content": f"old-{i}"} for i in range(20)]
 
-    result = agent.run("go")
+    # An exact compaction count is the assertion, so the PRE-TURN door is pinned shut:
+    # at a legal `trigger_fraction` of 0.001 it fires too and the count reads 2, which
+    # is correct behaviour presenting as a broken harness. What this test is about is
+    # the OVERFLOW door doing both jobs in its one recovery attempt.
+    with patch(
+        "harness.agent.CONFIG",
+        replace(CONFIG, compaction=replace(CONFIG.compaction, trigger_fraction=0.8)),
+    ):
+        result = agent.run("go")
 
     assert result.text == "RECOVERED"
     assert agent.compaction_count == 1  # prefix summarized
