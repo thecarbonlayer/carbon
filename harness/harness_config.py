@@ -35,6 +35,7 @@ of truth — the old module-level names still exist, but only as re-exports.
 from __future__ import annotations
 
 import json
+import math
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -50,6 +51,29 @@ class TruncationPolicy:
     strategy: str
     budget: int
     tail_fraction: float
+
+    def __post_init__(self) -> None:
+        # ``load_config`` validates the file's copy of these at import; a policy built
+        # in *code* (the ``Agent(tool_output=...)`` seam) never passes that door. A
+        # budget of 0 or a tail_fraction of 1.0 would surface only as a bizarre excerpt
+        # mid-turn, so the type validates itself wherever it is constructed.
+        #
+        # The types are checked, not just the ranges, because both wrong types survive
+        # the range check and fail later, deep inside the door: a float budget reaches
+        # a string slice as a TypeError mid-turn (in the very fallback that exists so
+        # truncation can never be fatal), and ``budget=True`` is a perfectly positive
+        # integer that silently cuts every result to one character.
+        if isinstance(self.budget, bool) or not isinstance(self.budget, int) or self.budget <= 0:
+            raise ValueError(f"truncation budget must be a positive integer, got {self.budget!r}")
+        if (
+            isinstance(self.tail_fraction, bool)
+            or not isinstance(self.tail_fraction, int | float)
+            or not math.isfinite(self.tail_fraction)
+            or not 0 < self.tail_fraction < 1
+        ):
+            raise ValueError(
+                f"truncation tail_fraction must be between 0 and 1, got {self.tail_fraction!r}"
+            )
 
 
 @dataclass(frozen=True)
@@ -144,6 +168,12 @@ _POSITIVE_INT_FIELDS = {
 }
 
 _TRUNCATION_STRATEGIES = frozenset({"keep_head", "head_tail"})
+# tool_output's menu additionally offers offload_to_file: the complete result goes
+# to a workspace file and the inline excerpt carries the path, so an over-budget
+# tool result is recoverable instead of gone. Only the tool-result door gets it —
+# file_injection already reads from a file the model can re-open, and the
+# compaction fallback runs where no workspace is in hand to write into.
+_TOOL_OUTPUT_STRATEGIES = _TRUNCATION_STRATEGIES | {"offload_to_file"}
 _COMPACTION_STRATEGIES = frozenset(
     {"summarize_middle", "structured_checkpoint", "token_budget_checkpoint"}
 )
@@ -276,15 +306,20 @@ def _object_keys(
         )
 
 
+def _truncation_menu(name: str) -> frozenset[str]:
+    """The strategy menu for one truncation-policy field — tool_output's is wider."""
+    return _TOOL_OUTPUT_STRATEGIES if name == "tool_output" else _TRUNCATION_STRATEGIES
+
+
 def _truncation_policy(name: str, value: dict) -> TruncationPolicy:
     _object_keys(name, value, {"strategy", "budget", "tail_fraction"})
     strategy = value["strategy"]
     budget = value["budget"]
     tail_fraction = value["tail_fraction"]
-    if strategy not in _TRUNCATION_STRATEGIES:
+    if strategy not in _truncation_menu(name):
         raise ValueError(
             f"harness config: field {name!r} strategy must be one of "
-            f"{sorted(_TRUNCATION_STRATEGIES)}, got {_short(strategy)}"
+            f"{sorted(_truncation_menu(name))}, got {_short(strategy)}"
         )
     if not isinstance(budget, int) or isinstance(budget, bool) or budget <= 0:
         raise ValueError(f"harness config: field {name!r}.budget must be a positive integer")
@@ -403,7 +438,7 @@ def config_schema() -> list[dict]:
         elif name == "memory_search_limit":
             item["locked_reason"] = "Locked until Refinery has memory-recall miners and guards."
         if name in {"file_injection", "tool_output"}:
-            item["strategies"] = sorted(_TRUNCATION_STRATEGIES)
+            item["strategies"] = sorted(_truncation_menu(name))
             item["parameters"] = {
                 "budget": {"type": "int", "positive": True},
                 "tail_fraction": {"type": "float", "exclusive_min": 0, "exclusive_max": 1},

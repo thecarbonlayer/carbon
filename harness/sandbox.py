@@ -13,8 +13,12 @@ containment boundary (network-none, non-root, cap-drop, memory + pid limits,
 read-only rootfs). The *local* fallback is **teaching-grade, not a security
 boundary**: it scrubs the environment and confines the cwd, and (as of the
 hardening below) puts each command in its own process group so a timeout kills the
-whole tree, and caps returned output — but it does *not* isolate the filesystem or
-cap host memory. Untrusted code on the local fallback can still read host files.
+whole tree — but it does *not* isolate the filesystem or cap host memory. Untrusted
+code on the local fallback can still read host files. The size limit that keeps a
+chatty command out of the model's window is not here at all: that is the agent's
+door (ch-06), applied once to the assembled tool result. This chapter adds only a
+blunt ceiling, set above anything real, so isolation needs no truncation policy,
+no workspace, and no imports from the chapters above it.
 Real isolation is a threat-model choice (gVisor / microVM / container-by-default);
 this course keeps the local path simple on purpose and names the limit rather than
 hiding it. See the README ("Why it's built this way": soft sandbox, hard verification).
@@ -38,20 +42,24 @@ from harness.tools import Tool
 
 # Minimal environment handed to sandboxed commands — note the absence of secrets.
 _SCRUBBED_ENV = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LC_ALL": "C"}
-_MAX_OUTPUT = 100_000  # cap returned output so a chatty command can't flood the window
+# A blunt ceiling on what one command hands back, set well above anything real, and
+# deliberately not a second truncation door: applying the agent's policy here re-cut
+# text the agent's own door cuts again, and under a strategy that WRITES it spilled a
+# file at this layer for the layer above to re-trim. The 100k it replaces was measured
+# to protect nothing — both backends materialize the whole stream in this process
+# before this line runs (a 256MB result peaked at 875MB either way), and the agent's
+# door already accepts a 33MB read_file result. What is left is an honest bound: above
+# it, completeness is NOT promised.
+_MAX_OUTPUT = 10_000_000
 
 
-def _cap(s: str | None) -> str:
-    s = s or ""
+def _cap(s: str) -> str:
+    """The ceiling: head and tail, no policy, no workspace, no file. Tail included
+    because the last thing a failing command writes is usually the reason it failed."""
     if len(s) <= _MAX_OUTPUT:
         return s
-    # The subprocess safety cap is larger than the prompt door, but it must use
-    # the same selected retention policy or a prefix-only cap here would destroy
-    # the failure tail before Agent can preserve it.
-    from harness.harness_config import CONFIG
-    from harness.limits import truncate
-
-    return truncate(s, CONFIG.tool_output, budget=_MAX_OUTPUT)
+    half = _MAX_OUTPUT // 2
+    return f"{s[:half]}\n…[truncated {len(s) - _MAX_OUTPUT} chars]\n{s[-half:]}"
 
 
 def _kill_group(proc: subprocess.Popen) -> None:
@@ -112,6 +120,12 @@ class Sandbox:
     def run(self, command: str, workdir: str | None = None) -> SandboxResult:
         # A workdir makes the sandbox operate on a persistent workspace (bind-mounted
         # in docker, cwd locally) instead of a throwaway dir.
+        #
+        # The streams come back whole. Cutting them here, per stream, was the wrong
+        # seam: the caller concatenates stdout and stderr (and a timeout appends a
+        # suffix), so anything a per-stream cut appended landed in the MIDDLE of the
+        # result the model gets. Nothing is saved by cutting early either — both streams
+        # are fully buffered in this process by the time we see them.
         if self.trusted:
             return self._run_local(command, workdir)
         if self._docker_up():
@@ -144,7 +158,7 @@ class Sandbox:
             # stop it explicitly so it doesn't outlive the timeout.
             subprocess.run(["docker", "kill", name], capture_output=True)
             return SandboxResult("", "error: timed out", 124, "docker")
-        return SandboxResult(_cap(proc.stdout), _cap(proc.stderr), proc.returncode, "docker")
+        return SandboxResult(proc.stdout, proc.stderr, proc.returncode, "docker")
 
     def _run_local(self, command: str, workdir: str | None) -> SandboxResult:
         # Fallback: scrubbed env + timeout. Uses the persistent workspace if given,
@@ -170,18 +184,24 @@ class Sandbox:
         except subprocess.TimeoutExpired:
             _kill_group(proc)
             stdout, stderr = proc.communicate()
-            return SandboxResult(_cap(stdout), _cap(stderr) + "\nerror: timed out", 124, backend)
-        return SandboxResult(_cap(stdout), _cap(stderr), proc.returncode, backend)
+            return SandboxResult(stdout, stderr + "\nerror: timed out", 124, backend)
+        return SandboxResult(stdout, stderr, proc.returncode, backend)
 
 
 def bash_tool(sandbox: Sandbox, workdir: str | None = None) -> Tool:
     """A bash tool whose commands run inside the sandbox. With a workdir, commands
-    run in the persistent workspace (so they see files the edit tools wrote)."""
+    run in the persistent workspace (so they see files the edit tools wrote).
+
+    No truncation policy: what the model sees is sized by the agent's door, which runs
+    once on the whole string returned here."""
 
     def run_bash(command: str) -> str:
         r = sandbox.run(command, workdir=workdir)
+        # Compose first, then the ceiling — this is the only place the whole result
+        # exists. The exit header stays outside it: the verification gate reads a
+        # receipt by its leading `[exit 0`.
         body = (r.stdout + r.stderr).strip()
-        return f"[exit {r.exit_code} via {r.backend}]\n{body}"
+        return f"[exit {r.exit_code} via {r.backend}]\n{_cap(body)}"
 
     return Tool(
         name="bash",

@@ -16,6 +16,83 @@ One entry per release; commits stay fine-grained under a `feat(surface)` or
 
 ### Added
 
+- `offload_to_file`: a third `tool_output` truncation strategy, additive and
+  default-neutral (the shipped default stays `head_tail`; `config_version`
+  does not move for this entry). The two inline strategies decide which bytes
+  to lose; this one refuses to lose any — an over-budget tool result is
+  written complete to `.carbon/offload/<content-hash>.txt` under the agent's
+  workspace, the model sees the familiar `head_tail` excerpt inline, and a
+  footer names the file: the workspace-relative path, the line count, the
+  `read_file` call that pages it, and the `search_text` pattern that jumps
+  straight to a line. Only the tool-result door offers it: `file_injection`
+  already reads from a re-openable file, and the compaction fallback runs with
+  no workspace in hand. For the same reason a result that is *itself*
+  re-readable (a `read_file` result, which arrives with a continuation hint)
+  keeps that hint instead of being copied — what is already on disk needs a
+  smaller range, not another copy, and that same downgrade is what stops a page
+  the model asks for from spilling in turn. **The tool-result door is the only
+  door**, and that is what keeps the strategy small: a result passes it exactly
+  once, so nothing has to work out what an earlier cut did to text it cannot
+  authenticate. `bash_tool` composes stdout, stderr and any timeout suffix and
+  applies one blunt ceiling (well above anything real; above it, completeness
+  is not promised) — no policy, no workspace, no file, and no import of door
+  control from the isolation chapter. The overflow-shrink recovery path re-cuts
+  inline with `head_tail` and writes nothing either; its tail slice is floored
+  at the widest footer the door can write (and its budget floored high enough
+  to afford that tail at every configured size), so a pointer at the end of an
+  offloaded result survives the cut whole, and it appends its own line saying
+  how much of the message is left rather than leaving the door's larger counts
+  standing over a smaller body. One door, three trust domains: `truncate` cuts
+  text the harness or the user chose and rewrites nothing, while
+  `truncate_tool_result` defangs footer lookalikes in **the copy the model
+  reads** — every strategy, including under-budget results, and before the cut,
+  since quoting a lookalike lengthens it. The spilled file is never defanged: it
+  is the tool's own bytes, because that copy gets re-read, diffed, applied and
+  hashed (a defanged `git diff`, re-applied, wrote five corrupted lines and
+  reported success — an add-only hunk has no context to mismatch). The
+  invariant that replaced provenance: footer-shaped text may be matched in
+  order to QUOTE it, never in order to BELIEVE it. So a footer of ours that
+  comes back around is quoted like any other, and there is no pattern to bound
+  and no secret to keep. What the footer will not claim is completeness it
+  cannot check: a result that reaches the door already carrying a
+  `…[truncated]` marker (the sandbox ceiling, a tool's own paging) is labelled
+  "output as captured, already truncated upstream" instead of "Full output",
+  since every count is true of the file and none of them is true of the
+  command. The write is atomic
+  (temp file + `os.replace`, which replaces a symlink at the target name
+  instead of following it out of the workspace), keeps the user's umask, is
+  refused before anything is created if `.carbon` is a symlink or resolves
+  outside the workspace, and never trusts a pre-existing file at the hashed
+  name without verifying its content; any failure — no workspace, a bad write,
+  an unencodable result — degrades to the inline excerpt and says so in the
+  marker, because this runs mid-turn with `tool_calls` already in the
+  transcript. Housekeeping: the directory gets a `.gitignore` (a `*` when
+  absent, a covering line appended when an existing one doesn't cover the
+  spills, never a clobber), holds at most 64 spills but never reclaims one
+  this session's transcript still points at, and is skipped by
+  `list_files`/`search_text` unless a pattern names one spill file exactly —
+  the footer's own `search_text` route, judged on the resolved path so a
+  symlink into the scratch directory cannot reopen it.
+  `Agent(tool_output=...)` overrides the policy per instance (default `None`
+  keeps the editable surface in charge) — the experiment seam, same
+  philosophy as `Tool.max_result_chars`, while the config file remains the
+  improvement loop's surface.
+- `Agent(workspace_root=...)`: where the agent's files live — the directory
+  offloaded output is written under, and the root the model's `read_file`
+  resolves against. Defaults to `agents_dir`, which every wiring here binds
+  to the same directory, so no existing caller changes; a consumer that loads
+  `AGENTS.md` from a neutral directory while rooting `read_file` at the
+  workspace now has a way to say so, instead of every footer path being a
+  dead route. The truncation policy threads the same way:
+  `run_once(tool_output=...)` → `_coding_tools` → `delegate`/`fan_out`, so a
+  subagent — a whole Agent, with a door of its own — cuts the way its parent
+  does, and a worker given no registry gets the default tools rooted where it
+  offloads, so the footers it is handed name paths its own `read_file` can
+  resolve. `TruncationPolicy` validates the types and the
+  ranges of its budget and tail fraction wherever it is constructed (a float
+  budget used to reach a string slice mid-turn; `True` is a positive integer
+  that cuts every result to one character), and `Agent` rejects an
+  unimplemented strategy name at construction rather than mid-session.
 - `harness/extensions.py`: a tools-only extension loader. A Python file under
   `~/.carbon/extensions/` or a project's `.carbon/extensions/` exposing
   `setup(registry: ToolRegistry) -> None` can register new tools or `wrap()`
@@ -113,6 +190,32 @@ One entry per release; commits stay fine-grained under a `feat(surface)` or
   backoff, ~30s total patience across 4 retries) was tuned for unattended
   runs, not interactive use, where fast failure still matters more than
   patience.
+- **`harness.limits` grew a second entrance and renamed its re-cut helper.**
+  `truncate()` keeps its signature and now cuts without rewriting anything, which
+  is what an `@path` block and a generated checkpoint need; tool output goes
+  through the new `truncate_tool_result()`, which defangs footer lookalikes in
+  the model's copy only. `head_tail()` — public, unvalidated, and shaped exactly
+  like a way around the door — is now `recut()`, documented as the post-door
+  re-cut primitive and validating its budget and tail fraction through
+  `TruncationPolicy` (`head_tail(text, 10, tail_fraction=2.0)` used to return 61
+  chars for a budget of 10). None of the three was ever exported from `carbon`.
+- **The two retention copies of a tool result are bounded, head AND tail, at the
+  door's own budget.** `subscribe()`'s `tool_call` event and — when content
+  capture is on — the `execute_tool` span's `gen_ai.input.messages` /
+  `gen_ai.output.messages` are the pre-door result, which nothing under the loop
+  caps: a subscriber could hold a 33MB `read_file` result for the life of the
+  driver. They were clamped head-only at the fixed per-item ceiling, which was
+  faithful to neither side — it ignored both the configured `tool_output` budget
+  and a tool's declared `max_result_chars` (so it could keep less or more than
+  the model received), and dropping the tail dropped exactly the `FATAL: …` last
+  line that content capture is opt-in to see. Both now keep head and tail at the
+  effective budget for that result; `Tracer.record_tool()` takes the bound as a
+  `max_chars` keyword (default: the per-item ceiling) and applies it to the args
+  as well, so a 33MB `write_file` is no longer stored whole on the input side
+  while its result is trimmed. These are documented seams (adr/0002), so this is
+  an API change rather than trace-size housekeeping. Spans are in-memory only —
+  `dump_events()` persists the flat `Event` list and nothing else — so the bound
+  is on a live process's resident trace and exporter payload, not on a file.
 - `compact()` dispatches through a `_Strategy` registry instead of
   branching on strategy name inline at five separate points.
   Behavior-preserving — adding a future strategy now means one dict entry,
