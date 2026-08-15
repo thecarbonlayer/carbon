@@ -29,8 +29,13 @@ from dataclasses import asdict, dataclass, field, fields
 
 from harness import events
 from harness.events import NullExporter, Span, SpanExporter
-from harness.limits import clamp
+from harness.limits import MAX_ITEM_CHARS, clamp, recut
 from model.pricing import cost_from_usage
+
+# The head/tail split for captured content. Half and half: a captured result is read to
+# find out what happened, and what happened is as often in the last line (`FATAL: …`,
+# an exit summary) as in the first.
+_CAPTURE_TAIL_FRACTION = 0.5
 
 
 @dataclass
@@ -245,7 +250,12 @@ class Tracer:
         *,
         call_id: str | None = None,
         description: str | None = None,
+        max_chars: int = MAX_ITEM_CHARS,
     ) -> None:
+        """Record one tool call. ``max_chars`` is how much of the captured content this
+        keeps: the caller's own door budget for that result, so the span shows what the
+        model was actually handed rather than a constant that may be smaller or larger.
+        The default is the per-item ceiling, for callers with no door of their own."""
         # Keep the trace small but replayable — clamp the captured I/O.
         self._emit(
             Event(
@@ -270,8 +280,15 @@ class Tracer:
         if status == "error":
             attrs[events.ERROR_TYPE] = "error"
         if self.capture_content:
-            attrs[events.INPUT_MESSAGES] = args
-            attrs[events.OUTPUT_MESSAGES] = result
+            # Both sides bounded, and bounded the same way: head AND tail, at the size
+            # the caller's door allowed this result. Head-only lost the last line, which
+            # on a failing build is the one line worth capturing; leaving the args
+            # uncapped left a 33MB write_file in the span whole while its result was
+            # trimmed to 4,000 chars. Spans are in-memory only — ``dump_events`` persists
+            # the flat Event list and nothing else — so this bounds a live process's
+            # exporter payload and its resident trace, not a file on disk.
+            attrs[events.INPUT_MESSAGES] = recut(args, max_chars, _CAPTURE_TAIL_FRACTION)
+            attrs[events.OUTPUT_MESSAGES] = recut(result, max_chars, _CAPTURE_TAIL_FRACTION)
         self.spans.append(
             Span(
                 span_id=self._next_span_id(),

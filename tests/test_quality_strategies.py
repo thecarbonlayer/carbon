@@ -37,14 +37,41 @@ def test_head_tail_retains_both_failure_contexts():
     assert "truncated" in out
 
 
-def test_sandbox_safety_cap_does_not_destroy_failure_tail():
+def test_the_post_door_recut_validates_what_the_door_would_have():
+    """``recut`` is the one truncation helper that takes raw numbers instead of a
+    policy, which is exactly why it needs the policy's validation: it took a
+    ``tail_fraction`` of 2.0 without a word and returned 61 chars for a budget of 10 —
+    a cut bigger than the thing it was cutting to.
+
+    It is also the one that skips the door, so its name and its docstring say what it is
+    for (text already through a door) rather than reading as a general entry point."""
+    from harness.limits import recut
+
+    assert recut("ABCDEFGHIJ" * 5, 10, 0.6).endswith("EFGHIJ")
+    assert recut("short", 10, 0.6) == "short"
+    with pytest.raises(ValueError, match="tail_fraction"):
+        recut("ABCDEFGHIJ" * 5, 10, 2.0)
+    with pytest.raises(ValueError, match="tail_fraction"):
+        recut("ABCDEFGHIJ" * 5, 10, 0.0)
+    with pytest.raises(ValueError, match="budget"):
+        recut("ABCDEFGHIJ" * 5, 0, 0.5)
+
+
+def test_sandbox_ceiling_does_not_destroy_failure_tail():
+    """The sandbox's ceiling is blunt and policy-free, but it is still head AND tail:
+    the last thing a failing command writes is usually the reason it failed. It also
+    sits above anything real now — the 100k it replaced was measured to protect nothing
+    and cost a second truncation door on the same text."""
     from harness import sandbox
 
-    text = "PASS\n" * 30_000 + "FINAL-FAILURE-TAIL"
+    assert "truncated" not in sandbox._cap("PASS\n" * 30_000)  # 150k is not "chatty"
+
+    text = "PASS\n" * (sandbox._MAX_OUTPUT // 5 + 1000) + "FINAL-FAILURE-TAIL"
     out = sandbox._cap(text)
     assert out.startswith("PASS")
     assert out.endswith("FINAL-FAILURE-TAIL")
     assert "truncated" in out
+    assert len(out) <= sandbox._MAX_OUTPUT + 100  # the ceiling holds, plus its marker
 
 
 def test_read_file_supports_precise_line_ranges(tmp_path):

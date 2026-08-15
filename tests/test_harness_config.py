@@ -183,7 +183,8 @@ def test_surface_manifest_separates_choices_from_invariants():
     editable = {item["name"]: item for item in manifest["editable"]}
     locked = {item["name"]: item for item in manifest["locked_fields"]}
     immutable = {item["name"] for item in manifest["immutable"]}
-    assert editable["tool_output"]["strategies"] == ["head_tail", "keep_head"]
+    assert editable["tool_output"]["strategies"] == ["head_tail", "keep_head", "offload_to_file"]
+    assert editable["file_injection"]["strategies"] == ["head_tail", "keep_head"]
     assert locked["version"]["editable"] is False
     assert "verification integrity" in locked["require_run"]["locked_reason"]
     assert {

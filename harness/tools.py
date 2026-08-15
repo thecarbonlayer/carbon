@@ -20,6 +20,8 @@ from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
+from harness.limits import OFFLOAD_SUBDIR  # the one scratch path discovery may be aimed at
+
 
 def _is_secret_file(p: Path) -> bool:
     """A model-invoked read must never exfiltrate credentials. Refuse dotenv files,
@@ -54,7 +56,10 @@ def read_file(
         return f"error: refusing to read secret file: {path}"
     if not p.is_file():
         return f"error: no such file: {path}"
-    body = p.read_text()
+    # Explicit utf-8, matching the write side (limits.py spills offloaded output here
+    # for this tool to read back): a locale-dependent default would make the round
+    # trip work on one machine and raise on another.
+    body = p.read_text(encoding="utf-8")
     if start_line is None and end_line is None:
         return body
     lines = body.splitlines(keepends=True)
@@ -245,6 +250,22 @@ def _confined(root: str | Path | None) -> Path:
     return Path(root).resolve() if root else Path.cwd().resolve()
 
 
+_GLOB_MAGIC = set("*?[")
+
+
+def _names_one_spill(pattern: str) -> bool:
+    """Does this pattern point straight at a single offloaded result?
+
+    That is the whole exemption: the footer hands the model
+    ``.carbon/offload/<hash>.txt`` and tells it to grep that file, so exactly that
+    shape is allowed through and nothing wider is. Anything with glob magic in the
+    filename sweeps the directory instead, which is how a stale spill from an unrelated
+    task ends up quoted back as if it were the workspace's own content.
+    """
+    path = Path(pattern)
+    return path.parent == OFFLOAD_SUBDIR and not _GLOB_MAGIC & set(path.name)
+
+
 def _visible_files(base: Path, pattern: str) -> list[Path]:
     """Files under ``base`` matching ``pattern``, minus secrets and VCS/venv noise.
 
@@ -253,8 +274,21 @@ def _visible_files(base: Path, pattern: str) -> list[Path]:
     pointing at a file outside the root, or at ``.env`` — so checking the link's
     own name would leak the content it points to. ``read_file`` already resolves
     before its containment check; these have to agree with it.
+
+    ``.carbon`` is skipped for a different reason: it is the harness's own scratch
+    directory inside the workspace (offloaded tool output, project-local extensions),
+    not project content. An undirected walk that surfaced it would let yesterday's
+    spilled tool result answer a question about the user's code, and a search for a
+    symbol would hit every excerpt that ever quoted it. The one exemption is the route
+    the offload footer hands the model: a pattern naming ONE file under the offload
+    directory, which is what ``search_text(pattern=...)`` needs to grep the huge result
+    it just pointed at. A wildcard over that directory is not that route — it is an
+    enumeration of every spill the workspace has ever held — and neither is a pattern
+    that merely mentions ``.carbon`` somewhere.
     """
     skip = {".git", ".venv", "venv", "node_modules", "__pycache__", ".mypy_cache", ".ruff_cache"}
+    if not _names_one_spill(pattern):
+        skip.add(".carbon")
     out = []
     for p in sorted(base.glob(pattern)):
         target = p.resolve()
@@ -262,7 +296,11 @@ def _visible_files(base: Path, pattern: str) -> list[Path]:
             continue  # symlink (or traversal) out of the workspace
         if not target.is_file() or _is_secret_file(p) or _is_secret_file(target):
             continue
-        if skip & set(p.relative_to(base).parts):
+        # Both the apparent path and the resolved one: containment is judged on the
+        # resolved target, and so must this be, or `ln -s .carbon/offload cache` turns
+        # `cache/*` into the undirected walk of the scratch directory that the skip
+        # exists to prevent.
+        if skip & (set(p.relative_to(base).parts) | set(target.relative_to(base).parts)):
             continue
         out.append(p)
     return out

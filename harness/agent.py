@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 import time
 from collections.abc import Callable
@@ -32,9 +33,9 @@ from pathlib import Path
 
 from harness.compaction import compact, estimate_tokens
 from harness.context import deliver
-from harness.harness_config import CONFIG, RetryPolicy
+from harness.harness_config import CONFIG, RetryPolicy, TruncationPolicy
 from harness.instructions import load_agents_md, test_command
-from harness.limits import truncate
+from harness.limits import MAX_FOOTER_CHARS, recut, strategy_names, truncate_tool_result
 from harness.memory import DEFAULT_DIR, load_session, load_trace, save_session, save_trace
 from harness.observability import Tracer
 from harness.policy import Policy
@@ -51,6 +52,20 @@ DEFAULT_CONTEXT_LIMIT = CONFIG.default_context_limit  # ~tokens; compact above t
 APPROVAL_TOOLS = CONFIG.approval_tools  # tools the gate guards
 # a write/edit of one of these arms the test gate (a code change to verify)
 CODE_EXTENSIONS = CONFIG.code_extensions
+# The smallest tail an emergency shrink may leave: the widest recovery footer the door
+# can write (limits.py measures its own writer against that constant), so a pointer
+# sitting at the end of a result survives the cut by construction rather than by luck.
+SHRINK_TAIL_CHARS = MAX_FOOTER_CHARS
+# …which only holds if the shrink budget is big enough to spend that much on a tail.
+# The floor used to be 200, and the tail clamp below then silently overrode the
+# guarantee whenever the shrink budget fell under SHRINK_TAIL_CHARS / the clamp —
+# i.e. for a configured tool_output.budget below roughly 2000. The shipped 4000 was
+# never affected (it shrinks to 1000 and spends 600 on the tail); the configs that
+# needed the promise most were exactly the ones that lost it. Sized from the clamp
+# instead: at this budget the floored tail is always affordable, so the promise is
+# true wherever it is made.
+SHRINK_MAX_TAIL_FRACTION = 0.9  # never spend the whole budget on the tail
+SHRINK_MIN_BUDGET = math.ceil(SHRINK_TAIL_CHARS / SHRINK_MAX_TAIL_FRACTION)
 
 
 # --- retry strategies, registry-shaped to match compaction.py and limits.py --------
@@ -97,6 +112,7 @@ class Agent:
         provider: Provider | None = None,
         system: str | None = None,
         agents_dir: str = ".",
+        workspace_root: str | None = None,
         tools: ToolRegistry | None = None,
         approve: Callable[[str, str], bool] | None = None,
         approval_required: frozenset[str] | set[str] | None = None,
@@ -113,11 +129,20 @@ class Agent:
         max_tokens: int = CONFIG.max_tokens,
         response_format: dict | None = None,
         policy: Policy | None = None,
+        tool_output: TruncationPolicy | None = None,
     ) -> None:
         self.model = model
         self.provider = provider
         self.system = system
         self.agents_dir = agents_dir  # where AGENTS.md is auto-loaded from
+        # Where the agent's files live: the directory offloaded tool output is written
+        # under, and the root the model's own read_file resolves against. It defaults
+        # to agents_dir because every mature wiring here binds both to the workspace —
+        # but they answer different questions, and a consumer can legitimately split
+        # them (AGENTS.md loaded from a neutral directory, files written where the
+        # model can reach them). Then the footer's path must follow the read_file
+        # root, not the instructions root, or every recovery route is a dead link.
+        self.workspace_root = workspace_root
         self.tools = tools
         self.approve = approve
         self.approval_required = approval_required or set()
@@ -150,6 +175,23 @@ class Agent:
         # this loop against a harness that DOES have one) passes it here — same
         # reasoning as `max_tool_steps` just above.
         self.deadline_s = deadline_s
+        # Per-instance override of the tool-result truncation policy
+        # (CONFIG.tool_output). None (the default) keeps the editable surface in
+        # charge — every existing caller is unchanged. An experiment passes its own
+        # TruncationPolicy here to ride a public seam instead of editing the config
+        # file (same philosophy as the per-tool Tool.max_result_chars): the config
+        # stays the improvement loop's surface, code callers get a kwarg.
+        #
+        # Validated here rather than at first use: the config file's copy of this
+        # choice is checked at import, but a policy built in code goes around that
+        # door, and an unimplemented strategy name would otherwise surface as a
+        # mid-session crash — after the turns that got there were already paid for.
+        if tool_output is not None and tool_output.strategy not in strategy_names():
+            raise ValueError(
+                f"unsupported truncation strategy: {tool_output.strategy!r} "
+                f"(choose one of {sorted(strategy_names())})"
+            )
+        self.tool_output = tool_output
         self.skills = skills or []
         self._last_tokens = 0  # model-reported usage from the last call (ch-08)
         self.session = session
@@ -429,6 +471,16 @@ class Agent:
             for m in self.messages[turn_start:]
         )
 
+    def _tool_output_policy(self) -> TruncationPolicy:
+        """The active tool-result policy: the per-instance override, else the surface."""
+        return self.tool_output if self.tool_output is not None else CONFIG.tool_output
+
+    def _offload_root(self) -> str:
+        """Where an offloaded tool result is written — the explicit workspace root when
+        one was given, else agents_dir (which every wiring here binds to the same
+        directory, so no existing caller changes)."""
+        return self.workspace_root or self.agents_dir
+
     def _run(self, on_delta: OnDelta | None = None) -> str:
         """Drive the model, executing tool calls until it produces a final answer.
 
@@ -501,32 +553,58 @@ class Agent:
                             self._turn_approvals += 1
                         result = self.tools.call(name, args)
                         status = "error" if result.startswith("error") else "ok"
+                    # Keep the selected, Carbon-owned strategy fixed while a tool may
+                    # ask for a smaller budget. The strategy itself is an editable,
+                    # bounded choice; arbitrary truncation code is not.
+                    tool = self.tools.get(name)
+                    budget = tool.max_result_chars if tool and tool.max_result_chars else None
+                    policy = self._tool_output_policy()
+                    # What the two retention paths keep of this result: the same size the
+                    # model's own door allowed it, head AND tail. A bare per-item clamp
+                    # was faithful to neither — it ignored both the policy budget and the
+                    # tool's own, so it captured more or less than the model actually
+                    # received, and being head-only it dropped exactly the `FATAL: …` last
+                    # line that content capture is turned on to see. These are documented
+                    # seams (subscribe(), the Tracer — adr/0002), so the copies they hand
+                    # out are part of the contract, not trace-size housekeeping.
+                    #
+                    # Floored at 1: unlike a TruncationPolicy, ``Tool.max_result_chars``
+                    # is not validated where it is built, and a consumer's nonsense value
+                    # must not become the first exception of a turn whose tool_calls are
+                    # already in the transcript. The door has always absorbed one; so
+                    # does this.
+                    kept = max(1, budget or policy.budget)
+                    observed = recut(result, kept, policy.tail_fraction)
                     if self.tracer:
                         self.tracer.record_tool(
-                            name, time.perf_counter() - t1, args=args, result=result, status=status
+                            name,
+                            time.perf_counter() - t1,
+                            args=args,
+                            result=result,
+                            status=status,
+                            max_chars=kept,
                         )
                     self._emit(
                         {
                             "type": "tool_call",
                             "name": name,
                             "args": args,
-                            "result": result,
+                            "result": observed,
                             "is_error": status == "error",
                         }
                     )
-                    # Keep the selected, Carbon-owned strategy fixed while a tool may
-                    # ask for a smaller budget. The strategy itself is an editable,
-                    # bounded choice; arbitrary truncation code is not.
-                    tool = self.tools.get(name)
-                    budget = tool.max_result_chars if tool and tool.max_result_chars else None
                     hint = None
                     if name == "read_file":
                         hint = "Use start_line/end_line to request the missing range."
-                    content = truncate(
+                    # workspace_root anchors offload_to_file's files where the model's
+                    # own read_file resolves relative paths, so the footer's path is a
+                    # route the model can actually walk.
+                    content = truncate_tool_result(
                         result,
-                        CONFIG.tool_output,
+                        policy,
                         budget=budget,
                         continuation_hint=hint,
+                        workspace_root=self._offload_root(),
                     )
                     self.messages.append(
                         {"role": "tool", "tool_call_id": tc.get("id", ""), "content": content}
@@ -621,12 +699,38 @@ class Agent:
     def _shrink_turn_tool_results(self) -> bool:
         """Shrink this turn's oversized tool results in place; True if anything moved.
 
-        Receipt-safe by construction. The verification gate pairs an *assistant*
-        message's tool_calls with a tool message whose content starts with
-        ``[exit 0`` — so this never touches assistant messages, and every truncation
-        strategy in the menu keeps the head, where that marker lives.
+        Plain inline ``head_tail``, never the configured strategy and never a file: this
+        is a SECOND cut of text the door already cut, so offloading here would file an
+        *excerpt* as the complete output while the door's real file is still named in
+        the text being re-cut. It runs on every oversized result in the turn, including
+        ones the door already cut — skipping those would skip all of them — and it is
+        the only lever when the overflow came from the current turn, which prefix
+        compaction cannot reach.
+
+        Receipt-safe by construction: the verification gate pairs an *assistant*
+        message's tool_calls with a tool message starting ``[exit 0``, so this never
+        touches assistant messages and head_tail keeps that head. Pointer-safe too: the
+        tail floor is the widest footer the door can write, and the shrink budget is
+        floored high enough to afford that tail — so a recovery route sitting at the end
+        of an offloaded result survives this cut whole, at every configured budget.
+
+        It also says so. A message cut here still ends in whatever counts the door wrote
+        ("Showing 4000 of 29999 chars") and those describe a body five times the size of
+        the one now above them, so the pass appends its own line rather than rewriting
+        someone else's numbers — annotating text, never believing it.
+
+        "Anything moved" means the total actually got smaller. A budget-sized head_tail
+        plus its marker is LONGER than a result that was barely over the budget, and
+        reporting that as progress sends the caller back to the model with a payload it
+        has already seen — burning the one overflow-recovery attempt on a request that
+        will overflow identically.
         """
-        budget = max(200, CONFIG.tool_output.budget // 4)
+        active = self._tool_output_policy()
+        budget = max(SHRINK_MIN_BUDGET, active.budget // 4)
+        # The configured split, unless it leaves too little tail to carry a pointer.
+        tail_fraction = min(
+            SHRINK_MAX_TAIL_FRACTION, max(active.tail_fraction, SHRINK_TAIL_CHARS / budget)
+        )
         shrank = False
         for message in self.messages[self._active_turn_start :]:
             if message.get("role") != "tool":
@@ -634,8 +738,13 @@ class Agent:
             content = str(message.get("content", ""))
             if len(content) <= budget:
                 continue
-            message["content"] = truncate(content, CONFIG.tool_output, budget=budget)
-            shrank = True
+            cut = recut(content, budget, tail_fraction) + (
+                f"\n[Re-cut to fit the context window: {budget} of {len(content)} chars of the "
+                f"message above are left, so any earlier count in it describes a larger copy.]"
+            )
+            if len(cut) < len(content):
+                message["content"] = cut
+                shrank = True
         return shrank
 
     def _model_call_with_recovery(
@@ -709,6 +818,7 @@ def _coding_tools(
     provider: Provider | None = None,
     model: str | None = None,
     sessions_dir: str | Path | None = None,
+    tool_output: TruncationPolicy | None = None,
 ) -> ToolRegistry:
     """The mature agent's toolset, rooted at ``workspace`` — the one builder print
     mode, the REPL, and the TUI all use, so a delegated worker can't end up reading
@@ -716,7 +826,11 @@ def _coding_tools(
 
     ``provider``/``model`` are threaded to the workers too: a consumer that passes a
     custom provider expects its delegates to use it, not to silently fall back to
-    whatever the environment points at.
+    whatever the environment points at. So is ``tool_output`` — a subagent is a whole
+    Agent with a door of its own, and a worker reading the same oversized files as its
+    parent should cut them the same way (None: the surface's selection, which both
+    resolve identically). The sandbox is NOT on that list: ``bash_tool`` applies no
+    policy at all, so there is no third door to keep in agreement.
     """
     from harness.memory import search_memory_tool
     from harness.sandbox import Sandbox, bash_tool
@@ -747,8 +861,16 @@ def _coding_tools(
     tools.register(bash_tool(Sandbox(trusted=True, timeout=120), workdir=root))
     tools.register(search_memory_tool(memory_dir, exclude=exclude_session))
     workers = worker_tools()
-    tools.register(delegate_tool(model=model, provider=provider, tools=workers, agents_dir=root))
-    tools.register(fan_out_tool(model=model, provider=provider, tools=workers, agents_dir=root))
+    tools.register(
+        delegate_tool(
+            model=model, provider=provider, tools=workers, agents_dir=root, tool_output=tool_output
+        )
+    )
+    tools.register(
+        fan_out_tool(
+            model=model, provider=provider, tools=workers, agents_dir=root, tool_output=tool_output
+        )
+    )
     return tools
 
 
@@ -764,6 +886,7 @@ def run_once(
     sessions_dir: str = DEFAULT_DIR,
     workspace_root: str = ".",
     agents_dir: str | None = None,
+    tool_output: TruncationPolicy | None = None,
 ) -> str:
     """Run exactly one turn non-interactively and return it rendered as ``fmt``
     ("plain" | "json" | "transcript"). Fail-closed on approvals unless ``yes``.
@@ -788,6 +911,7 @@ def run_once(
         provider=provider,
         model=provider.model,
         sessions_dir=sessions_dir,
+        tool_output=tool_output,
     )
     if extensions:
         load_extensions(tools, *_extension_dirs(workspace.root))
@@ -802,7 +926,12 @@ def run_once(
         session=session,
         sessions_dir=sessions_dir,
         agents_dir=agents_dir or str(workspace.root),
+        # Explicit, because this is the one entrypoint where the two can differ: a
+        # caller may point agents_dir at another project's instructions, but files
+        # are written and read here.
+        workspace_root=str(workspace.root),
         tracer=tracer,
+        tool_output=tool_output,
     )
     reply = agent.send(prompt, on_delta=on_delta)
     if fmt == "json":
@@ -935,6 +1064,7 @@ def _run_repl(args: argparse.Namespace) -> None:
         skills=load_skills("skills"),
         session="repl",
         agents_dir=str(workspace.root),  # read AGENTS.md (incl. ## Testing) from the project
+        workspace_root=str(workspace.root),  # …and spill oversized results into it
         tracer=tracer,
     )
     print(

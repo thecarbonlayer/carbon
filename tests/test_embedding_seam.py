@@ -297,7 +297,7 @@ def test_config_schema_describes_the_surface():
     assert by["approval_tools"]["collection"] and by["approval_tools"]["type"] == "list[str]"
     assert by["max_tool_steps"]["positive_int"] and by["max_tool_steps"]["type"] == "int"
     assert by["require_run"]["type"] == "bool" and not by["require_run"]["positive_int"]
-    assert by["tool_output"]["strategies"] == ["head_tail", "keep_head"]
+    assert by["tool_output"]["strategies"] == ["head_tail", "keep_head", "offload_to_file"]
     assert by["compaction"]["strategies"] == [
         "structured_checkpoint",
         "summarize_middle",
