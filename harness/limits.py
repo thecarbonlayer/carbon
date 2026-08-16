@@ -9,8 +9,8 @@ every strategy-shaped config knob uses the same shape, so an external improver
 (or a person) reads one pattern once, not one pattern per knob plus a note that
 this one is "simple enough" to skip it. The two inline strategies decide which
 bytes to *lose*; ``offload_to_file`` refuses to lose any — the complete result
-goes to a workspace file and the inline excerpt carries the path, so what the
-door cut stays one ``read_file`` away instead of gone.
+goes to a file in the session's private scratch and the inline excerpt carries a
+virtual ref, so what the door cut stays one ``read_file`` away instead of gone.
 
 This is the ONE door: an item passes it exactly once, and no other layer applies a
 policy to the same text — not the sandbox, not the overflow shrink. That is what
@@ -44,12 +44,22 @@ from harness.harness_config import CONFIG, TruncationPolicy
 
 MAX_ITEM_CHARS = CONFIG.max_item_chars  # re-export; the value lives in the editable surface
 
-# Where offloaded results live, relative to the agent's workspace root. Inside the
-# workspace on purpose: the model's own read_file resolves relative paths against
-# that root, so the marker's path works verbatim. The files share the workspace's
-# lifecycle (a throwaway worktree, a benchmark container) and are never meant to
-# be committed.
-OFFLOAD_SUBDIR = Path(".carbon") / "offload"
+SCRATCH_SCHEME = "scratch://"
+# Spills live under the SESSION's private scratch (harness/session_env.py), never the
+# workspace: the workspace is the user's durable repo and the sync/commit unit, and a
+# complete tool-output copy inside it inherits both audiences. The transcript carries
+# only the virtual ref below; read_file resolves it. Bounded disk: MAX_OFFLOAD_FILES.
+_OFFLOAD_DIRNAME = "offload"
+
+
+def spill_ref(filename: str) -> str:
+    """The ONE place a spill's location becomes transcript text. Virtual on purpose:
+    no absolute host path enters the transcript (machine-private, and unstable the
+    moment execution moves into a container or remote session), and a forged ref can
+    only ever name a file inside this session's own scratch inventory."""
+    return f"{SCRATCH_SCHEME}{_OFFLOAD_DIRNAME}/{filename}"
+
+
 # Bounded disk. The filename is a content hash, so nothing ever overwrites anything;
 # a long session on a persistent workspace would spill one file per over-budget
 # result forever. Keep the newest N — the older a spill is, the less likely anything
@@ -101,13 +111,13 @@ def _cut_head_tail(text: str, content_budget: int, tail_fraction: float, marker:
 
 
 def _keep_head(
-    text: _Text, content_budget: int, _tail_fraction: float, marker: str, _root: Path | None
+    text: _Text, content_budget: int, _tail_fraction: float, marker: str, _scratch: Path | None
 ) -> str:
     return text.shown[:content_budget] + marker
 
 
 def _head_tail(
-    text: _Text, content_budget: int, tail_fraction: float, marker: str, _root: Path | None
+    text: _Text, content_budget: int, tail_fraction: float, marker: str, _scratch: Path | None
 ) -> str:
     return _cut_head_tail(text.shown, content_budget, tail_fraction, marker)
 
@@ -145,14 +155,14 @@ _UPSTREAM_CUT = "…[truncated "
 MAX_FOOTER_CHARS = 450
 
 
-def _route(line_count: int, rel: Path) -> str:
-    """The two ways back into the spill, in the units the tools actually take.
+def _route(line_count: int, ref: str) -> str:
+    """The one way back into the spill, in the unit read_file actually takes.
 
-    Both are offered because they answer different questions: paging reads the file in
-    order, searching jumps to the one line that matters. The search route needs its
-    ``pattern`` spelled out — the harness's scratch directory is kept out of an
-    undirected walk (tools.py), so a bare query would report no matches on the very
-    file this footer is pointing at.
+    Only read_file is offered now. The old second route (``search_text``, with its
+    own ``pattern`` spelled out) and the single-line shell slice both depended on a
+    real workspace path a walk or a shell could reach; a virtual ``scratch://`` ref
+    has neither, so both fall away and read_file — which resolves the ref directly —
+    is the whole answer.
 
     No range is computed for the page. A suggested first page used to be sized against
     this door so its result could not come back over budget, but read_file's result
@@ -160,23 +170,16 @@ def _route(line_count: int, rel: Path) -> str:
     (see ``_door``) — so an over-budget page returns an excerpt plus "ask for a
     smaller range", never another spill. That mechanism prevents the circle for every
     page the model asks for; a computed first page only ever saved the first round trip.
-
-    The shell slice is offered, never promised: a subagent's registry is read-only
-    tools with no bash in it, and naming a tool the reader may not have should read as
-    "not for you" rather than as a dead end.
     """
     if line_count <= 1:
         return (
-            f"one long line, so line paging cannot reach into it; a shell can slice it, "
-            f"e.g. sed -n '1p' {rel} | cut -c1-4000"
+            f"one long line; request it with read_file(path='{ref}', start_line=1, "
+            "end_line=1) and follow the continuation hint for the rest"
         )
-    return (
-        f"read_file(path='{rel}', start_line=1, end_line=<n>) to page it, "
-        f"or search_text(query='<what you need>', pattern='{rel}') to jump to a line"
-    )
+    return f"read_file(path='{ref}', start_line=1, end_line=<n>) to page it"
 
 
-def _footer(rel: Path, *, shown: int, total: int, lines: int, cut_upstream: bool) -> str:
+def _footer(ref: str, *, shown: int, total: int, lines: int, cut_upstream: bool) -> str:
     """Name the complete copy and hand the model the exact next call to make.
 
     Counts, not text: every number here describes the file on disk, and the widest
@@ -197,7 +200,7 @@ def _footer(rel: Path, *, shown: int, total: int, lines: int, cut_upstream: bool
     )
     return (
         f"\n[Showing {shown} of {total} chars. {claim} ({lines} lines): "
-        f"{rel} — {_route(lines, rel)}]"
+        f"{ref} — {_route(lines, ref)}]"
     )
 
 
@@ -228,38 +231,6 @@ def _defang(text: str) -> str:
 # --- writing the complete copy ------------------------------------------------
 class _OffloadUnavailable(Exception):
     """No complete copy could be written; the caller degrades to an inline excerpt."""
-
-
-# A line that already covers the spills; anything else is somebody's own file.
-_IGNORE_COVERAGE = frozenset({"*", "**", "offload", "offload/", "/offload", "/offload/"})
-
-
-def _mark_ignored(carbon_dir: Path) -> None:
-    """Keep spilled output out of the user's history.
-
-    The agent works inside a real repository, and ``.carbon`` is the harness's own
-    scratch directory in it — without this, one ``git add -A`` after a long session
-    commits the agent's own truncated tool results. An existing ``.gitignore`` is never
-    clobbered (it may be the user's, or another tool's), but one that does not actually
-    cover the spills — say a project-local ``extensions/`` line and nothing else — is
-    appended to, because "a file exists" was never the property worth checking.
-    """
-    marker = carbon_dir / ".gitignore"
-    if marker.is_symlink():
-        # Never write through a link we did not create: a dangling one makes this
-        # create its target, which is somewhere outside .carbon by definition.
-        return
-    try:
-        existing = marker.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        marker.write_text("*\n", encoding="utf-8")
-        return
-    except (OSError, UnicodeError):
-        return
-    if any(line.strip() in _IGNORE_COVERAGE for line in existing.splitlines()):
-        return
-    with marker.open("a", encoding="utf-8") as handle:
-        handle.write(("" if existing.endswith("\n") or not existing else "\n") + "offload/\n")
 
 
 def _prune(offload_dir: Path) -> None:
@@ -344,42 +315,27 @@ def _holds(target: Path, payload: bytes) -> bool:
         return False
 
 
-def _offload_dir(workspace_root: Path) -> Path:
-    """The resolved offload directory, created only once we know where it lands.
-
-    Containment is checked BEFORE anything is created. ``.carbon`` may itself be a
-    symlink the workspace's owner planted, and by the time an after-the-fact check can
-    refuse, ``mkdir(parents=True)`` has already made a directory outside the workspace —
-    the data was safe, the side effect was not. A symlinked ``.carbon`` or ``offload``
-    is refused outright, pointing in or out: the harness's own scratch directory is a
-    real directory here or it is nothing. ``resolve()`` on a path that does not exist
-    yet still follows the links in the part that does, which is exactly the question.
-    """
-    root = Path(workspace_root).resolve()
-    carbon = Path(workspace_root) / OFFLOAD_SUBDIR.parts[0]
-    offload = Path(workspace_root) / OFFLOAD_SUBDIR
-    if carbon.is_symlink() or offload.is_symlink():
-        raise _OffloadUnavailable("offload directory is a symlink")
-    landed = offload.resolve()
-    if landed != root and root not in landed.parents:
-        raise _OffloadUnavailable("offload directory escapes the workspace")
-    offload.mkdir(parents=True, exist_ok=True)
-    with suppress(OSError):  # housekeeping must never cost us the copy
-        _mark_ignored(carbon)
+# No containment check here (unlike the workspace-rooted version this replaces): the
+# scratch parent is mkdtemp-private to the harness (session_env.py) rather than a path
+# inside a repository someone else controls, so there is no workspace-owner symlink
+# attack left to defend against — a real directory here is just a real directory.
+def _offload_dir(scratch_dir: Path | None) -> Path:
+    if scratch_dir is None:
+        raise _OffloadUnavailable("no scratch storage to write under")
+    landed = Path(scratch_dir) / _OFFLOAD_DIRNAME
+    landed.mkdir(parents=True, exist_ok=True)
     return landed
 
 
-def _spill(text: str, workspace_root: Path | None) -> Path:
-    """Write the complete text under the workspace; return its workspace-relative path.
+def _spill(text: str, scratch_dir: Path | None) -> str:
+    """Write the complete text under the session scratch; return its VIRTUAL ref.
 
     The filename is a content hash — deterministic per call, so a retried or repeated
-    identical result re-lands on the same file instead of littering the workspace. The
+    identical result re-lands on the same file instead of littering scratch. The
     encoding is explicit here and on ``read_file``'s side, so the round trip does not
     depend on the host's locale.
     """
-    if workspace_root is None:
-        raise _OffloadUnavailable("no workspace to write under")
-    landed = _offload_dir(Path(workspace_root))
+    landed = _offload_dir(scratch_dir)
     payload = text.encode("utf-8")
     target = landed / f"{hashlib.sha256(payload).hexdigest()[:16]}.txt"
     if not _holds(target, payload):
@@ -389,7 +345,7 @@ def _spill(text: str, workspace_root: Path | None) -> Path:
     _OURS.add(target)
     with suppress(OSError):  # housekeeping must never cost us the copy we just wrote
         _prune(landed)
-    return OFFLOAD_SUBDIR / target.name
+    return spill_ref(target.name)
 
 
 def _note(marker: str, note: str) -> str:
@@ -405,14 +361,15 @@ def _why(exc: Exception) -> str:
 
 
 def _offload_to_file(
-    text: _Text, content_budget: int, tail_fraction: float, marker: str, workspace_root: Path | None
+    text: _Text, content_budget: int, tail_fraction: float, marker: str, scratch_dir: Path | None
 ) -> str:
-    """Recoverable truncation: write the COMPLETE text to a workspace file, keep the
-    ``head_tail`` excerpt inline, and append a footer naming the file.
+    """Recoverable truncation: write the COMPLETE text to a session scratch file, keep
+    the ``head_tail`` excerpt inline, and append a footer naming the file.
 
-    The footer's path is RELATIVE to the workspace root: that is the path the model's
-    own ``read_file`` resolves, and an absolute host path in a transcript would leak
-    machine-private detail into anything that records it.
+    The footer names a VIRTUAL ``scratch://`` ref, never a host path: that is what the
+    model's own ``read_file`` resolves, and an absolute host path in a transcript would
+    leak machine-private detail into anything that records it — and go stale the moment
+    execution moves into a container or remote session.
 
     Best-effort by construction. This runs mid-turn, after the assistant's tool_calls
     are already in the transcript, so raising would abandon the turn with an unanswered
@@ -423,7 +380,7 @@ def _offload_to_file(
     try:
         # The tool's bytes, not the model's copy of them: this file is re-read, diffed,
         # applied and checksummed, and a relabeled line inside it is silent corruption.
-        rel = _spill(text.complete, workspace_root)
+        ref = _spill(text.complete, scratch_dir)
     except (_OffloadUnavailable, OSError, UnicodeError) as exc:
         note = _note(marker, _why(exc))
         return _cut_head_tail(text.shown, content_budget, tail_fraction, note)
@@ -434,7 +391,7 @@ def _offload_to_file(
     # file, which is what the model is being sent to read.
     complete = text.complete
     return excerpt + _footer(
-        rel,
+        ref,
         shown=head_chars + tail_chars,
         total=len(complete),
         lines=len(complete.splitlines()),
@@ -496,7 +453,7 @@ def truncate(
     *,
     budget: int | None = None,
     continuation_hint: str | None = None,
-    workspace_root: str | Path | None = None,
+    scratch_dir: str | Path | None = None,
 ) -> str:
     """Apply one vetted truncation strategy to text the harness or the user chose.
 
@@ -510,7 +467,7 @@ def truncate(
         policy,
         budget=budget,
         continuation_hint=continuation_hint,
-        workspace_root=workspace_root,
+        scratch_dir=scratch_dir,
     )
 
 
@@ -520,7 +477,7 @@ def truncate_tool_result(
     *,
     budget: int | None = None,
     continuation_hint: str | None = None,
-    workspace_root: str | Path | None = None,
+    scratch_dir: str | Path | None = None,
 ) -> str:
     """The same door for TOOL OUTPUT — the untrusted domain, defanged on the way in.
 
@@ -539,7 +496,7 @@ def truncate_tool_result(
         policy,
         budget=budget,
         continuation_hint=continuation_hint,
-        workspace_root=workspace_root,
+        scratch_dir=scratch_dir,
     )
 
 
@@ -549,17 +506,17 @@ def _door(
     *,
     budget: int | None = None,
     continuation_hint: str | None = None,
-    workspace_root: str | Path | None = None,
+    scratch_dir: str | Path | None = None,
 ) -> str:
     """The door itself, shared by both trust domains.
 
     ``budget`` lets a tool declare a smaller result limit without changing the
     selected strategy. The marker is deliberately actionable: losing bytes is
     unavoidable, losing the fact that bytes were lost is not — and under
-    ``offload_to_file`` the bytes are not even lost, only moved to a file under
-    ``workspace_root`` that the marker's footer names. The inline strategies ignore
-    ``workspace_root``; offload degrades to an inline excerpt without one rather than
-    guessing a directory (the process cwd is not the agent's workspace).
+    ``offload_to_file`` the bytes are not even lost, only moved to a file in the
+    session's private scratch that the marker's footer names. The inline strategies
+    ignore ``scratch_dir``; offload degrades to an inline excerpt without one rather
+    than guessing a directory (the process cwd is not the session's scratch).
 
     This is the one door: every result the model sees comes through here exactly once,
     which is what lets the rules below be this short.
@@ -591,5 +548,5 @@ def _door(
     # Counted on the copy being cut, so the number describes what the model lost here —
     # under offload the footer's own totals then describe the file, which is bigger news.
     marker = f"\n…[truncated {len(text.shown) - max_chars} chars using {name}.{hint}]"
-    root = Path(workspace_root) if workspace_root is not None else None
-    return strat.apply(text, max_chars, policy.tail_fraction, marker, root)
+    scratch = Path(scratch_dir) if scratch_dir is not None else None
+    return strat.apply(text, max_chars, policy.tail_fraction, marker, scratch)
