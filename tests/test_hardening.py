@@ -202,6 +202,24 @@ def test_read_file_tool_binds_root(tmp_path):
     assert tool.func(path="note.txt") == "hello"
 
 
+def test_read_file_resolves_scratch_ref_confined_to_scratch(tmp_path):
+    from harness.tools import read_file
+
+    scratch = tmp_path / "scratch"
+    (scratch / "offload").mkdir(parents=True)
+    (scratch / "offload" / "ab12.txt").write_text("the complete bytes")
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    body = read_file("scratch://offload/ab12.txt", root=ws, scratch_root=scratch)
+    assert "the complete bytes" in body
+    # escape attempts stay inside scratch
+    err = read_file("scratch://../ws/anything", root=ws, scratch_root=scratch)
+    assert err.startswith("error:")
+    # no scratch configured -> a clear error, not a workspace fallback
+    err2 = read_file("scratch://offload/ab12.txt", root=ws, scratch_root=None)
+    assert err2.startswith("error:")
+
+
 # --- approval preview is honest about a failing edit -------------------------
 def test_approval_preview_shows_edit_failure_not_no_change(tmp_path):
     from harness.workspace import Workspace

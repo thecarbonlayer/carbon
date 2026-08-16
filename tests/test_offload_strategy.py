@@ -41,12 +41,13 @@ from harness.harness_config import CONFIG, CONFIG_PATH, TruncationPolicy, load_c
 from harness.limits import (
     MAX_FOOTER_CHARS,
     MAX_OFFLOAD_FILES,
+    SCRATCH_SCHEME,
     spill_ref,
     strategy_names,
     truncate,
     truncate_tool_result,
 )
-from harness.tools import Tool, ToolRegistry
+from harness.tools import Tool, ToolRegistry, read_file
 from model import LLMResponse, Provider
 
 _POLICY = TruncationPolicy("offload_to_file", 100, 0.5)
@@ -646,14 +647,59 @@ def test_offload_params_are_still_validated(tmp_path):
         load_config(_write(tmp_path, raw))
 
 
+# --- the footer's route, walked end to end -------------------------------------
+# The tests above pin the footer's TEXT; these pin that the route it names actually
+# goes somewhere. Task 2 (this file, the two commits above) wrote the ref but never
+# called read_file with it — the round trip below is what that left unproven.
+def test_read_file_walks_the_offload_footers_scratch_ref_back_to_the_complete_bytes(tmp_path):
+    """Extract the ref straight out of the returned text — not reconstructed via
+    ``spill_ref`` + ``_spills`` the way the tests above check the footer's wording —
+    so this fails if what the footer actually says ever disagrees with what it means.
+    Resolved against a workspace that holds nothing at all, to prove the route needs
+    no cooperation from it."""
+    scratch = tmp_path / "scratch"
+    text = "A" * 300 + "MIDDLE-NEEDLE" + "B" * 300
+    out = truncate_tool_result(text, _POLICY, scratch_dir=scratch)
+
+    refs = set(re.findall(re.escape(SCRATCH_SCHEME) + r"offload/[0-9a-f]{16}\.txt", out))
+    assert len(refs) == 1, f"footer should name exactly one file, consistently: {refs}"
+    ref = refs.pop()
+
+    elsewhere = tmp_path / "unrelated-workspace"
+    elsewhere.mkdir()
+    body = read_file(ref, root=elsewhere, scratch_root=scratch)
+
+    assert body == text  # the complete original bytes, not the inline excerpt
+
+
+def test_read_file_refuses_a_forged_scratch_ref_reaching_outside_scratch(tmp_path):
+    """Substantiates spill_ref's containment claim — 'a forged ref can only ever name
+    a file inside this session's own scratch inventory' — for both shapes a forged ref
+    could take: a relative climb out of scratch, and an absolute host path smuggled in
+    right after the scheme prefix. Neither may ever return content."""
+    scratch = tmp_path / "scratch"
+    (scratch / "offload").mkdir(parents=True)
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    secret = tmp_path / "not-in-scratch.txt"
+    secret.write_text("must never come back through a scratch:// ref")
+
+    relative_escape = read_file("scratch://offload/../../etc/hosts", root=ws, scratch_root=scratch)
+    assert relative_escape.startswith("error:")
+
+    absolute_escape = read_file(f"scratch://{secret}", root=ws, scratch_root=scratch)
+    assert absolute_escape.startswith("error:")
+    assert "must never come back" not in absolute_escape
+
+
 # --- the Agent seam -----------------------------------------------------------
 # NOTE: these tests assert the contract Task 4 delivers (the agent passes its
 # session scratch to the door, not a workspace path) and are expected red until
 # harness/agent.py is rewired to construct a SessionEnvironment and call the door
 # with scratch_dir=self.session_env.scratch_root instead of
-# workspace_root=self._offload_root(). The suite cannot collect at this commit
-# anyway — harness/tools.py still imports the now-deleted OFFLOAD_SUBDIR (Task 3)
-# — so asserting the target contract here adds no new redness now.
+# workspace_root=self._offload_root(). The suite can now collect (Task 3 removed the
+# stale OFFLOAD_SUBDIR import and taught read_file to walk a scratch:// ref — see
+# the round trip above), so this note now names only the one remaining gap.
 def test_agent_override_offloads_tool_results(tmp_path):
     blob = "\n".join(f"line-{i:04d}" for i in range(200))
     agent = Agent(
