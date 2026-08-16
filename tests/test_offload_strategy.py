@@ -167,21 +167,32 @@ def test_paging_a_spill_back_in_cannot_spiral_into_another_spill(tmp_path):
     assert "Full output" not in out
 
 
-def test_single_line_output_is_pointed_at_read_file_not_line_paging(tmp_path):
-    """read_file pages by line; one 600-char line has no pages. A virtual ref has
-    no shell to slice it either, so the only route offered is a single-shot
-    read_file naming its own start and end line, with the continuation hint doing
-    the rest if there is more to see."""
+def test_single_line_output_has_no_call_to_offer_only_the_excerpt(tmp_path):
+    """read_file pages by line; one 600-char line has no pages to offer it. The
+    inline excerpt already carries this line's own head and tail — the same cut
+    every strategy makes — so there is nothing a call could recover that isn't
+    already sitting in the excerpt. The honest route names no call at all, just a
+    plain instruction to try again with less; the footer's header still names the
+    file, even though nothing points back at it."""
     out = truncate_tool_result("x" * 600, _POLICY, scratch_dir=tmp_path)
     ref = spill_ref(_spills(tmp_path)[0].name)
+    # Copied verbatim from harness/limits.py::_route's line_count <= 1 branch —
+    # retyping this by hand is exactly how it drifted out of sync last round.
     expected_route = (
-        f"one long line; request it with read_file(path='{ref}', start_line=1, "
-        "end_line=1) and follow the continuation hint for the rest"
+        "one long line, so line paging cannot reach into it; the inline excerpt "
+        "already shows its head and tail — rerun the command with narrower "
+        "output if the middle is needed"
     )
+    footer_line = out.splitlines()[-1]
+    route_part = footer_line.split(" — ", 1)[1].rstrip("]")  # text after ref, before ']'
+
     assert "Full output (1 lines): " in out
-    assert expected_route in out
+    assert ref in out  # the file is still named, even with no route back to it
+    assert route_part == expected_route
     assert "search_text(" not in out
     assert "sed -n" not in out
+    assert "read_file(" not in route_part
+    assert "continuation hint" not in route_part
 
 
 def test_the_footer_never_outgrows_the_bound_two_other_modules_size_from(tmp_path):
@@ -731,25 +742,44 @@ def test_policy_types_are_validated_too_not_just_ranges():
 
 def test_subagents_inherit_the_parents_door(tmp_path):
     """A worker reads the same oversized files the parent does. Left on the default,
-    it would quietly drop the middle of every one of them."""
+    it would quietly drop the middle of every one of them.
+
+    Expected red until Task 5: a worker is a full Agent (harness/subagents.py), and
+    per the plan it inherits the PARENT's session scratch rather than opening its
+    own — one session, one scratch inventory, whichever Agent object is doing the
+    spilling — but `run_subagent` does not accept `session_env=` yet, so there is
+    nothing here for a worker to inherit.
+    """
+    from harness.session_env import local_session_env
     from harness.subagents import run_subagent
 
     blob = "\n".join(f"line-{i:04d}" for i in range(200))
-    run_subagent(
-        "look",
-        provider=_scripted(_dump_turn()),
-        tools=_dump_registry(blob),
-        agents_dir=str(tmp_path),
-        tool_output=TruncationPolicy("offload_to_file", 200, 0.5),
-    )
-    files = list((tmp_path / "offload").glob("*.txt"))
-    assert [p.read_text() for p in files] == [blob]
+    parent_env = local_session_env(tmp_path)
+    try:
+        run_subagent(
+            "look",
+            provider=_scripted(_dump_turn()),
+            tools=_dump_registry(blob),
+            agents_dir=str(tmp_path),
+            tool_output=TruncationPolicy("offload_to_file", 200, 0.5),
+            session_env=parent_env,
+        )
+        files = list((parent_env.scratch_root / "offload").glob("*.txt"))
+        assert [p.read_text() for p in files] == [blob]
+        assert not (tmp_path / "offload").exists()  # never inside agents_dir either
+    finally:
+        parent_env.cleanup()
 
 
-def test_a_workers_default_tools_read_the_tree_it_offloads_into(tmp_path):
-    """A worker given no registry got one rooted at the process's cwd while its own
-    spills landed under ``agents_dir`` — so the first footer it was handed named a path
-    its own read_file could not resolve."""
+def test_a_workers_default_tools_are_rooted_at_agents_dir_not_the_process_cwd(tmp_path):
+    """A worker given no registry got one rooted at the process's cwd while
+    ``agents_dir`` — the tree it was actually handed to read — went unseen; a bare
+    ``list_files`` call couldn't find a file sitting right there.
+
+    That root has nothing to do with where the worker's own spills land: offload
+    now targets the session's scratch, reached back through a ``scratch://`` ref
+    and read_file, never through this tree at all. The old name conflated the
+    two ("the tree it offloads into") — they are two different roots now."""
     from harness.subagents import run_subagent
 
     (tmp_path / "marker.txt").write_text("hello")
@@ -886,7 +916,11 @@ def test_one_oversized_bash_result_yields_exactly_one_file_end_to_end(tmp_path):
     """The whole path, in the shape that broke capping per stream: a build with big
     stdout and a warning on stderr, through the real sandbox, into a real turn. The
     result is composed once and cut once, so there is one file and one footer — and the
-    receipt the verification gate reads is still the first thing in the message."""
+    receipt the verification gate reads is still the first thing in the message.
+
+    Expected red until Task 4: asserts agent.session_env, which does not exist on
+    Agent yet.
+    """
     from harness.sandbox import Sandbox, bash_tool
 
     tools = ToolRegistry()
@@ -925,9 +959,10 @@ def test_one_oversized_bash_result_yields_exactly_one_file_end_to_end(tmp_path):
     content = next(m["content"] for m in agent.messages if m.get("role") == "tool")
     assert content.count("Full output (") == 1
     assert content.startswith("[exit 0 via trusted]")  # the receipt the gate reads survives
-    spilled = _spills(tmp_path)
+    spilled = _spills(agent.session_env.scratch_root)
     assert len(spilled) == 1
     assert spilled[0].read_text().endswith("o" * 1000 + "e" * 20_000)  # the composite, whole
+    assert not (tmp_path / "offload").exists()  # never inside the workspace/agents_dir
 
 
 # --- housekeeping in the session scratch directory -----------------------------
