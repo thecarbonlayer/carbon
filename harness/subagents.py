@@ -11,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from harness.harness_config import TruncationPolicy
 from harness.policy import Policy
+from harness.session_env import SessionEnvironment
 from harness.tools import Tool, ToolRegistry, default_tools
 from model import Provider
 
@@ -27,6 +28,7 @@ def run_subagent(
     agents_dir: str = ".",
     policy: Policy | None = None,
     tool_output: TruncationPolicy | None = None,
+    session_env: SessionEnvironment | None = None,
 ) -> str:
     """Run one subtask in an isolated Agent. Read-only unless told otherwise.
 
@@ -37,9 +39,20 @@ def run_subagent(
     is therefore ``Policy(read_only=True)``: mutation is opt-in, and a caller that
     wants a worker to write must hand it a policy that says so.
 
-    ``tool_output`` is the parent's truncation policy. A worker reading the same
-    workspace hits the same oversized files; inheriting the door means a parent
-    running ``offload_to_file`` doesn't spawn workers that silently drop the middle.
+    ``session_env`` is the parent's session scratch, passed straight through to the
+    worker ``Agent`` and to the default tool registry's ``scratch_root``. One
+    session, one scratch inventory: a parent running ``offload_to_file`` spills into
+    its own scratch and hands the worker a ``scratch://`` footer naming a file
+    there, so a parent's footer resolves inside a worker only if the worker's own
+    ``read_file`` resolves against that SAME scratch — not a workspace path (there
+    never was one to hit) and not a scratch of the worker's own. No env supplied,
+    no inheritance: the worker opens its own, and this call closes it below, the
+    same as any construction site closes what it owns.
+
+    ``tool_output`` is the parent's truncation policy, inherited for the same
+    reason: a worker reading the same oversized results the parent does should cut
+    them the same way, not silently drop the middle under whatever the surface
+    happens to default to.
     """
     from harness.agent import Agent  # lazy: avoids an import cycle at module load
 
@@ -48,14 +61,25 @@ def run_subagent(
         # Default tools are rooted where this worker writes, not at the process cwd:
         # the worker's own offloaded output lands under ``agents_dir``, and a read_file
         # resolving anywhere else makes every footer it is handed a dead path.
-        tools=tools or default_tools(agents_dir),
+        tools=tools
+        or default_tools(
+            agents_dir, scratch_root=session_env.scratch_root if session_env else None
+        ),
         model=model,
         provider=provider,
         agents_dir=agents_dir,
         policy=policy or Policy(read_only=True),
         tool_output=tool_output,
+        session_env=session_env,
     )
-    return sub.send(task)
+    try:
+        return sub.send(task)
+    finally:
+        # This call constructed ``sub``, so this call owns closing it. Agent.close()
+        # already tracks ownership by how ``sub`` was built (a supplied session_env
+        # is a no-op here; one ``sub`` created itself is removed) — nothing here
+        # re-decides that, it only guarantees close() actually runs.
+        sub.close()
 
 
 def fan_out(
@@ -67,9 +91,19 @@ def fan_out(
     agents_dir: str = ".",
     policy: Policy | None = None,
     tool_output: TruncationPolicy | None = None,
+    session_env: SessionEnvironment | None = None,
     max_workers: int = 4,
 ) -> list[str]:
-    """Run subtasks in parallel, each in its own isolated subagent. Order preserved."""
+    """Run subtasks in parallel, each in its own isolated subagent. Order preserved.
+
+    ``session_env`` is forwarded to every worker unchanged — one parent scratch
+    shared by all of them, since it names one session's inventory, not one per
+    worker. Each ``run_subagent`` call still owns closing its own worker (see
+    there): a supplied env is shared, and sharing is not ownership, so this
+    function never closes it either — that stays the caller's job, same as any
+    borrowed ``SessionEnvironment``. With no env supplied, every worker opens (and
+    closes) its own, exactly as a single ``run_subagent`` call would.
+    """
     if not tasks:
         return []
     with ThreadPoolExecutor(max_workers=min(max_workers, len(tasks))) as pool:
@@ -83,6 +117,7 @@ def fan_out(
                     agents_dir=agents_dir,
                     policy=policy,
                     tool_output=tool_output,
+                    session_env=session_env,
                 ),
                 tasks,
             )

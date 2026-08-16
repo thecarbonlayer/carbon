@@ -5,6 +5,7 @@ mode widened, spill aimed at the workspace) prove the detectors fire — a guard
 that cannot go red is decoration."""
 
 import os
+import tempfile
 import time
 from pathlib import Path
 
@@ -101,3 +102,61 @@ def test_agent_never_cleans_a_caller_supplied_env(tmp_path):
         assert env.scratch_root.exists(), "a shared env is the creator's to clean"
     finally:
         env.cleanup()
+
+
+# --- leak detection at the real driving code paths -----------------------------
+# The tests above call Agent.close()/env.cleanup() directly — real proof the
+# CONTRACT is right, but not proof a real caller actually triggers it. The
+# autouse `_sweep_scratch_dirs_this_test_leaked` fixture (conftest.py) removes
+# every stray `carbon-scratch-*` dir left behind after EACH test regardless of
+# why it was left — which is exactly why a regression in `Agent.close()` (the
+# cleanup call quietly dropped, or a caller that stops running it in `finally`)
+# would not fail the suite: the fixture hides the very symptom that first
+# exposed this leak class (755 stray dirs after a full run, ~330x slower
+# scavenge()). These assert inside the test body, snapshot-before/compare-after,
+# BEFORE that fixture's own sweep gets a turn — so a broken close() shows up
+# here, in seconds, instead of only in a slow scavenge() on some future session.
+def _scratch_dirs() -> set[Path]:
+    return set(Path(tempfile.gettempdir()).glob(f"{SCRATCH_PREFIX}*"))
+
+
+def test_run_once_leaves_no_scratch_dir_behind(tmp_path):
+    """``run_once`` (print mode's real non-interactive entrypoint) builds an Agent
+    that owns its env and closes it in ``finally`` — driven here, fully offline,
+    through the fake provider. If that ``finally`` ever stopped calling ``close()``
+    (or ``close()`` stopped calling ``cleanup()``), this is what would go red."""
+    from harness.agent import run_once
+    from model import fake
+
+    before = _scratch_dirs()
+
+    run_once(
+        "say hi",
+        provider=fake(scripted=lambda msgs: "hi"),
+        sessions_dir=str(tmp_path),
+        workspace_root=str(tmp_path),
+        agents_dir=str(tmp_path),
+    )
+
+    leaked = _scratch_dirs() - before
+    assert not leaked, f"run_once leaked scratch dirs: {leaked}"
+
+
+def test_run_subagent_with_no_env_leaves_no_scratch_dir_behind(tmp_path):
+    """A `run_subagent` call given no `session_env` builds a worker Agent that
+    owns its own env — nothing else in the program holds a reference to it, so
+    `run_subagent` is the only call that can close it. Same real-driver shape as
+    the test above, for the delegation entrypoint instead of print mode."""
+    from harness.subagents import run_subagent
+    from model import fake
+
+    before = _scratch_dirs()
+
+    run_subagent(
+        "look around",
+        provider=fake(scripted=lambda msgs: "done"),
+        agents_dir=str(tmp_path),
+    )
+
+    leaked = _scratch_dirs() - before
+    assert not leaked, f"run_subagent (no env) leaked scratch dirs: {leaked}"
