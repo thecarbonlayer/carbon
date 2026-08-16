@@ -72,18 +72,32 @@ class Orchestrator:
 
         approve = approve or (lambda _step: True)
         plan = self._plan(task)
+        # Agent before tools: with no tools given at construction, this worker
+        # creates and owns its own SessionEnvironment — and a fallback default_tools()
+        # registry has to be wired to THAT scratch (not built blind) so its own
+        # read_file tool can resolve whatever it offloads. A caller-supplied
+        # self.tools is used as-is, same as before.
         worker = Agent(
             system="Execute each step using tools when needed. Be concise.",
-            tools=self.tools if self.tools is not None else default_tools(),
             model=self.model,
         )
-        results: list[str] = []
-        for step in plan:
-            if not approve(step):
-                results.append(f"[skipped] {step}")
-                continue
-            results.append(self._run_with_retry(worker, step))
-        return OrchestratorResult(plan=plan, results=results, final=results[-1] if results else "")
+        try:
+            worker.tools = (
+                self.tools
+                if self.tools is not None
+                else default_tools(scratch_root=worker.session_env.scratch_root)
+            )
+            results: list[str] = []
+            for step in plan:
+                if not approve(step):
+                    results.append(f"[skipped] {step}")
+                    continue
+                results.append(self._run_with_retry(worker, step))
+            return OrchestratorResult(
+                plan=plan, results=results, final=results[-1] if results else ""
+            )
+        finally:
+            worker.close()
 
     @staticmethod
     def _run_with_retry(worker, step: str, attempts: int = 2) -> str:

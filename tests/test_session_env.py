@@ -71,3 +71,33 @@ def test_metadata_names_kind_and_storage_policy(tmp_path):
         assert "storage_policy" in env.metadata and "impl_version" in env.metadata
     finally:
         env.cleanup()
+
+
+# --- the Agent's ownership of a SessionEnvironment -----------------------------
+# Task 4: Agent constructs its own SessionEnvironment when none is supplied, and
+# close() ends that scratch's lifecycle — but only when the Agent is the one that
+# created it. A caller-supplied env is shared, and sharing is not ownership: it is
+# the supplier's to clean, not this Agent's, or a worker closing on its way out
+# would yank the scratch out from under the parent (or a sibling) still using it.
+def test_agent_owns_and_cleans_an_env_it_created(tmp_path):
+    from harness.agent import Agent
+
+    a = Agent(agents_dir=str(tmp_path))  # no session_env given -> Agent creates one
+    scratch = a.session_env.scratch_root
+    assert scratch.is_dir()
+    a.close()
+    assert not scratch.exists()
+    a.close()  # idempotent
+
+
+def test_agent_never_cleans_a_caller_supplied_env(tmp_path):
+    from harness.agent import Agent
+    from harness.session_env import local_session_env
+
+    env = local_session_env(tmp_path)
+    try:
+        a = Agent(agents_dir=str(tmp_path), session_env=env)
+        a.close()
+        assert env.scratch_root.exists(), "a shared env is the creator's to clean"
+    finally:
+        env.cleanup()

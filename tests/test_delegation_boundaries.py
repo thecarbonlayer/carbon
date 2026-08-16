@@ -48,7 +48,6 @@ def test_delegated_workers_cannot_mutate_the_workspace():
     could delegate the write it just refused.
     """
     root = Path(tempfile.mkdtemp())
-    tools = _coding_tools(Workspace(root=root), exclude_session=None)
 
     seen: list[str] = []
 
@@ -63,7 +62,14 @@ def test_delegated_workers_cannot_mutate_the_workspace():
             return _tool_call("delegate", task="write a file")
         return LLMResponse(content="parent done")
 
-    Agent(provider=_calls(script), tools=tools).run("delegate a write")
+    # Agent before tools: _coding_tools' scratch_root has to come from a
+    # SessionEnvironment that already exists (Task 4), and the Agent creates one
+    # in __init__ when none is supplied.
+    agent = Agent(provider=_calls(script))
+    agent.tools = _coding_tools(
+        Workspace(root=root), exclude_session=None, session_env=agent.session_env
+    )
+    agent.run("delegate a write")
 
     assert not (root / "pwned.txt").exists()
 
@@ -107,10 +113,15 @@ def test_delegates_inherit_the_parent_provider():
         return LLMResponse(content="parent done")
 
     provider = _calls(script)
-    tools = _coding_tools(
-        Workspace(root=root), exclude_session=None, provider=provider, model="injected-model"
+    agent = Agent(provider=provider)
+    agent.tools = _coding_tools(
+        Workspace(root=root),
+        exclude_session=None,
+        provider=provider,
+        model="injected-model",
+        session_env=agent.session_env,
     )
-    Agent(provider=provider, tools=tools).run("delegate")
+    agent.run("delegate")
 
     assert workers_saw, "delegate fell back to the environment provider"
 
@@ -258,7 +269,6 @@ def test_read_only_workers_can_still_explore_the_repository():
     (root / "pkg" / "mod.py").write_text("def target():\n    return 1\n")
     (root / ".env").write_text("LLM_API_KEY=secret")
 
-    tools = _coding_tools(Workspace(root=root), exclude_session=None)
     worker_names: list[str] = []
 
     def script(messages, **kwargs):
@@ -269,7 +279,11 @@ def test_read_only_workers_can_still_explore_the_repository():
             return _tool_call("delegate", task="explore")
         return LLMResponse(content="done")
 
-    Agent(provider=_calls(script), tools=tools).run("go")
+    agent = Agent(provider=_calls(script))
+    agent.tools = _coding_tools(
+        Workspace(root=root), exclude_session=None, session_env=agent.session_env
+    )
+    agent.run("go")
 
     from harness.tools import list_files, search_text
 

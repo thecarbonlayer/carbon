@@ -700,13 +700,8 @@ def test_read_file_refuses_a_forged_scratch_ref_reaching_outside_scratch(tmp_pat
 
 
 # --- the Agent seam -----------------------------------------------------------
-# NOTE: these tests assert the contract Task 4 delivers (the agent passes its
-# session scratch to the door, not a workspace path) and are expected red until
-# harness/agent.py is rewired to construct a SessionEnvironment and call the door
-# with scratch_dir=self.session_env.scratch_root instead of
-# workspace_root=self._offload_root(). The suite can now collect (Task 3 removed the
-# stale OFFLOAD_SUBDIR import and taught read_file to walk a scratch:// ref — see
-# the round trip above), so this note now names only the one remaining gap.
+# The agent passes its session scratch to the door (scratch_dir=self.session_env.
+# scratch_root), never a workspace path — Task 4's contract, now wired in agent.py.
 def test_agent_override_offloads_tool_results(tmp_path):
     blob = "\n".join(f"line-{i:04d}" for i in range(200))
     agent = Agent(
@@ -970,9 +965,6 @@ def test_one_oversized_bash_result_yields_exactly_one_file_end_to_end(tmp_path):
     stdout and a warning on stderr, through the real sandbox, into a real turn. The
     result is composed once and cut once, so there is one file and one footer — and the
     receipt the verification gate reads is still the first thing in the message.
-
-    Expected red until Task 4: asserts agent.session_env, which does not exist on
-    Agent yet.
     """
     from harness.sandbox import Sandbox, bash_tool
 
@@ -1016,6 +1008,66 @@ def test_one_oversized_bash_result_yields_exactly_one_file_end_to_end(tmp_path):
     assert len(spilled) == 1
     assert spilled[0].read_text().endswith("o" * 1000 + "e" * 20_000)  # the composite, whole
     assert not (tmp_path / "offload").exists()  # never inside the workspace/agents_dir
+
+
+def test_the_agents_registered_read_file_tool_resolves_the_footer_it_wrote(tmp_path):
+    """The registry-level round trip: Task 3 taught the bare read_file FUNCTION to
+    walk a scratch:// ref (see the round trip above); it never proved that the TOOL
+    an Agent actually hands the model — built by ``_coding_tools()``, the same
+    builder every production entrypoint (run_once, the REPL, the TUI) uses — was
+    wired with ``scratch_root`` at all. A review of this feature found exactly that
+    gap: ``scratch_root`` was threaded through ``read_file`` and the door, but no
+    production caller passed it into the registry, so the footer's route shipped
+    dead. Driving a real oversized result through a real Agent's door and then
+    calling read_file through the REGISTRY — never the bare function — is what
+    would have caught it.
+    """
+    from harness.agent import _coding_tools
+    from harness.workspace import Workspace
+
+    blob = "\n".join(f"line-{i:04d}" for i in range(200))
+    agent = Agent(
+        provider=_scripted(_dump_turn()),
+        agents_dir=str(tmp_path),
+        tool_output=TruncationPolicy("offload_to_file", 200, 0.5),
+    )
+    # Built the way every production entrypoint builds an agent's tools: the
+    # session's scratch has to exist before the tools that read out of it do, so
+    # this is built AFTER the Agent — never a registry the test wires by hand.
+    tools = _coding_tools(
+        Workspace(root=str(tmp_path)),
+        exclude_session=None,
+        sessions_dir=str(tmp_path / "sessions"),
+        session_env=agent.session_env,
+    )
+    tools.register(
+        Tool(
+            name="dump",
+            description="Return a large blob.",
+            parameters={"type": "object", "properties": {}, "required": []},
+            func=lambda: blob,
+            mutates=False,
+        )
+    )
+    agent.tools = tools
+
+    agent.run("go")
+
+    tool_msg = next(m for m in agent.messages if m.get("role") == "tool")
+    # A multi-line spill's footer names the ref twice (once as identity, once inside
+    # the read_file(...) call it hands back) — set() checks both name the same file
+    # rather than assuming occurrence count, the way the bare-function round trip
+    # above does for the same reason.
+    refs = set(
+        re.findall(re.escape(SCRATCH_SCHEME) + r"offload/[0-9a-f]{16}\.txt", tool_msg["content"])
+    )
+    assert len(refs) == 1, f"footer should name exactly one file, consistently: {refs}"
+    ref = refs.pop()
+
+    # The model's own call, through the REGISTRY — never the bare read_file(...).
+    result = agent.tools.call("read_file", json.dumps({"path": ref}))
+
+    assert result == blob
 
 
 # --- housekeeping in the session scratch directory -----------------------------

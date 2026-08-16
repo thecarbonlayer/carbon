@@ -380,8 +380,9 @@ def _accept_ch06_doorcontrol() -> bool:
                 func=lambda: "Z" * (MAX_ITEM_CHARS * 4),
             )
         )
-        # workspace_root, so that a surface selecting offload_to_file spills into this
-        # temp dir instead of the checkout the gate is run from.
+        # Any offload this triggers lands under this Agent's own session scratch
+        # (harness/session_env.py) regardless of workspace_root — the assertion below
+        # only cares that the INLINE copy stays within the door's ceiling.
         a = agent.Agent(
             system="Call the dump tool, then say DONE.", tools=tools, workspace_root=str(d)
         )
@@ -400,15 +401,16 @@ def _accept_ch06_offload() -> bool:
     mid-output fact by following the footer's path — the recoverable door, live.
 
     The needle sits past the inline head and short of the inline tail, so no
-    honest excerpt at this budget can contain it; the only route is the
-    ``.carbon/offload/`` file the footer names, paged with read_file ranges.
+    honest excerpt at this budget can contain it; the only route is the file the
+    footer's virtual ``scratch://`` ref names, under the agent's own session
+    scratch (harness/session_env.py) — never a workspace path — paged with
+    read_file ranges.
     """
     import tempfile
     from pathlib import Path
 
     from harness import agent
     from harness.harness_config import TruncationPolicy
-    from harness.limits import OFFLOAD_SUBDIR
     from harness.tools import Tool, default_tools
 
     lines = [f"log line {i:04d} status ok" for i in range(1, 401)]
@@ -417,7 +419,22 @@ def _accept_ch06_offload() -> bool:
 
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
-        tools = default_tools(root)
+        # Agent before tools (harness/agent.py's own call sites follow the same
+        # order now): with no session_env given it creates and owns one, and that
+        # is where the registry's scratch_root has to come from — read_file must
+        # resolve the same scratch the door is about to spill into.
+        a = agent.Agent(
+            system=(
+                "You are a log analyst. When a tool result says its full output was "
+                "written to a file, read THAT file with read_file, paging with "
+                "start_line/end_line in chunks of at most 40 lines until you find "
+                "what you need."
+            ),
+            agents_dir=str(root),
+            workspace_root=str(root),
+            tool_output=TruncationPolicy("offload_to_file", 1000, 0.5),
+        )
+        tools = default_tools(root, scratch_root=a.session_env.scratch_root)
         tools.register(
             Tool(
                 name="dump",
@@ -427,35 +444,27 @@ def _accept_ch06_offload() -> bool:
                 mutates=False,
             )
         )
-        a = agent.Agent(
-            system=(
-                "You are a log analyst. When a tool result says its full output was "
-                "written to a file, read THAT file with read_file, paging with "
-                "start_line/end_line in chunks of at most 40 lines until you find "
-                "what you need."
-            ),
-            tools=tools,
-            agents_dir=str(root),
-            workspace_root=str(root),
-            tool_output=TruncationPolicy("offload_to_file", 1000, 0.5),
-        )
-        reply = a.send(
-            "Call dump, then find the log line containing SECRET-CODE and reply "
-            "with just the code it names."
-        )
+        a.tools = tools
+        try:
+            reply = a.send(
+                "Call dump, then find the log line containing SECRET-CODE and reply "
+                "with just the code it names."
+            )
 
-        offloaded = list((root / OFFLOAD_SUBDIR).glob("*.txt"))
-        complete = any(p.read_text() == blob for p in offloaded)
-        inline = next(
-            (
-                str(m.get("content", ""))
-                for m in a.messages
-                if m.get("role") == "tool" and "Full output (" in str(m.get("content", ""))
-            ),
-            "",
-        )
-        capped = bool(inline) and len(inline) < len(blob)
-        recovered = "MANGO-42" in reply
+            offloaded = list((a.session_env.scratch_root / "offload").glob("*.txt"))
+            complete = any(p.read_text() == blob for p in offloaded)
+            inline = next(
+                (
+                    str(m.get("content", ""))
+                    for m in a.messages
+                    if m.get("role") == "tool" and "Full output (" in str(m.get("content", ""))
+                ),
+                "",
+            )
+            capped = bool(inline) and len(inline) < len(blob)
+            recovered = "MANGO-42" in reply
+        finally:
+            a.close()
     print("offload file complete:", complete, "| inline capped:", capped, "| reply:", repr(reply))
     return complete and capped and recovered
 

@@ -209,21 +209,14 @@ class AgentTUI(App):
         # of the worktree — the detached-worktree mismatch. Read from the same tree we
         # write to, and hand workers the same binding. Trusted bash: the agent works
         # on your real project, so your test command runs for real, approval-gated.
-        tools = agent_mod._coding_tools(
-            self.workspace,
-            exclude_session=session,  # recall across *other* sessions
-            provider=self.provider,
-            model=self.provider.model,
-            sessions_dir=self.sessions_dir,
-        )
-        if self.extensions:
-            from harness.extensions import load_extensions
-
-            load_extensions(tools, *agent_mod._extension_dirs(self.workspace.root))
+        #
+        # Agent before tools: with no session_env supplied it creates and owns one,
+        # and that is where _coding_tools' scratch_root has to come from — the
+        # registry's read_file tool must resolve the same scratch the door spills
+        # into. Tools are built and bound after.
         tracer = Tracer(model=self.provider.model)
-        return agent_mod.Agent(
+        agent = agent_mod.Agent(
             system=agent_mod.DEFAULT_SYSTEM,
-            tools=tools,
             skills=load_skills("skills"),
             session=session,
             sessions_dir=self.sessions_dir,
@@ -233,8 +226,22 @@ class AgentTUI(App):
             approve=self._approve,
             approval_required=APPROVAL_TOOLS,
             agents_dir=str(self.workspace.root),  # AGENTS.md lives where the agent works
-            workspace_root=str(self.workspace.root),  # …and so does anything it spills
+            workspace_root=str(self.workspace.root),  # …and so does read_file/write_file
         )
+        tools = agent_mod._coding_tools(
+            self.workspace,
+            exclude_session=session,  # recall across *other* sessions
+            provider=self.provider,
+            model=self.provider.model,
+            sessions_dir=self.sessions_dir,
+            session_env=agent.session_env,
+        )
+        if self.extensions:
+            from harness.extensions import load_extensions
+
+            load_extensions(tools, *agent_mod._extension_dirs(self.workspace.root))
+        agent.tools = tools
+        return agent
 
     # --- layout -------------------------------------------------------------
     def compose(self) -> ComposeResult:
@@ -485,7 +492,9 @@ class AgentTUI(App):
 
     def _open_session(self, session: str) -> None:
         """Point the UI at ``session`` (already on disk or brand-new) and re-render."""
+        previous = self.agent
         self.agent = self._build_agent(session)
+        previous.close()  # end the outgoing session's scratch lifecycle, if it owned one
         self._render_history()
         self._rebuild_trace()
         self._refresh_header()

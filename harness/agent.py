@@ -40,6 +40,7 @@ from harness.memory import DEFAULT_DIR, load_session, load_trace, save_session, 
 from harness.observability import Tracer
 from harness.policy import Policy
 from harness.result import RunResult, ToolCall
+from harness.session_env import SessionEnvironment, local_session_env
 from harness.skills import Skill, skills_prompt
 from harness.tools import ToolRegistry
 from model import LLMResponse, OnDelta, Provider, chat
@@ -113,6 +114,7 @@ class Agent:
         system: str | None = None,
         agents_dir: str = ".",
         workspace_root: str | None = None,
+        session_env: SessionEnvironment | None = None,
         tools: ToolRegistry | None = None,
         approve: Callable[[str, str], bool] | None = None,
         approval_required: frozenset[str] | set[str] | None = None,
@@ -135,14 +137,25 @@ class Agent:
         self.provider = provider
         self.system = system
         self.agents_dir = agents_dir  # where AGENTS.md is auto-loaded from
-        # Where the agent's files live: the directory offloaded tool output is written
-        # under, and the root the model's own read_file resolves against. It defaults
-        # to agents_dir because every mature wiring here binds both to the workspace —
-        # but they answer different questions, and a consumer can legitimately split
-        # them (AGENTS.md loaded from a neutral directory, files written where the
-        # model can reach them). Then the footer's path must follow the read_file
-        # root, not the instructions root, or every recovery route is a dead link.
+        # Where the agent's files live: the root a caller's tool registry resolves
+        # read_file/write_file against (every mature wiring here builds that registry
+        # from this same value). It defaults to agents_dir because every mature wiring
+        # binds both to the workspace — but they answer different questions, and a
+        # consumer can legitimately split them (AGENTS.md loaded from a neutral
+        # directory, files written where the model can reach them). Offloaded tool
+        # output answers neither question anymore — that goes to session_env's private
+        # scratch below (Task 4), never a workspace path — so this field's only
+        # remaining job here is seeding that scratch's workspace_root metadata when no
+        # session_env is supplied.
         self.workspace_root = workspace_root
+        # The session's runtime storage. Created here when not supplied, so every
+        # wiring gets the scratch lifecycle without opting in; supplied by callers
+        # that share one environment across agents (fan-out workers, a test) — a
+        # shared env is the CREATOR's to clean, so ownership tracks construction.
+        self._owns_env = session_env is None
+        self.session_env = session_env or local_session_env(
+            workspace_root=self.workspace_root or self.agents_dir
+        )
         self.tools = tools
         self.approve = approve
         self.approval_required = approval_required or set()
@@ -211,6 +224,12 @@ class Agent:
         # ch-13: restore the persisted trace too, so it isn't empty on resume.
         if self.tracer is not None and session:
             self.tracer.load_events(load_trace(session, sessions_dir))
+
+    def close(self) -> None:
+        """End-of-session housekeeping: remove the private scratch if this Agent
+        created it. Idempotent, never raises — callers run it in ``finally``."""
+        if self._owns_env:
+            self.session_env.cleanup()
 
     def _approved(self, name: str, args: str) -> bool:
         # Fail closed: a tool marked as requiring approval with no approver is denied.
@@ -475,11 +494,11 @@ class Agent:
         """The active tool-result policy: the per-instance override, else the surface."""
         return self.tool_output if self.tool_output is not None else CONFIG.tool_output
 
-    def _offload_root(self) -> str:
-        """Where an offloaded tool result is written — the explicit workspace root when
-        one was given, else agents_dir (which every wiring here binds to the same
-        directory, so no existing caller changes)."""
-        return self.workspace_root or self.agents_dir
+    def _scratch_dir(self) -> Path:
+        """Where offloaded tool results are written — the session's private scratch
+        (harness/session_env.py), never the workspace: the repo is the user's durable
+        state, and runtime spills carry a session lifecycle instead."""
+        return self.session_env.scratch_root
 
     def _run(self, on_delta: OnDelta | None = None) -> str:
         """Drive the model, executing tool calls until it produces a final answer.
@@ -596,15 +615,16 @@ class Agent:
                     hint = None
                     if name == "read_file":
                         hint = "Use start_line/end_line to request the missing range."
-                    # workspace_root anchors offload_to_file's files where the model's
-                    # own read_file resolves relative paths, so the footer's path is a
-                    # route the model can actually walk.
+                    # scratch_dir anchors offload_to_file's complete copy in the
+                    # session's private scratch; the footer names it as a virtual
+                    # scratch:// ref, which the model's own read_file tool resolves
+                    # against that same scratch_root — never a workspace path.
                     content = truncate_tool_result(
                         result,
                         policy,
                         budget=budget,
                         continuation_hint=hint,
-                        workspace_root=self._offload_root(),
+                        scratch_dir=self._scratch_dir(),
                     )
                     self.messages.append(
                         {"role": "tool", "tool_call_id": tc.get("id", ""), "content": content}
@@ -815,6 +835,7 @@ def _coding_tools(
     workspace,
     *,
     exclude_session: str | None,
+    session_env: SessionEnvironment,
     provider: Provider | None = None,
     model: str | None = None,
     sessions_dir: str | Path | None = None,
@@ -831,6 +852,16 @@ def _coding_tools(
     parent should cut them the same way (None: the surface's selection, which both
     resolve identically). The sandbox is NOT on that list: ``bash_tool`` applies no
     policy at all, so there is no third door to keep in agreement.
+
+    ``session_env`` is required, not defaulted: this is where the registered
+    ``read_file`` tool's ``scratch_root`` comes from, and a caller that forgot to
+    pass one used to get a registry whose ``read_file`` could never resolve a
+    ``scratch://`` ref — the footer's route shipping dead. Making it required turns
+    that into a construction-time error instead of a silent gap a live session would
+    have to hit an oversized result to discover. The caller must therefore build
+    (or own) a ``SessionEnvironment`` — typically ``agent.session_env`` — BEFORE
+    calling this, which is also why every call site here constructs its ``Agent``
+    first and assigns ``agent.tools`` after building this registry from it.
     """
     from harness.memory import search_memory_tool
     from harness.sandbox import Sandbox, bash_tool
@@ -840,6 +871,7 @@ def _coding_tools(
 
     root = str(workspace.root)
     memory_dir = sessions_dir if sessions_dir is not None else DEFAULT_DIR
+    scratch_root = session_env.scratch_root
 
     def worker_tools() -> ToolRegistry:
         """What a delegated worker gets: the parent's workspace, read-only.
@@ -849,12 +881,19 @@ def _coding_tools(
         parent running fail-closed could delegate the write it just refused. Until
         delegation has a composite approval design, workers observe and report; the
         parent makes the changes.
+
+        ``scratch_root`` here is the PARENT's session scratch — the only one in scope
+        this early. A worker spawned via delegate/fan_out today still opens its own
+        session (subagents.py does not yet accept ``session_env=``), so a worker's
+        own offload footers are not resolvable through this registry until that
+        lands; what this fixes is the parent's own scratch:// refs staying resolvable
+        for a worker asked to read one back.
         """
-        registry = default_tools(root)
+        registry = default_tools(root, scratch_root=scratch_root)
         registry.register(search_memory_tool(memory_dir, exclude=exclude_session))
         return registry
 
-    tools = default_tools(root)
+    tools = default_tools(root, scratch_root=scratch_root)
     tools.register(write_file_tool(workspace))
     tools.register(edit_file_tool(workspace))
     tools.register(apply_patch_tool(workspace))
@@ -905,21 +944,14 @@ def run_once(
     provider = provider or Provider.from_env()
     workspace = Workspace(root=workspace_root)
     tracer = Tracer(model=provider.model)
-    tools = _coding_tools(
-        workspace,
-        exclude_session=session,
-        provider=provider,
-        model=provider.model,
-        sessions_dir=sessions_dir,
-        tool_output=tool_output,
-    )
-    if extensions:
-        load_extensions(tools, *_extension_dirs(workspace.root))
+    # Construct the Agent BEFORE its tools: with no session_env supplied it creates
+    # (and owns) one in __init__, and that is where _coding_tools' scratch_root has
+    # to come from — the registry's read_file tool must resolve the same scratch
+    # the door is about to spill into. Tools are then built and bound afterward.
     agent = Agent(
         system=DEFAULT_SYSTEM,
         provider=provider,
         model=provider.model,
-        tools=tools,
         approve=_approver(yes),
         approval_required=APPROVAL_TOOLS,
         skills=load_skills("skills"),
@@ -933,12 +965,30 @@ def run_once(
         tracer=tracer,
         tool_output=tool_output,
     )
-    reply = agent.send(prompt, on_delta=on_delta)
-    if fmt == "json":
-        return render_json(reply, tracer, agent.messages)
-    if fmt == "transcript":
-        return render_transcript(agent.messages, tracer)
-    return render_plain(reply)
+    try:
+        tools = _coding_tools(
+            workspace,
+            exclude_session=session,
+            provider=provider,
+            model=provider.model,
+            sessions_dir=sessions_dir,
+            tool_output=tool_output,
+            session_env=agent.session_env,
+        )
+        if extensions:
+            load_extensions(tools, *_extension_dirs(workspace.root))
+        agent.tools = tools
+        reply = agent.send(prompt, on_delta=on_delta)
+        if fmt == "json":
+            return render_json(reply, tracer, agent.messages)
+        if fmt == "transcript":
+            return render_transcript(agent.messages, tracer)
+        return render_plain(reply)
+    finally:
+        # Each invocation is stateless and one-shot (module docstring); nothing else
+        # reuses this Agent, so its scratch's lifecycle ends here rather than waiting
+        # on the next session's scavenge().
+        agent.close()
 
 
 def _stdout_sink(channel: str, text: str) -> None:
@@ -1048,25 +1098,31 @@ def _run_repl(args: argparse.Namespace) -> None:
     # it to price calls (else the REPL trace shows $0.0000), and the agent reuses it.
     provider = Provider.from_env()
     tracer = Tracer(model=provider.model)  # ch-13: record every step + price it
-    tools = _coding_tools(
-        workspace, exclude_session="repl", provider=provider, model=provider.model
-    )
-    if args.extensions:
-        load_extensions(tools, *_extension_dirs(workspace.root))
+    # Agent before tools (see run_once): with no session_env given it creates and
+    # owns one, and _coding_tools' scratch_root has to come from that same env.
     agent = Agent(
         system=DEFAULT_SYSTEM,
         provider=provider,
         model=provider.model,
-        tools=tools,
         approve=approve,
         approval_required=APPROVAL_TOOLS,
         context_limit=args.context_limit,
         skills=load_skills("skills"),
         session="repl",
         agents_dir=str(workspace.root),  # read AGENTS.md (incl. ## Testing) from the project
-        workspace_root=str(workspace.root),  # …and spill oversized results into it
+        workspace_root=str(workspace.root),  # …and read_file/write_file resolve there too
         tracer=tracer,
     )
+    tools = _coding_tools(
+        workspace,
+        exclude_session="repl",
+        provider=provider,
+        model=provider.model,
+        session_env=agent.session_env,
+    )
+    if args.extensions:
+        load_extensions(tools, *_extension_dirs(workspace.root))
+    agent.tools = tools
     print(
         "agent ready — streaming replies; observable runs (a trace with tokens + cost "
         "after each turn); change code and the harness enforces the project's tests "
@@ -1103,7 +1159,8 @@ def _run_repl(args: argparse.Namespace) -> None:
             _ = reply  # already shown via the stream; keep the name for clarity
             print(tracer.timeline())
     finally:
-        cleanup()
+        agent.close()  # end the session's scratch lifecycle
+        cleanup()  # …then the git worktree's
 
 
 if __name__ == "__main__":
