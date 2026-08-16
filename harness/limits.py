@@ -61,9 +61,9 @@ def spill_ref(filename: str) -> str:
 
 
 # Bounded disk. The filename is a content hash, so nothing ever overwrites anything;
-# a long session on a persistent workspace would spill one file per over-budget
-# result forever. Keep the newest N — the older a spill is, the less likely anything
-# is still following its footer.
+# a long session still spills one file per over-budget result until session close.
+# Keep the newest N — the older a spill is, the less likely anything is still
+# following its footer.
 MAX_OFFLOAD_FILES = 64
 _PART_SUFFIX = ".part"  # a spill mid-write; only ever named between mkstemp and rename
 
@@ -145,9 +145,11 @@ _LOOKALIKE_RE = re.compile(r"\[(?=Showing \d+ of \d+ chars\. (?:Full output|Outp
 # about the command even while every count is true of the file. Planting one buys an
 # attacker a more cautious footer and nothing else.
 _UPSTREAM_CUT = "…[truncated "
-# The widest footer this module can write, over every route and every claim, with
-# counts up to ten digits (a 10 GB result — this process could not hold one). Measured
-# at 384 today. Two consumers size themselves from it: the overflow shrink's tail floor
+# The widest footer this module can write, over the single-line case, the paging
+# case, and every claim, with counts up to ten digits (a 10 GB result — this process
+# could not hold one). Measured at 343 today (the single-line branch is now the
+# widest — it names no call, but its fixed explanation outruns the paging call it
+# replaced). Two consumers size themselves from it: the overflow shrink's tail floor
 # (agent.py) and the accept gate's door-control allowance (tasks/checks.py). A footer
 # that outgrew it would silently cost a pointer in the first and read as a door-control
 # regression in the second, so test_offload_strategy measures this writer against this
@@ -156,25 +158,34 @@ MAX_FOOTER_CHARS = 450
 
 
 def _route(line_count: int, ref: str) -> str:
-    """The one way back into the spill, in the unit read_file actually takes.
+    """The way back into a multi-line spill; a single line has no route to offer.
 
-    Only read_file is offered now. The old second route (``search_text``, with its
-    own ``pattern`` spelled out) and the single-line shell slice both depended on a
-    real workspace path a walk or a shell could reach; a virtual ``scratch://`` ref
-    has neither, so both fall away and read_file — which resolves the ref directly —
-    is the whole answer.
+    Multi-line spills get read_file paging and nothing else. The old second route
+    (``search_text``, with its own ``pattern`` spelled out) and the old single-line
+    shell slice both depended on a real workspace path a walk or a shell could
+    reach; a virtual ``scratch://`` ref has neither, so both fall away and
+    read_file — which resolves the ref directly — is what is left.
 
-    No range is computed for the page. A suggested first page used to be sized against
-    this door so its result could not come back over budget, but read_file's result
-    carries a continuation hint, and a hint downgrades the strategy away from offload
-    (see ``_door``) — so an over-budget page returns an excerpt plus "ask for a
-    smaller range", never another spill. That mechanism prevents the circle for every
-    page the model asks for; a computed first page only ever saved the first round trip.
+    No range is computed for the page. A suggested first page used to be sized
+    against this door so its result could not come back over budget, but
+    read_file's result carries a continuation hint, and a hint downgrades the
+    strategy away from offload (see ``_door``) — so an over-budget page returns an
+    excerpt plus "ask for a smaller range", never another spill. That mechanism
+    prevents the circle for every page the model asks for; a computed first page
+    only ever saved the first round trip.
+
+    A single line is a different problem, not a smaller one: read_file pages by
+    line, so there is no range inside one line for it to page to, and promising one
+    would just be a route to "no such range". The inline excerpt already carries
+    this line's own head and tail — the same cut every strategy makes — so nothing
+    a call could recover isn't already sitting in the excerpt; the honest answer
+    names no call at all.
     """
     if line_count <= 1:
         return (
-            f"one long line; request it with read_file(path='{ref}', start_line=1, "
-            "end_line=1) and follow the continuation hint for the rest"
+            "one long line, so line paging cannot reach into it; the inline excerpt "
+            "already shows its head and tail — rerun the command with narrower "
+            "output if the middle is needed"
         )
     return f"read_file(path='{ref}', start_line=1, end_line=<n>) to page it"
 
@@ -265,10 +276,10 @@ def _write_atomically(target: Path, payload: bytes) -> None:
     """Write via a private temp file and ``os.replace``.
 
     ``rename`` REPLACES whatever holds the target name instead of following it, which
-    matters because the name is a deterministic hash: a workspace the agent does not
-    own can pre-place it as a symlink to any file on the host, and a plain write would
-    dutifully overwrite that file. The rename is also atomic, so the model reading the
-    path on its very next turn never sees a half-written file.
+    matters because the name is a deterministic hash: anything that can write into
+    the scratch directory can pre-place it as a symlink to any file on the host, and
+    a plain write would dutifully overwrite that file. The rename is also atomic, so
+    the model reading the path on its very next turn never sees a half-written file.
 
     The mode is mkstemp's own 0600. An earlier pass widened it to 0644 for a sandboxed
     shell running as another uid — but the shell the coding wiring actually builds is
@@ -299,10 +310,10 @@ def _write_atomically(target: Path, payload: bytes) -> None:
 def _holds(target: Path, payload: bytes) -> bool:
     """Does a REGULAR file at ``target`` already hold exactly ``payload``?
 
-    The name is a content hash, but a hash is a claim about content that the
-    *workspace's owner* can make too: a repository can pre-place
-    ``.carbon/offload/<known hash>.txt`` with content of its choosing, and skipping the
-    write on "a file is already there" would have the footer label that content "Full
+    The name is a content hash, but a hash is a claim about content that anything
+    able to write into the scratch directory can make too: it can pre-place
+    ``<known hash>.txt`` with content of its choosing, and skipping the write on "a
+    file is already there" would have the footer label that content "Full
     output". So verify rather than assume — one read of a file we would otherwise be
     rewriting anyway. A symlink, a directory, or a fifo at the name is not our copy
     either, whatever it contains.
@@ -320,7 +331,7 @@ def _holds(target: Path, payload: bytes) -> bool:
 # inside a repository someone else controls, so there is no workspace-owner symlink
 # attack left to defend against — a real directory here is just a real directory.
 def _offload_dir(scratch_dir: Path | None) -> Path:
-    if scratch_dir is None:
+    if not scratch_dir:
         raise _OffloadUnavailable("no scratch storage to write under")
     landed = Path(scratch_dir) / _OFFLOAD_DIRNAME
     landed.mkdir(parents=True, exist_ok=True)
@@ -548,5 +559,9 @@ def _door(
     # Counted on the copy being cut, so the number describes what the model lost here —
     # under offload the footer's own totals then describe the file, which is bigger news.
     marker = f"\n…[truncated {len(text.shown) - max_chars} chars using {name}.{hint}]"
-    scratch = Path(scratch_dir) if scratch_dir is not None else None
+    # Falsy, not just ``None``: ``Path("")`` normalizes to ``.``, and a truthy-but-empty
+    # scratch_dir wrapped there before this check would spill into the process's own
+    # cwd instead of degrading — the empty string has to be caught here, before it is
+    # ever wrapped in a Path, because a Path object is truthy no matter what it names.
+    scratch = Path(scratch_dir) if scratch_dir else None
     return strat.apply(text, max_chars, policy.tail_fraction, marker, scratch)

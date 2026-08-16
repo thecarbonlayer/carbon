@@ -244,6 +244,24 @@ def test_offload_without_scratch_falls_back_inline(tmp_path):
     assert "Full output" not in out
 
 
+def test_empty_scratch_dir_degrades_inline_instead_of_spilling_into_cwd(tmp_path, monkeypatch):
+    """``scratch_dir=""`` is falsy, not a real location — but ``Path("")`` normalizes
+    to ``.``, so a check that only ruled out ``None`` would happily wrap it and spill
+    into the process's OWN working directory. Falsy has to degrade exactly like
+    ``None``: an inline excerpt, and nothing written anywhere, cwd included."""
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    monkeypatch.chdir(cwd)
+
+    out = truncate_tool_result(
+        "x" * 9000, TruncationPolicy("offload_to_file", 4000, 0.3), scratch_dir=""
+    )
+
+    assert "offload unavailable: no scratch storage to write under" in out
+    assert out.startswith("x" * 50)  # the inline head_tail excerpt
+    assert list(cwd.iterdir()) == []  # nothing at all landed in the cwd
+
+
 def test_write_failure_falls_back_inline(tmp_path):
     """Same contract when the scratch dir exists but refuses the write."""
     (tmp_path / "offload").write_text("not a directory")
@@ -618,13 +636,13 @@ def test_offload_params_are_still_validated(tmp_path):
 
 
 # --- the Agent seam -----------------------------------------------------------
-# NOTE: agent.py still calls the door with `workspace_root=self._offload_root()` (the
-# rename to `scratch_dir` is a later task in this batch — see the module boundary this
-# suite documents in its own commit). Every test below that drives a tool call through
-# `Agent.run`/`run_subagent` therefore still fails until that call site is updated;
-# they are left in their pre-existing shape (module-level `Agent`/`run_subagent`
-# behavior is not this module's surface to fix) so they start passing the moment that
-# rename lands, with no further edits here.
+# NOTE: these tests assert the contract Task 4 delivers (the agent passes its
+# session scratch to the door, not a workspace path) and are expected red until
+# harness/agent.py is rewired to construct a SessionEnvironment and call the door
+# with scratch_dir=self.session_env.scratch_root instead of
+# workspace_root=self._offload_root(). The suite cannot collect at this commit
+# anyway — harness/tools.py still imports the now-deleted OFFLOAD_SUBDIR (Task 3)
+# — so asserting the target contract here adds no new redness now.
 def test_agent_override_offloads_tool_results(tmp_path):
     blob = "\n".join(f"line-{i:04d}" for i in range(200))
     agent = Agent(
@@ -637,14 +655,18 @@ def test_agent_override_offloads_tool_results(tmp_path):
     tool_msg = next(m for m in agent.messages if m.get("role") == "tool")
     assert "Full output (200 lines): " in tool_msg["content"]
     assert len(tool_msg["content"]) < len(blob)
-    files = list((tmp_path / "offload").glob("*.txt"))
+    files = list((agent.session_env.scratch_root / "offload").glob("*.txt"))
     assert [p.read_text() for p in files] == [blob]
+    assert not (tmp_path / "offload").exists()  # never inside the workspace/agents_dir
 
 
-def test_agent_writes_where_read_file_reads_not_where_agents_md_lives(tmp_path):
-    """A consumer may load AGENTS.md from a neutral directory while the model's
-    read_file is rooted at the workspace. The footer's path is only walkable if the
-    file lands under the READ root."""
+def test_agent_offload_lands_in_scratch_regardless_of_agents_dir_or_workspace_split(tmp_path):
+    """AGENTS.md may load from a neutral directory while read_file is rooted at a
+    separate workspace — a split ``agents_dir``/``workspace_root`` a consumer can
+    legitimately choose. Offload's target is neither of those: the session's own
+    scratch, reached through ``agent.session_env`` regardless of where either of
+    them point. A spill inside one of them would leak harness runtime state into
+    whichever happens to be a real repository."""
     instructions, workspace = tmp_path / "instructions", tmp_path / "ws"
     instructions.mkdir()
     workspace.mkdir()
@@ -656,8 +678,10 @@ def test_agent_writes_where_read_file_reads_not_where_agents_md_lives(tmp_path):
         tool_output=TruncationPolicy("offload_to_file", 200, 0.5),
     )
     agent.run("go")
-    assert list((workspace / "offload").glob("*.txt"))
+    assert list((agent.session_env.scratch_root / "offload").glob("*.txt"))
     assert not (instructions / ".carbon").exists()
+    assert not (workspace / "offload").exists()
+    assert not (workspace / ".carbon").exists()
 
 
 def test_agent_default_policy_is_the_config(tmp_path):
@@ -907,11 +931,15 @@ def test_one_oversized_bash_result_yields_exactly_one_file_end_to_end(tmp_path):
 
 
 # --- housekeeping in the session scratch directory -----------------------------
-def test_spill_lands_in_scratch_never_in_workspace(tmp_path):
+def test_spill_lands_in_scratch_never_in_workspace(tmp_path, monkeypatch):
     ws = tmp_path / "ws"
     scratch = tmp_path / "scratch"
     ws.mkdir()
     scratch.mkdir()
+    # cwd is set to the workspace so the "nothing lands in it" assertion below is
+    # load-bearing: without this, ws is never touched by any code path regardless
+    # of correctness, and the assertion could never go red.
+    monkeypatch.chdir(ws)
     from harness.harness_config import TruncationPolicy
     from harness.limits import SCRATCH_SCHEME, truncate_tool_result
 
