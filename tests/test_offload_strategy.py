@@ -683,9 +683,16 @@ def test_read_file_refuses_a_forged_scratch_ref_reaching_outside_scratch(tmp_pat
     ws.mkdir()
     secret = tmp_path / "not-in-scratch.txt"
     secret.write_text("must never come back through a scratch:// ref")
+    # The relative climb resolves to <tmp_path>/etc/hosts — plant real content there
+    # too, so a broken containment check would return it instead of a benign "no such
+    # file" that a missing target could produce even with containment removed.
+    climb_target = tmp_path / "etc" / "hosts"
+    climb_target.parent.mkdir(parents=True)
+    climb_target.write_text("must never come back via a relative climb out of scratch")
 
     relative_escape = read_file("scratch://offload/../../etc/hosts", root=ws, scratch_root=scratch)
-    assert relative_escape.startswith("error:")
+    assert "path outside scratch storage" in relative_escape
+    assert "must never come back via a relative climb" not in relative_escape
 
     absolute_escape = read_file(f"scratch://{secret}", root=ws, scratch_root=scratch)
     assert absolute_escape.startswith("error:")

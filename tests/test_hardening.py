@@ -212,12 +212,19 @@ def test_read_file_resolves_scratch_ref_confined_to_scratch(tmp_path):
     ws.mkdir()
     body = read_file("scratch://offload/ab12.txt", root=ws, scratch_root=scratch)
     assert "the complete bytes" in body
-    # escape attempts stay inside scratch
+    # escape attempts stay inside scratch — a real file sits at the climb target so a
+    # broken containment check would return its content, not just any old error.
+    (ws / "anything").write_text("must never leak through a scratch:// relative climb")
     err = read_file("scratch://../ws/anything", root=ws, scratch_root=scratch)
-    assert err.startswith("error:")
-    # no scratch configured -> a clear error, not a workspace fallback
+    assert "path outside scratch storage" in err
+    assert "must never leak through a scratch:// relative climb" not in err
+    # no scratch configured -> a clear error, not a workspace fallback — a real file
+    # sits at the fallback location too, so a silent fallback would return content.
+    (ws / "offload").mkdir()
+    (ws / "offload" / "ab12.txt").write_text("must never leak through a workspace fallback")
     err2 = read_file("scratch://offload/ab12.txt", root=ws, scratch_root=None)
-    assert err2.startswith("error:")
+    assert "no scratch storage in this context" in err2
+    assert "must never leak through a workspace fallback" not in err2
 
 
 # --- approval preview is honest about a failing edit -------------------------
