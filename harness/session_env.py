@@ -10,8 +10,13 @@ The contract, which tests enforce clause by clause:
   - scratch is PRIVATE (0700, unpredictable name via mkdtemp) and OUTSIDE the repo;
   - it lives exactly as long as the session: ``cleanup()`` removes it, callers run
     that in ``finally`` (success, failure, cancellation alike);
-  - crashes leak at most one directory until ``scavenge()`` — run at every session
-    start — removes strays older than ``SCAVENGE_AGE_S``;
+  - an abandoned session — one whose ``cleanup()``/``close()`` never ran (a crash,
+    a caller that forgot) — leaks its ONE directory until a later ``scavenge()``
+    — run at every session start — removes strays older than ``SCAVENGE_AGE_S``.
+    This is a backstop for the session that couldn't run its own cleanup, not a
+    substitute for running it: N abandoned sessions leak N directories, each
+    sitting until scavenge's next pass, not "at most one" for the process;
+    ``close()`` is the contract for everything else;
   - another session cannot name it (unpredictable component) or read it (0700);
   - ``metadata`` states what kind of environment this is and its storage policy, so
     a results manifest can record what the measurement ran on.

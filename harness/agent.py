@@ -1113,23 +1113,28 @@ def _run_repl(args: argparse.Namespace) -> None:
         workspace_root=str(workspace.root),  # …and read_file/write_file resolve there too
         tracer=tracer,
     )
-    tools = _coding_tools(
-        workspace,
-        exclude_session="repl",
-        provider=provider,
-        model=provider.model,
-        session_env=agent.session_env,
-    )
-    if args.extensions:
-        load_extensions(tools, *_extension_dirs(workspace.root))
-    agent.tools = tools
-    print(
-        "agent ready — streaming replies; observable runs (a trace with tokens + cost "
-        "after each turn); change code and the harness enforces the project's tests "
-        "before 'done'; /plan; durable sessions, approval gate, skills. Ctrl-D to exit."
-    )
-    orchestrator = Orchestrator()
+    # The try opens HERE, immediately after the Agent (and the session_env it just
+    # created and owns) exist — not after the tool-building/extension-loading/
+    # Orchestrator setup below. That setup can raise (load_extensions in particular
+    # runs arbitrary user code from .carbon/extensions/), and a raise there used to
+    # skip agent.close() entirely, leaking the scratch this Agent already created.
     try:
+        tools = _coding_tools(
+            workspace,
+            exclude_session="repl",
+            provider=provider,
+            model=provider.model,
+            session_env=agent.session_env,
+        )
+        if args.extensions:
+            load_extensions(tools, *_extension_dirs(workspace.root))
+        agent.tools = tools
+        print(
+            "agent ready — streaming replies; observable runs (a trace with tokens + cost "
+            "after each turn); change code and the harness enforces the project's tests "
+            "before 'done'; /plan; durable sessions, approval gate, skills. Ctrl-D to exit."
+        )
+        orchestrator = Orchestrator()
         while True:
             try:
                 user = input("you> ")

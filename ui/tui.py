@@ -266,6 +266,14 @@ class AgentTUI(App):
         self._rebuild_trace()
         self.query_one("#prompt", Input).focus()
 
+    def on_unmount(self) -> None:
+        """App exit (ctrl+q's ``quit`` binding, an unhandled error, the process
+        tearing the run loop down) — end the current agent's scratch lifecycle the
+        same way ``_open_session`` already does on a session switch. ``close()`` is
+        idempotent and a no-op for a caller-supplied agent, so this is safe
+        regardless of how ``self.agent`` was constructed."""
+        self.agent.close()
+
     # --- rendering ----------------------------------------------------------
     def _refresh_header(self) -> None:
         a = self.agent
