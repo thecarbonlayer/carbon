@@ -792,11 +792,12 @@ def test_subagents_inherit_the_parents_door(tmp_path):
     """A worker reads the same oversized files the parent does. Left on the default,
     it would quietly drop the middle of every one of them.
 
-    Expected red until Task 5: a worker is a full Agent (harness/subagents.py), and
-    per the plan it inherits the PARENT's session scratch rather than opening its
-    own — one session, one scratch inventory, whichever Agent object is doing the
-    spilling — but `run_subagent` does not accept `session_env=` yet, so there is
-    nothing here for a worker to inherit.
+    A worker is a full Agent (harness/subagents.py) that inherits the PARENT's
+    session scratch rather than opening its own — one session, one scratch
+    inventory, whichever Agent object is doing the spilling. This drives that
+    inheritance through a hand-built ``tools=_dump_registry(...)`` registry; the two
+    tests below drive it through the worker's own DEFAULT registry instead, which
+    this one leaves completely uncovered.
     """
     from harness.session_env import local_session_env
     from harness.subagents import run_subagent
@@ -817,6 +818,134 @@ def test_subagents_inherit_the_parents_door(tmp_path):
         assert not (tmp_path / "offload").exists()  # never inside agents_dir either
     finally:
         parent_env.cleanup()
+
+
+def test_a_workers_default_registry_resolves_a_parent_written_scratch_ref(tmp_path):
+    """A supplied parent env, NO ``tools=``: the worker's DEFAULT registry (built by
+    `run_subagent` itself from `scratch_root=session_env.scratch_root`) must resolve
+    a ref the PARENT wrote before this call even started. The seam test above only
+    proves inheritance through a caller-supplied registry; nothing pins the
+    default-registry forwarding on its own without this.
+    """
+    from harness.session_env import local_session_env
+    from harness.subagents import run_subagent
+
+    parent_env = local_session_env(tmp_path)
+    try:
+        # The parent's own door already spilled this, independent of any worker —
+        # standing in for an earlier tool call in the parent's own turn.
+        blob = "PARENT-SECRET line\n" + "filler\n" * 500
+        footer = truncate_tool_result(
+            blob,
+            TruncationPolicy("offload_to_file", 200, 0.5),
+            scratch_dir=parent_env.scratch_root,
+        )
+        refs = set(re.findall(re.escape(SCRATCH_SCHEME) + r"offload/[0-9a-f]{16}\.txt", footer))
+        assert len(refs) == 1, f"footer should name exactly one file, consistently: {refs}"
+        ref = refs.pop()
+
+        seen: list[list[dict]] = []
+
+        def responder(messages, **kwargs):
+            seen.append(list(messages))
+            if len(seen) == 1:
+                return LLMResponse(
+                    content="",
+                    tool_calls=[
+                        {
+                            "id": "t1",
+                            "function": {
+                                "name": "read_file",
+                                "arguments": json.dumps({"path": ref}),
+                            },
+                        }
+                    ],
+                )
+            return LLMResponse(content="done")
+
+        run_subagent(
+            "read back the parent's file",
+            provider=Provider("fake://worker-parent-ref", "fake", responder=responder),
+            agents_dir=str(tmp_path),
+            session_env=parent_env,
+        )
+
+        tool_results = {
+            m["tool_call_id"]: m["content"] for m in seen[-1] if m.get("role") == "tool"
+        }
+        assert tool_results["t1"] == blob
+    finally:
+        parent_env.cleanup()
+
+
+def test_a_workers_own_default_registry_resolves_its_own_spill_within_the_call(tmp_path):
+    """NO ``session_env``, NO ``tools=``: the worker's default registry must be built
+    from THIS worker's own session scratch — the env `Agent` creates for itself when
+    `session_env` is `None` — never from `scratch_root=None`, which is all the
+    pre-construction `session_env` parameter can ever be in this branch. Drives a
+    real oversized `search_text` result through the door and a real `read_file` call
+    back, both through the worker's own default registry, in one scripted run: the
+    worker reading back what it JUST wrote, not something a parent wrote earlier.
+    """
+    from harness.subagents import run_subagent
+    from harness.tools import search_text
+
+    lines = [f"needle-line-{i:04d}: NEEDLE marker text here" for i in range(150)]
+    (tmp_path / "log.txt").write_text("\n".join(lines))
+    expected = search_text("NEEDLE", root=tmp_path)
+    assert len(expected) > 300, "test setup must actually exceed the door's budget"
+
+    seen: list[list[dict]] = []
+
+    def responder(messages, **kwargs):
+        seen.append(list(messages))
+        if len(seen) == 1:
+            return LLMResponse(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "t1",
+                        "function": {
+                            "name": "search_text",
+                            "arguments": json.dumps({"query": "NEEDLE"}),
+                        },
+                    }
+                ],
+            )
+        if len(seen) == 2:
+            footer = str(messages[-1]["content"])
+            refs = set(re.findall(re.escape(SCRATCH_SCHEME) + r"offload/[0-9a-f]{16}\.txt", footer))
+            assert len(refs) == 1, f"footer should name exactly one file, consistently: {refs}"
+            ref = refs.pop()
+            return LLMResponse(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "t2",
+                        "function": {"name": "read_file", "arguments": json.dumps({"path": ref})},
+                    }
+                ],
+            )
+        return LLMResponse(content="done")
+
+    run_subagent(
+        "search for NEEDLE, then read back whatever the footer points at",
+        provider=Provider("fake://worker-own-spill", "fake", responder=responder),
+        agents_dir=str(tmp_path),
+        tool_output=TruncationPolicy("offload_to_file", 300, 0.5),
+    )
+
+    tool_results = {m["tool_call_id"]: m["content"] for m in seen[-1] if m.get("role") == "tool"}
+    # Not exact equality: read_file's own (whole-file, no start_line/end_line) result
+    # re-enters the SAME small door and gets its own head_tail downgrade — correct,
+    # already-pinned behavior (test_paging_a_spill_back_in_cannot_spiral_into_
+    # another_spill), and orthogonal to what THIS test is about. What matters here is
+    # that real content from the actual spilled file came back at all, from both
+    # ends of it, rather than the routing error this is guarding against.
+    assert not tool_results["t2"].startswith("error:")
+    assert "needle-line-0000: NEEDLE marker text here" in tool_results["t2"]  # the file's head
+    assert "more than 100 hits; narrow it" in tool_results["t2"]  # the file's tail
+    assert expected.startswith("log.txt:1: needle-line-0000")  # sanity: head is where expected
 
 
 def test_a_workers_default_tools_are_rooted_at_agents_dir_not_the_process_cwd(tmp_path):

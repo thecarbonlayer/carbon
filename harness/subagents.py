@@ -56,15 +56,19 @@ def run_subagent(
     """
     from harness.agent import Agent  # lazy: avoids an import cycle at module load
 
+    # Agent-first, tools-after (the same ordering run_once uses, harness/agent.py):
+    # constructed before the default registry, not inside the ``tools=`` expression.
+    # ``session_env`` (the parameter) is only ever a real value when the CALLER
+    # supplied one; when it's None, the worker's actual scratch doesn't exist until
+    # ``Agent.__init__`` creates it. Building ``default_tools(scratch_root=...)``
+    # from the parameter instead of from ``sub.session_env`` left a no-env worker's
+    # own registry permanently bound to ``scratch_root=None`` — its own read_file
+    # could never resolve the scratch:// footer its own offloads had just written.
+    # ``sub.session_env`` is correct in both cases: the parent's env when supplied,
+    # or the one this Agent just created for itself when it wasn't.
     sub = Agent(
         system=system or DEFAULT_WORKER_SYSTEM,
-        # Default tools are rooted where this worker writes, not at the process cwd:
-        # the worker's own offloaded output lands under ``agents_dir``, and a read_file
-        # resolving anywhere else makes every footer it is handed a dead path.
-        tools=tools
-        or default_tools(
-            agents_dir, scratch_root=session_env.scratch_root if session_env else None
-        ),
+        tools=tools,
         model=model,
         provider=provider,
         agents_dir=agents_dir,
@@ -72,6 +76,11 @@ def run_subagent(
         tool_output=tool_output,
         session_env=session_env,
     )
+    if tools is None:
+        # read_file/list_files/search_text are rooted at agents_dir, not the process
+        # cwd, so this worker sees the tree it was actually asked to look at —
+        # unrelated to scratch_root, which is a different root entirely (see above).
+        sub.tools = default_tools(agents_dir, scratch_root=sub.session_env.scratch_root)
     try:
         return sub.send(task)
     finally:
