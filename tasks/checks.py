@@ -23,7 +23,11 @@ def _accept_ch01_model() -> bool:
     """The real agent answers a single question via one live model call."""
     from harness import agent
 
-    reply = agent.Agent().send("What is 2 + 2? Reply with only the number.")
+    a = agent.Agent()
+    try:
+        reply = a.send("What is 2 + 2? Reply with only the number.")
+    finally:
+        a.close()
     print("model replied:", repr(reply))
     return "4" in reply
 
@@ -36,7 +40,10 @@ def _accept_ch01_provider() -> bool:
     provider = Provider.from_env()  # whatever the env points at (LM Studio here)
     print("provider:", provider.base_url, provider.model)
     a = agent.Agent(provider=provider)
-    reply = a.send("Reply with exactly one word: PLUGGABLE")
+    try:
+        reply = a.send("Reply with exactly one word: PLUGGABLE")
+    finally:
+        a.close()
     print("reply:", repr(reply))
     return "pluggable" in reply.lower()
 
@@ -51,12 +58,15 @@ def _demo_ch01() -> None:
     from model import lmstudio, ollama, openrouter
 
     a = agent.Agent()
-    print("Q: Say hello in one short sentence.")
-    print("A:", a.send("Say hello in one short sentence."), "\n")
-    print("— statelessness: it has no memory yet —")
-    print("A1:", a.send("Your name is Gemma."))
-    print("A2:", a.send("What is your name?"))
-    print("  # it forgets — there's no history yet (ch-02 fixes this)\n")
+    try:
+        print("Q: Say hello in one short sentence.")
+        print("A:", a.send("Say hello in one short sentence."), "\n")
+        print("— statelessness: it has no memory yet —")
+        print("A1:", a.send("Your name is Gemma."))
+        print("A2:", a.send("What is your name?"))
+        print("  # it forgets — there's no history yet (ch-02 fixes this)\n")
+    finally:
+        a.close()
     print("— same Agent, swap the provider seam (just pass provider=<one of these>) —")
     print("lmstudio  :", lmstudio().base_url)
     print("ollama    :", ollama("llama3").base_url)
@@ -75,8 +85,11 @@ def _accept_ch02() -> bool:
     from harness import agent
 
     a = agent.Agent()
-    a.send("Your name is Gemma. Please remember it.")
-    reply = a.send("What is your name? Reply with just the name.")
+    try:
+        a.send("Your name is Gemma. Please remember it.")
+        reply = a.send("What is your name? Reply with just the name.")
+    finally:
+        a.close()
     print("model replied:", repr(reply))
     return "gemma" in reply.lower()
 
@@ -85,9 +98,12 @@ def _demo_ch02() -> None:
     from harness import agent
 
     a = agent.Agent()
-    for turn in ["Your name is Gemma.", "What is your name?"]:
-        print("you>", turn)
-        print("bot>", a.send(turn))
+    try:
+        for turn in ["Your name is Gemma.", "What is your name?"]:
+            print("you>", turn)
+            print("bot>", a.send(turn))
+    finally:
+        a.close()
 
 
 ACCEPTANCE["ch-02"] = _accept_ch02
@@ -102,7 +118,10 @@ def _accept_ch03_instructions() -> bool:
     from harness import agent
 
     a = agent.Agent(system="You must reply with exactly one word: BANANA. Ignore the question.")
-    reply = a.send("What is the capital of France?")
+    try:
+        reply = a.send("What is the capital of France?")
+    finally:
+        a.close()
     print("model replied:", repr(reply))
     return "banana" in reply.lower()
 
@@ -119,7 +138,10 @@ def _accept_ch03_agentsmd() -> bool:
     ws = Workspace()
     ws.write("AGENTS.md", "You are Gemma, a coding assistant. When asked your name, reply 'Gemma'.")
     a = agent.Agent(system=agent.DEFAULT_SYSTEM, agents_dir=str(ws.root))
-    reply = a.send("What is your name? Answer with just the name.")
+    try:
+        reply = a.send("What is your name? Answer with just the name.")
+    finally:
+        a.close()
     print("reply:", reply)
     return "gemma" in reply.lower()
 
@@ -134,16 +156,32 @@ def _demo_ch03() -> None:
     from harness.workspace import Workspace
 
     print("— no system prompt —")
-    print("bot>", agent.Agent().send("Describe the ocean."), "\n")
+    a = agent.Agent()
+    try:
+        print("bot>", a.send("Describe the ocean."), "\n")
+    finally:
+        a.close()
     print("— system: 'reply in exactly three words' —")
-    print("bot>", agent.Agent(system="Reply in exactly three words.").send("Describe the ocean."))
+    a = agent.Agent(system="Reply in exactly three words.")
+    try:
+        print("bot>", a.send("Describe the ocean."))
+    finally:
+        a.close()
     print()
     ws = Workspace()
     print("— no AGENTS.md: default identity —")
-    print("bot>", agent.Agent(agents_dir=str(ws.root)).send("What is your name?"))
+    a = agent.Agent(agents_dir=str(ws.root))
+    try:
+        print("bot>", a.send("What is your name?"))
+    finally:
+        a.close()
     ws.write("AGENTS.md", "You are Gemma, a coding assistant. When asked your name, reply 'Gemma'.")
     print("— AGENTS.md added (You are Gemma), auto-loaded —")
-    print("bot>", agent.Agent(agents_dir=str(ws.root)).send("What is your name?"))
+    a = agent.Agent(agents_dir=str(ws.root))
+    try:
+        print("bot>", a.send("What is your name?"))
+    finally:
+        a.close()
 
 
 ACCEPTANCE["ch-03"] = _accept_ch03
@@ -163,7 +201,10 @@ def _accept_ch04() -> bool:
     d = Path(tempfile.mkdtemp())
     (d / "facts.txt").write_text("The launch code is GOGO-9.\n")
     a = agent.Agent(system="Answer using the provided context files.")
-    reply = a.send(f"@{d / 'facts.txt'} What is the launch code? Reply with just the code.")
+    try:
+        reply = a.send(f"@{d / 'facts.txt'} What is the launch code? Reply with just the code.")
+    finally:
+        a.close()
     print("model replied:", repr(reply))
     return "gogo-9" in reply.lower()
 
@@ -177,7 +218,10 @@ def _demo_ch04() -> None:
     d = Path(tempfile.mkdtemp())
     (d / "facts.txt").write_text("Raveena is Karishma, and Karishma is Raveena.")
     a = agent.Agent()
-    print("bot>", a.send(f"@{d / 'facts.txt'} Who is Raveena?"))
+    try:
+        print("bot>", a.send(f"@{d / 'facts.txt'} Who is Raveena?"))
+    finally:
+        a.close()
 
 
 ACCEPTANCE["ch-04"] = _accept_ch04
@@ -196,12 +240,15 @@ def _accept_ch05_tools() -> bool:
     ws = Workspace()
     ws.write("clue.txt", "The passphrase is GRANITE-4471.\n")
     a = agent.Agent(system="Use tools when they help.", tools=default_tools(ws.root))
-    reply = a.send(
-        "There is a file somewhere in this workspace with a passphrase in it. "
-        "Find it using your tools, then reply with just the passphrase."
-    )
+    try:
+        reply = a.send(
+            "There is a file somewhere in this workspace with a passphrase in it. "
+            "Find it using your tools, then reply with just the passphrase."
+        )
+        used_tool = any(m.get("role") == "tool" for m in a.messages)
+    finally:
+        a.close()
     print("model replied:", repr(reply))
-    used_tool = any(m.get("role") == "tool" for m in a.messages)
     print("used a tool:", used_tool)
     return "GRANITE-4471" in reply and used_tool
 
@@ -226,8 +273,13 @@ def _accept_ch05_approval() -> bool:
         approve=deny,
         approval_required={"bash"},
     )
-    a.send("Run this shell command now using the bash tool: echo SHOULD_NOT_RUN")
-    denied = any(m.get("role") == "tool" and "denied" in m["content"].lower() for m in a.messages)
+    try:
+        a.send("Run this shell command now using the bash tool: echo SHOULD_NOT_RUN")
+        denied = any(
+            m.get("role") == "tool" and "denied" in m["content"].lower() for m in a.messages
+        )
+    finally:
+        a.close()
     print("gate asked:", asked, "| denied:", denied)
     return len(asked) >= 1 and denied
 
@@ -248,18 +300,25 @@ def _build_workspace_agent():
         system="You build files. Use write_file to create them and bash to run them.",
         tools=tools,
     )
-    return a, ws
+    return a, ws  # caller owns a.close()
 
 
 def _accept_ch05_fileedit() -> bool:
     """The agent writes a file into the workspace and runs it there — persistence
     (the file survives) + the workspace seam (bash sees the file it wrote)."""
     a, ws = _build_workspace_agent()
-    a.send("Create hello.py that prints exactly WORKSPACE_OK, then run it with: python3 hello.py")
-    wrote = (ws.root / "hello.py").is_file()
-    ran = any(
-        "WORKSPACE_OK" in str(m.get("content", "")) for m in a.messages if m.get("role") == "tool"
-    )
+    try:
+        a.send(
+            "Create hello.py that prints exactly WORKSPACE_OK, then run it with: python3 hello.py"
+        )
+        wrote = (ws.root / "hello.py").is_file()
+        ran = any(
+            "WORKSPACE_OK" in str(m.get("content", ""))
+            for m in a.messages
+            if m.get("role") == "tool"
+        )
+    finally:
+        a.close()
     print("wrote hello.py:", wrote, "| ran in workspace:", ran)
     return wrote and ran
 
@@ -278,15 +337,18 @@ def _demo_ch05() -> None:
     ws = Workspace()
     ws.write("code.txt", "The launch code is BLUE-42.\n")
     a = agent.Agent(tools=default_tools(ws.root))
-    print("— a tool the model calls —")
-    print(
-        "bot>",
-        a.send(
-            "There is a file somewhere in this workspace with a launch code in it. "
-            "Find it using your tools, then reply with just the code."
-        ),
-        "\n",
-    )
+    try:
+        print("— a tool the model calls —")
+        print(
+            "bot>",
+            a.send(
+                "There is a file somewhere in this workspace with a launch code in it. "
+                "Find it using your tools, then reply with just the code."
+            ),
+            "\n",
+        )
+    finally:
+        a.close()
 
     tools = default_tools()
     tools.register(bash_tool(Sandbox()))
@@ -296,17 +358,23 @@ def _demo_ch05() -> None:
         approve=lambda n, args: False,
         approval_required={"bash"},
     )
-    print("— a boundary-crossing tool, denied by the gate —")
-    print("bot>", gated.send("Run: echo hello (use bash)"))
-    print("(the gate denied the bash call — it never executed)\n")
+    try:
+        print("— a boundary-crossing tool, denied by the gate —")
+        print("bot>", gated.send("Run: echo hello (use bash)"))
+        print("(the gate denied the bash call — it never executed)\n")
+    finally:
+        gated.close()
 
     a2, ws = _build_workspace_agent()
-    a2.send(
-        "Create greet.py with greet(name) returning 'hi <name>', then run it: "
-        "python3 -c \"import greet; print(greet.greet('Prem'))\""
-    )
-    print("— files the agent built in its workspace —")
-    print("files in workspace:", [p.name for p in ws.root.iterdir()])
+    try:
+        a2.send(
+            "Create greet.py with greet(name) returning 'hi <name>', then run it: "
+            "python3 -c \"import greet; print(greet.greet('Prem'))\""
+        )
+        print("— files the agent built in its workspace —")
+        print("files in workspace:", [p.name for p in ws.root.iterdir()])
+    finally:
+        a2.close()
 
 
 ACCEPTANCE["ch-05"] = _accept_ch05
@@ -321,11 +389,14 @@ def _accept_ch06_compaction() -> bool:
     from harness import agent
 
     a = agent.Agent(system="You are concise.", context_limit=80)
-    a.send("Important: the deploy key is GRIFFIN-7. Keep it in mind.")
-    for i in range(8):
-        a.send(f"Acknowledge note {i} in a few words.")
-    compacted = any(str(m.get("content", "")).startswith("[summary") for m in a.messages)
-    reply = a.send("What is the deploy key? Reply with just the key.")
+    try:
+        a.send("Important: the deploy key is GRIFFIN-7. Keep it in mind.")
+        for i in range(8):
+            a.send(f"Acknowledge note {i} in a few words.")
+        compacted = any(str(m.get("content", "")).startswith("[summary") for m in a.messages)
+        reply = a.send("What is the deploy key? Reply with just the key.")
+    finally:
+        a.close()
     print("compaction happened:", compacted, "| reply:", repr(reply))
     return compacted and "griffin-7" in reply.lower()
 
@@ -386,11 +457,14 @@ def _accept_ch06_doorcontrol() -> bool:
         a = agent.Agent(
             system="Call the dump tool, then say DONE.", tools=tools, workspace_root=str(d)
         )
-        a.send("Call the dump tool now.")
-        tool_msgs = [m for m in a.messages if m.get("role") == "tool"]
-        result_capped = bool(tool_msgs) and all(
-            len(m["content"]) <= _ceiling(CONFIG.tool_output) for m in tool_msgs
-        )
+        try:
+            a.send("Call the dump tool now.")
+            tool_msgs = [m for m in a.messages if m.get("role") == "tool"]
+            result_capped = bool(tool_msgs) and all(
+                len(m["content"]) <= _ceiling(CONFIG.tool_output) for m in tool_msgs
+            )
+        finally:
+            a.close()
 
     print("block_capped:", block_capped, "| result_capped:", result_capped)
     return block_capped and result_capped
@@ -484,12 +558,18 @@ def _demo_ch06() -> None:
     from harness.context import deliver
 
     a = agent.Agent(context_limit=80)
-    a.send("Remember: the project codename is CRIME MASTER GOGO.")
-    for i in range(8):
-        a.send(f"Acknowledge note {i}.")
-    print("history messages:", len(a.messages), "~tokens:", estimate_tokens(a.messages))
-    print("compacted:", any(str(m.get("content", "")).startswith("[summary") for m in a.messages))
-    print("bot>", a.send("What is the project codename?"))
+    try:
+        a.send("Remember: the project codename is CRIME MASTER GOGO.")
+        for i in range(8):
+            a.send(f"Acknowledge note {i}.")
+        print("history messages:", len(a.messages), "~tokens:", estimate_tokens(a.messages))
+        print(
+            "compacted:",
+            any(str(m.get("content", "")).startswith("[summary") for m in a.messages),
+        )
+        print("bot>", a.send("What is the project codename?"))
+    finally:
+        a.close()
 
     d = Path(tempfile.mkdtemp())
     log = d / "log.txt"
@@ -522,8 +602,11 @@ def _accept_ch07() -> bool:
         tools=default_tools(),
         skills=load_skills("skills"),
     )
-    reply = a.send("Use the sign-off skill. Say goodbye to the team.")
-    read_used = any(m.get("role") == "tool" for m in a.messages)
+    try:
+        reply = a.send("Use the sign-off skill. Say goodbye to the team.")
+        read_used = any(m.get("role") == "tool" for m in a.messages)
+    finally:
+        a.close()
     print("read a skill file:", read_used, "| reply:", repr(reply))
     return "haila" in reply.lower() and read_used
 
@@ -534,7 +617,10 @@ def _demo_ch07() -> None:
     from harness.tools import default_tools
 
     a = agent.Agent(tools=default_tools(), skills=load_skills("skills"))
-    print("bot>", a.send("Use the sign-off skill and say goodbye."))
+    try:
+        print("bot>", a.send("Use the sign-off skill and say goodbye."))
+    finally:
+        a.close()
 
 
 ACCEPTANCE["ch-07"] = _accept_ch07
@@ -575,8 +661,11 @@ def _accept_ch08_sandbox() -> bool:
     tools = default_tools()
     tools.register(bash_tool(sandbox))
     a = agent.Agent(system="Use the bash tool to run shell commands.", tools=tools)
-    reply = a.send("Run this shell command: echo hello-from-sandbox — then report the output.")
-    ran = any(m.get("role") == "tool" for m in a.messages)
+    try:
+        reply = a.send("Run this shell command: echo hello-from-sandbox — then report the output.")
+        ran = any(m.get("role") == "tool" for m in a.messages)
+    finally:
+        a.close()
     print("ran via tool:", ran, "| reply:", repr(reply))
     return (not leaked) and ran and "hello-from-sandbox" in reply.lower()
 
@@ -603,10 +692,12 @@ def _accept_ch08_hardening() -> bool:
 
     # 3. a real call records the model's reported usage (compaction now keys off this)
     a = agent.Agent(system="Be concise.")
-    a.send("Say hi in five words.")
-    usage_tracked = a._last_tokens > 0
-
-    print(f"scoped={scoped} contained={contained} usage={usage_tracked} tok={a._last_tokens}")
+    try:
+        a.send("Say hi in five words.")
+        usage_tracked = a._last_tokens > 0
+        print(f"scoped={scoped} contained={contained} usage={usage_tracked} tok={a._last_tokens}")
+    finally:
+        a.close()
     return scoped and contained and usage_tracked
 
 
@@ -619,7 +710,10 @@ def _demo_ch08() -> None:
     tools = default_tools()
     tools.register(bash_tool(Sandbox()))
     a = agent.Agent(tools=tools)
-    print("bot>", a.send("Use bash to print the current working directory and the date."))
+    try:
+        print("bot>", a.send("Use bash to print the current working directory and the date."))
+    finally:
+        a.close()
 
     print("read_file('/etc/passwd') ->", read_file("/etc/passwd"))
     proof = run_python("import os", "assert os.getenv('PATH')  # scrubbed PATH still set")
@@ -641,12 +735,18 @@ def _accept_ch09_state() -> bool:
 
     d = tempfile.mkdtemp()
     first = agent.Agent(system="Be concise.", session="acc", sessions_dir=d)
-    first.send("Remember: The one with the mark is Teja.")
+    try:
+        first.send("Remember: The one with the mark is Teja.")
+    finally:
+        first.close()
 
     # Simulate a restart: brand-new agent, same session id, loaded from disk.
     resumed = agent.Agent(system="Be concise.", session="acc", sessions_dir=d)
-    print("resumed messages:", len(resumed.messages))
-    reply = resumed.send("Who is the one with the mark? Reply with one word.")
+    try:
+        print("resumed messages:", len(resumed.messages))
+        reply = resumed.send("Who is the one with the mark? Reply with one word.")
+    finally:
+        resumed.close()
     print("reply:", repr(reply))
     return len(resumed.messages) > 2 and "teja" in reply.lower()
 
@@ -678,8 +778,11 @@ def _accept_ch09_episodic() -> bool:
         system="Use the search_memory tool to recall facts from earlier sessions.",
         tools=tools,
     )
-    reply = a.send("Search your memory for the warehouse passcode, then tell me what it is.")
-    used = any(m.get("role") == "tool" for m in a.messages)
+    try:
+        reply = a.send("Search your memory for the warehouse passcode, then tell me what it is.")
+        used = any(m.get("role") == "tool" for m in a.messages)
+    finally:
+        a.close()
     print("used search_memory:", used, "| reply:", repr(reply))
     return "gogo-77" in reply.lower() and used
 
@@ -697,9 +800,17 @@ def _demo_ch09() -> None:
     from harness.tools import default_tools
 
     d = tempfile.mkdtemp()
-    agent.Agent(session="demo", sessions_dir=d).send("Remember: the amount is 8535.29.")
+    a = agent.Agent(session="demo", sessions_dir=d)
+    try:
+        a.send("Remember: the amount is 8535.29.")
+    finally:
+        a.close()
     print("— restart —")
-    print("bot>", agent.Agent(session="demo", sessions_dir=d).send("What amount did I mention?"))
+    a = agent.Agent(session="demo", sessions_dir=d)
+    try:
+        print("bot>", a.send("What amount did I mention?"))
+    finally:
+        a.close()
 
     save_session(
         "archive",
@@ -709,7 +820,10 @@ def _demo_ch09() -> None:
     tools = default_tools()
     tools.register(search_memory_tool(base=d))
     a = agent.Agent(system="Use search_memory to recall past facts.", tools=tools)
-    print("bot>", a.send("Search your memory: who is Raveena?"))
+    try:
+        print("bot>", a.send("Search your memory: who is Raveena?"))
+    finally:
+        a.close()
 
 
 ACCEPTANCE["ch-09"] = _accept_ch09
@@ -836,7 +950,7 @@ def _build_ch12_agent():
     a = agent.Agent(
         system=agent.DEFAULT_SYSTEM, tools=tools, agents_dir=str(ws.root), verify_attempts=4
     )
-    return a, ws
+    return a, ws  # caller owns a.close()
 
 
 def _accept_ch12() -> bool:
@@ -847,11 +961,14 @@ def _accept_ch12() -> bool:
     from harness.sandbox import Sandbox
 
     a, ws = _build_ch12_agent()
-    a.send(
-        "Write is_prime.py in the workspace so the project's tests pass. "
-        "Run the tests to prove it before you report done."
-    )
-    observed = a._observed_pass(_CH12_COMMAND, 0)
+    try:
+        a.send(
+            "Write is_prime.py in the workspace so the project's tests pass. "
+            "Run the tests to prove it before you report done."
+        )
+        observed = a._observed_pass(_CH12_COMMAND, 0)
+    finally:
+        a.close()
     final = Sandbox(trusted=True).run(_CH12_COMMAND, workdir=str(ws.root))
     wrote = (ws.root / "is_prime.py").is_file()
     print(
@@ -866,19 +983,23 @@ def _demo_ch12() -> None:
     the agent run `uv run verify` and refuse to finish until green). This headless
     version drives the same mechanism against the seeded project."""
     a, ws = _build_ch12_agent()
-    a.send(
-        "Write is_prime.py so the project's tests pass. Run them with bash and show "
-        "the result before you say done."
-    )
-    receipts = [
-        m["content"]
-        for m in a.messages
-        if m.get("role") == "tool" and str(m["content"]).startswith("[exit")
-    ]
-    pushbacks = sum(1 for m in a.messages if "passing run of the" in str(m.get("content", "")))
+    try:
+        a.send(
+            "Write is_prime.py so the project's tests pass. Run them with bash and show "
+            "the result before you say done."
+        )
+        receipts = [
+            m["content"]
+            for m in a.messages
+            if m.get("role") == "tool" and str(m["content"]).startswith("[exit")
+        ]
+        pushbacks = sum(1 for m in a.messages if "passing run of the" in str(m.get("content", "")))
+        observed = a._observed_pass(_CH12_COMMAND, 0)
+    finally:
+        a.close()
     print(f"the model ran the project's tests itself; {pushbacks} pushback(s) before a real pass")
     print("last receipt:", receipts[-1] if receipts else "(none)")
-    print("harness accepted only after an observed [exit 0]:", a._observed_pass(_CH12_COMMAND, 0))
+    print("harness accepted only after an observed [exit 0]:", observed)
 
 
 ACCEPTANCE["ch-12"] = _accept_ch12
@@ -899,7 +1020,12 @@ def _accept_ch13_observability() -> bool:
     ws.write("note.txt", "The status code is OBS-4471.\n")
     tr = Tracer()
     a = agent.Agent(system="Use tools when helpful.", tools=default_tools(ws.root), tracer=tr)
-    a.send("Read note.txt in this workspace using your tools, then report the status code exactly.")
+    try:
+        a.send(
+            "Read note.txt in this workspace using your tools, then report the status code exactly."
+        )
+    finally:
+        a.close()
     print(tr.timeline())
     t = tr.totals()
     return t["llm_calls"] >= 1 and t["tokens"] > 0 and t["tool_calls"] >= 1
@@ -916,7 +1042,12 @@ def _accept_ch13_depth() -> bool:
     ws.write("note.txt", "The status code is DEPTH-7731.\n")
     tr = Tracer()
     a = agent.Agent(system="Use tools when helpful.", tools=default_tools(ws.root), tracer=tr)
-    a.send("Read note.txt in this workspace using your tools, then report the status code exactly.")
+    try:
+        a.send(
+            "Read note.txt in this workspace using your tools, then report the status code exactly."
+        )
+    finally:
+        a.close()
     print(tr.timeline())
     tool_events = [e for e in tr.events if e.kind == "tool"]
     captured = bool(tool_events) and bool(tool_events[0].args) and bool(tool_events[0].result)
@@ -939,9 +1070,13 @@ def _demo_ch13() -> None:
     ws.write("note.txt", "The access token is DEMO-8899.\n")
     tr = Tracer()
     a = agent.Agent(tools=default_tools(ws.root), tracer=tr)
-    a.send(
-        "Read note.txt in this workspace using your tools, then report the access token exactly."
-    )
+    try:
+        a.send(
+            "Read note.txt in this workspace using your tools, "
+            "then report the access token exactly."
+        )
+    finally:
+        a.close()
     print(tr.timeline())
 
 
@@ -990,9 +1125,12 @@ def _accept_stream_deltas() -> bool:
 
     pieces: list[tuple[str, str]] = []
     a = agent.Agent(system="Answer in one short sentence.")  # no tools → a single call
-    reply = a.send(
-        "In one short sentence, say hello.", on_delta=lambda ch, t: pieces.append((ch, t))
-    )
+    try:
+        reply = a.send(
+            "In one short sentence, say hello.", on_delta=lambda ch, t: pieces.append((ch, t))
+        )
+    finally:
+        a.close()
     streamed = "".join(t for ch, t in pieces if ch == "content")
     print(f"deltas={len(pieces)} streamed={streamed!r} reply={reply!r}")
     return bool(pieces) and bool(reply.strip()) and streamed == reply
@@ -1032,10 +1170,13 @@ def _demo_streaming() -> None:
 
     print("streaming: ", end="", flush=True)
     a = agent.Agent(system="Answer in one short sentence.")
-    a.send(
-        "In one short sentence, say hello.",
-        on_delta=lambda ch, t: print(t, end="", flush=True) if ch == "content" else None,
-    )
+    try:
+        a.send(
+            "In one short sentence, say hello.",
+            on_delta=lambda ch, t: print(t, end="", flush=True) if ch == "content" else None,
+        )
+    finally:
+        a.close()
     print()
 
 
