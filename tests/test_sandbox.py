@@ -1,0 +1,110 @@
+"""The sandbox's half of the scratch route (ch-08, hardened for ch-06's spills).
+
+``offload_to_file`` writes a spill under the session's private scratch and hands the
+model a virtual ``scratch://offload/<hash>.txt`` ref that only ``read_file`` resolves.
+A live measurement (iteration 5, task E4: recover a truncated artifact) scored 0/10 —
+the transcripts showed 32 of 32 attempts to reach a spill went through bash (grep,
+ls -F, a python one-liner), none of which can resolve ``scratch://``, so the model
+fabricated an answer by re-deriving it instead. The ref looked like a path and
+behaved like a private ``read_file`` API handle with exactly one consumer.
+
+These tests pin the second adapter: the sandbox carries an optional ``scratch_dir``
+and exposes it to bash as ``$CARBON_SCRATCH_DIR`` — set only when a real scratch dir
+exists, never an empty string (which `Path("")` would normalize to `.`, turning a
+rooted read into one from the process's own cwd instead of an honest unset var).
+"""
+
+from __future__ import annotations
+
+
+def test_local_shell_can_read_a_scratch_artifact_via_the_env_var(tmp_path):
+    """The route the model actually reaches for. 32 of 32 accesses in iteration 5's
+    confirmation used bash; none could resolve scratch://, so recovery was 0/10."""
+    from harness.sandbox import Sandbox
+
+    scratch = tmp_path / "scratch"
+    (scratch / "offload").mkdir(parents=True)
+    (scratch / "offload" / "ab12.txt").write_text("NEEDLE-7F3A\n")
+    sb = Sandbox(trusted=True, prefer_docker=False, scratch_dir=scratch)
+    r = sb.run('grep NEEDLE "$CARBON_SCRATCH_DIR/offload/ab12.txt"', workdir=str(tmp_path))
+    assert r.exit_code == 0 and "NEEDLE-7F3A" in r.stdout
+
+
+def test_untrusted_local_shell_also_gets_the_scratch_route(tmp_path):
+    """The scrubbed env drops host secrets but must still carry this var, or the
+    route exists only for trusted wiring and silently vanishes elsewhere."""
+    from harness.sandbox import Sandbox
+
+    scratch = tmp_path / "scratch"
+    (scratch / "offload").mkdir(parents=True)
+    (scratch / "offload" / "cd34.txt").write_text("NEEDLE-9B1C\n")
+    sb = Sandbox(trusted=False, prefer_docker=False, scratch_dir=scratch)
+    r = sb.run('cat "$CARBON_SCRATCH_DIR/offload/cd34.txt"', workdir=str(tmp_path))
+    assert "NEEDLE-9B1C" in r.stdout
+
+
+def test_no_scratch_configured_leaves_the_var_unset_not_empty(tmp_path):
+    """An empty CARBON_SCRATCH_DIR expands to "" and `cat "/offload/x"` reads from
+    the filesystem root. Unset is the honest state."""
+    from harness.sandbox import Sandbox
+
+    sb = Sandbox(trusted=True, prefer_docker=False)
+    r = sb.run('echo "[${CARBON_SCRATCH_DIR-UNSET}]"', workdir=str(tmp_path))
+    assert "[UNSET]" in r.stdout
+
+
+def test_docker_backend_mounts_scratch_read_only_at_a_fixed_path(monkeypatch):
+    """Docker gets a FIXED container-side mount (``/carbon-scratch``): the container
+    path is stable and says nothing about the host, unlike the local backend where
+    the real path is the only option. Read-only on purpose — a container that could
+    rewrite a spill could forge what the harness later attributes it wrote. Asserts
+    the constructed argv directly rather than requiring a live docker daemon, which
+    may not be running in this environment."""
+    import subprocess
+
+    from harness.sandbox import DOCKER_SCRATCH_MOUNT, SCRATCH_ENV_VAR, Sandbox
+
+    captured: dict = {}
+
+    def fake_run(argv, **kwargs):
+        captured["argv"] = argv
+        return subprocess.CompletedProcess(argv, 0, stdout="ok\n", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    # _run_docker takes no path through `_docker_up`'s live probe — called directly,
+    # exactly like `run()` calls it once the daemon is confirmed up — so no live
+    # daemon is needed to check what argv this backend constructs.
+    sb = Sandbox(trusted=False, prefer_docker=True, scratch_dir="/host/session-42/scratch")
+    sb._run_docker("echo ok", workdir=None)
+
+    argv = captured["argv"]
+    # The scratch bind-mount: host path, fixed container path, read-only.
+    assert f"/host/session-42/scratch:{DOCKER_SCRATCH_MOUNT}:ro" in argv
+    assert f"{SCRATCH_ENV_VAR}={DOCKER_SCRATCH_MOUNT}" in argv
+    # The model must never see the host path — only the fixed mount name travels via -e.
+    assert not any(str(a).startswith(SCRATCH_ENV_VAR) and "/host/" in str(a) for a in argv)
+
+
+def test_docker_backend_omits_scratch_mount_when_no_scratch_configured(monkeypatch):
+    """No scratch_dir → no mount, no env var — mirrors the local-path unset test, on
+    the docker path. A stray ``-e CARBON_SCRATCH_DIR=`` with no mount behind it would
+    be worse than nothing: a name that resolves to a directory that isn't there."""
+    import subprocess
+
+    from harness.sandbox import DOCKER_SCRATCH_MOUNT, SCRATCH_ENV_VAR, Sandbox
+
+    captured: dict = {}
+
+    def fake_run(argv, **kwargs):
+        captured["argv"] = argv
+        return subprocess.CompletedProcess(argv, 0, stdout="ok\n", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    sb = Sandbox(trusted=False, prefer_docker=True)  # no scratch_dir
+    sb._run_docker("echo ok", workdir=None)
+
+    argv = captured["argv"]
+    assert DOCKER_SCRATCH_MOUNT not in " ".join(argv)
+    assert not any(str(a).startswith(f"{SCRATCH_ENV_VAR}=") for a in argv)

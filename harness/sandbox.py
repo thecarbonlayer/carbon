@@ -37,11 +37,29 @@ import subprocess
 import tempfile
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 
 from harness.tools import Tool
 
 # Minimal environment handed to sandboxed commands — note the absence of secrets.
 _SCRUBBED_ENV = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LC_ALL": "C"}
+# The shell's route into the session's scratch (harness/limits.py's ``shell_ref``
+# builds the same name into text the model reads). A fixed mount under Docker — the
+# container path is stable and says nothing about the host — the real path under
+# local execution, where there is no mount namespace to hide behind. Either way the
+# MODEL only ever sees the variable's NAME, `$CARBON_SCRATCH_DIR/offload/<file>`, so
+# no host path reaches a prompt or a stored transcript. Defined here, not in
+# limits.py: this module imports nothing from the chapters above it (see the module
+# docstring), so a sandbox-side constant is what limits.py reaches for, never the
+# reverse — and limits.py does so with a deferred import (see ``shell_ref``), because
+# this module imports ``harness.tools``, which imports ``harness.limits`` for
+# ``SCRATCH_SCHEME``; a module-level import back here would close that into a real
+# three-module cycle, order-dependent on which of the three a caller happens to touch
+# first (verified: the entry point that breaks it is ``import harness.tools`` first,
+# since ``harness.tools`` pauses on this exact import line before its own ``Tool``
+# class is defined, and this module then asks the still-loading tools module for it).
+SCRATCH_ENV_VAR = "CARBON_SCRATCH_DIR"
+DOCKER_SCRATCH_MOUNT = "/carbon-scratch"
 # A blunt ceiling on what one command hands back, set well above anything real, and
 # deliberately not a second truncation door: applying the agent's policy here re-cut
 # text the agent's own door cuts again, and under a strategy that WRITES it spilled a
@@ -90,6 +108,7 @@ class Sandbox:
         timeout: float = 15.0,
         prefer_docker: bool = True,
         trusted: bool = False,
+        scratch_dir: str | Path | None = None,
     ) -> None:
         self.image = image
         self.timeout = timeout
@@ -98,6 +117,11 @@ class Sandbox:
         # For a coding agent working on your own project running your own test
         # command — the approval gate is the control, not network-none isolation.
         self.trusted = trusted
+        # Falsy check, not `is not None`: an empty string is not a real location, and
+        # `Path("")` normalizes to `.` — wrapping it here would turn "no scratch
+        # configured" into "the process's own cwd," which is not what an empty value
+        # means. Normalized once, here, so every reader downstream sees Path-or-None.
+        self.scratch_dir = Path(scratch_dir) if scratch_dir else None
         self._docker: bool | None = None
 
     def _docker_up(self) -> bool:
@@ -136,6 +160,22 @@ class Sandbox:
         # Hardened: no network, non-root, capabilities dropped, writable only in /work.
         # /work is a throwaway tmpfs unless a workspace is bind-mounted.
         work = ["-v", f"{workdir}:/work"] if workdir else ["--tmpfs", "/work:rw,size=16m"]
+        # Read-only on purpose, unlike /work: the spill is evidence to be read, and a
+        # container that could rewrite it could forge what the harness later
+        # attributes to it. Omitted entirely (no mount, no env var) when there is no
+        # real scratch dir — a stray `-e CARBON_SCRATCH_DIR=` naming a mount that was
+        # never made would be worse than an unset var: a name that resolves to
+        # nothing, instead of an honestly absent one.
+        scratch = (
+            [
+                "-v",
+                f"{self.scratch_dir}:{DOCKER_SCRATCH_MOUNT}:ro",
+                "-e",
+                f"{SCRATCH_ENV_VAR}={DOCKER_SCRATCH_MOUNT}",
+            ]
+            if self.scratch_dir is not None
+            else []
+        )
         name = f"agent-sbx-{uuid.uuid4().hex[:12]}"  # so a timeout can kill the container
         argv = [
             "docker", "run", "--rm",
@@ -147,6 +187,7 @@ class Sandbox:
             "--pids-limit", "128",
             "--read-only",
             *work,
+            *scratch,
             "-w", "/work",
             self.image,
             "sh", "-c", command,
@@ -165,8 +206,16 @@ class Sandbox:
         # else a fresh throwaway dir. (network is NOT isolated here — that needs Docker.)
         cwd = workdir or tempfile.mkdtemp(prefix="sandbox-")
         # trusted → the real environment (your test runner needs uv/PATH/deps);
-        # otherwise the scrubbed env (untrusted code sees no host secrets).
+        # otherwise the scrubbed env (untrusted code sees no host secrets). Either
+        # way the scratch var rides along below — the route it advertises is not a
+        # secret, and withholding it from untrusted code would make the route work
+        # only for trusted wiring and silently vanish everywhere else.
         env = os.environ.copy() if self.trusted else dict(_SCRUBBED_ENV, HOME=cwd, TMPDIR=cwd)
+        if self.scratch_dir is not None:
+            # Set only when there is a real directory: an empty value would expand to
+            # "" and turn "$CARBON_SCRATCH_DIR/offload/x" into an absolute read from
+            # /. Unset is the honest state for "no scratch configured."
+            env[SCRATCH_ENV_VAR] = str(self.scratch_dir)
         backend = "trusted" if self.trusted else "local"
         # Own process group (start_new_session) so a timeout kills the whole tree,
         # including any backgrounded descendants — not just the immediate shell.

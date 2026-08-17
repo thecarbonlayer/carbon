@@ -42,6 +42,7 @@ from harness.limits import (
     MAX_FOOTER_CHARS,
     MAX_OFFLOAD_FILES,
     SCRATCH_SCHEME,
+    shell_ref,
     spill_ref,
     strategy_names,
     truncate,
@@ -121,10 +122,12 @@ def test_footer_reports_lines_and_names_the_way_back_in(tmp_path):
     """Chars for the excerpt, LINES for read_file that pages the file back in — two
     different units, and the line count is what turns into a page range.
 
-    Only read_file is offered. The old second route (``search_text``, spelled out
-    with its own ``pattern``) walked the workspace tree to reach a spill sitting
-    inside it; a virtual ``scratch://`` ref has no workspace path for an undirected
-    walk to land on, so there is exactly one way back in now.
+    Two routes are offered, one per consumer. The old second route (``search_text``,
+    spelled out with its own ``pattern``) walked the workspace tree to reach a spill
+    sitting inside it; a virtual ``scratch://`` ref has no workspace path for an
+    undirected walk to land on. What replaces it is not another workspace-rooted
+    route but a shell one — measured necessary when iteration 5 showed 32 of 32
+    recovery attempts went through bash, none of which can resolve ``scratch://``.
 
     No range is computed for the first page. That mechanism (57 lines of it) was
     defending against a suggested page whose result came back over budget and spilled
@@ -135,10 +138,13 @@ def test_footer_reports_lines_and_names_the_way_back_in(tmp_path):
     policy = TruncationPolicy("offload_to_file", 1000, 0.5)
     out = truncate_tool_result(text, policy, scratch_dir=tmp_path)
 
-    ref = spill_ref(_spills(tmp_path)[0].name)
+    name = _spills(tmp_path)[0].name
+    ref = spill_ref(name)
+    shell = shell_ref(name)
     assert f"[Showing 1000 of {len(text)} chars. Full output (300 lines): {ref} — " in out
     assert str(tmp_path) not in out  # never an absolute host path in model-visible text
     assert f"read_file(path='{ref}', start_line=1, end_line=<n>) to page it" in out
+    assert f"grep -n '<what you need>' \"{shell}\"" in out  # the bash route, unexpanded
     assert not re.search(r"end_line=\d", out), "a computed range is a promise about a page"
 
 
@@ -168,32 +174,46 @@ def test_paging_a_spill_back_in_cannot_spiral_into_another_spill(tmp_path):
     assert "Full output" not in out
 
 
-def test_single_line_output_has_no_call_to_offer_only_the_excerpt(tmp_path):
-    """read_file pages by line; one 600-char line has no pages to offer it. The
-    inline excerpt already carries this line's own head and tail — the same cut
-    every strategy makes — so there is nothing a call could recover that isn't
-    already sitting in the excerpt. The honest route names no call at all, just a
-    plain instruction to try again with less; the footer's header still names the
-    file, even though nothing points back at it."""
+def test_single_line_output_offers_a_shell_slice_route(tmp_path):
+    """read_file pages by LINE; one 600-char line has no line boundary inside it for
+    read_file's start_line/end_line to page to — that part hasn't changed. What has
+    is the old conclusion drawn from it: iteration 5's own single-line finding named
+    this exact case (task E4 scored 0/10 recovering a truncated artifact), and a
+    shell can slice into the middle of one long line by CHARACTER even though
+    read_file structurally cannot. So the route is not silence any more — read_file
+    is still offered (it returns the line whole, which is sometimes exactly enough),
+    and a shell cut is offered beside it for reaching the middle."""
     out = truncate_tool_result("x" * 600, _POLICY, scratch_dir=tmp_path)
-    ref = spill_ref(_spills(tmp_path)[0].name)
+    name = _spills(tmp_path)[0].name
+    ref = spill_ref(name)
+    shell = shell_ref(name)
     # Copied verbatim from harness/limits.py::_route's line_count <= 1 branch —
     # retyping this by hand is exactly how it drifted out of sync last round.
     expected_route = (
-        "one long line, so line paging cannot reach into it; the inline excerpt "
-        "already shows its head and tail — rerun the command with narrower "
-        "output if the middle is needed"
+        f"one long line: read_file(path='{ref}') returns it whole, or slice it in "
+        f'a shell, e.g. cut -c1-4000 "{shell}"'
     )
     footer_line = out.splitlines()[-1]
     route_part = footer_line.split(" — ", 1)[1].rstrip("]")  # text after ref, before ']'
 
     assert "Full output (1 lines): " in out
-    assert ref in out  # the file is still named, even with no route back to it
+    assert ref in out
     assert route_part == expected_route
     assert "search_text(" not in out
-    assert "sed -n" not in out
-    assert "read_file(" not in route_part
-    assert "continuation hint" not in route_part
+    assert "start_line" not in route_part, "no line range: there is only one line"
+    assert str(tmp_path) not in out  # the shell route names the var, never the host path
+
+
+def test_footer_advertises_both_routes_and_no_host_path(tmp_path):
+    """The contract this task adds, pinned directly: a footer names a call for each
+    consumer that reaches for a spill — read_file (the only route before this task)
+    and now a shell one — and never the host path either route expands to."""
+    out = truncate_tool_result(
+        "x" * 9000, TruncationPolicy("offload_to_file", 4000, 0.3), scratch_dir=tmp_path
+    )
+    assert "scratch://offload/" in out, "read_file route"
+    assert "$CARBON_SCRATCH_DIR/offload/" in out, "shell route"
+    assert str(tmp_path) not in out, "the expansion must never enter the transcript"
 
 
 def test_the_footer_never_outgrows_the_bound_two_other_modules_size_from(tmp_path):
@@ -203,14 +223,18 @@ def test_the_footer_never_outgrows_the_bound_two_other_modules_size_from(tmp_pat
     choice does not read as a door-control regression). Both used to carry their own
     hand-kept literal, and the test that pinned the writer to them was deleted with the
     provenance recognizer — leaving the numbers to drift against wording nobody
-    re-measured. Measured here against the widest thing this writer can emit."""
+    re-measured. Measured here against the widest thing this writer can emit —
+    now two routes (``read_file`` and a shell one) rather than one, since a footer
+    that only advertised the first left every bash-only recovery attempt with
+    nothing to call (iteration 5: 32 of 32 attempts, 0/10 on task E4)."""
     from harness.agent import SHRINK_TAIL_CHARS
     from harness.limits import _footer
     from tasks.checks import _ceiling
 
     ref = spill_ref("f" * 16 + ".txt")
+    shell = shell_ref("f" * 16 + ".txt")
     widest = max(
-        len(_footer(ref, shown=10**10, total=10**10, lines=lines, cut_upstream=cut))
+        len(_footer(ref, shell, shown=10**10, total=10**10, lines=lines, cut_upstream=cut))
         for lines in (1, 10**10)  # both shapes: the single line and the paging case
         for cut in (False, True)  # both claims: "Full output" and the downgrade
     )
@@ -382,8 +406,12 @@ def test_a_result_that_merely_ends_in_a_footer_is_still_offloaded_and_defanged(t
     assert "log line 0200" in _spills(tmp_path)[0].read_text()  # written, middle and all
     assert _FORGED.strip() not in out  # never handed over verbatim …
     assert "[quoted tool output: Showing 9 of 9 chars." in out  # … only as the quote it is
-    assert out.splitlines()[-1].endswith("to page it]")  # ours has the last word
-    assert len(out) <= 1000 + 400
+    shell = shell_ref(_spills(tmp_path)[0].name)
+    assert out.splitlines()[-1].endswith(f'"{shell}"]')  # ours has the last word
+    # Budget, plus the marker every over-budget cut carries, plus the widest footer
+    # this door can write — derived from the same bound the door itself is measured
+    # against, not a hand-fitted slack that goes stale the moment the footer grows.
+    assert len(out) <= 1000 + MAX_FOOTER_CHARS + 60
 
 
 def test_our_own_footer_coming_back_around_is_quoted_not_obeyed(tmp_path):

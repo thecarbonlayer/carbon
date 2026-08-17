@@ -60,6 +60,34 @@ def spill_ref(filename: str) -> str:
     return f"{SCRATCH_SCHEME}{_OFFLOAD_DIRNAME}/{filename}"
 
 
+def shell_ref(filename: str) -> str:
+    """The bash route to the same artifact, as an UNEXPANDED variable reference.
+
+    `scratch://` is carbon's internal identifier and only `read_file` resolves it.
+    Iteration 5 measured what that costs: every one of the model's 32 attempts to
+    reach a spill went through bash — grep, ls, a python one-liner — and every one
+    failed, after which it fabricated the answer by re-deriving it. An identifier
+    that looks like a path but is only honoured by a single tool is a private API
+    handle wearing a path's clothes. Both consumers get an adapter.
+
+    The variable's NAME is baked into this module (below); its value is set by
+    ``harness.sandbox`` on the ``Sandbox`` that actually runs the command, so what
+    lands in the transcript is always the name, never a host path.
+    """
+    # Deferred, not module-level: this module is imported BY harness.sandbox's own
+    # dependency chain (sandbox -> tools -> limits, for SCRATCH_SCHEME), so a
+    # module-level `from harness.sandbox import ...` here would close that into a
+    # real three-module cycle. It would even resolve under some import orders — but
+    # not the one where something imports harness.tools first, since tools.py pauses
+    # on its own `from harness.limits import SCRATCH_SCHEME` line before its `Tool`
+    # class is defined, and this module would then be asking the still-loading tools
+    # module for it. Deferred to call time, every module involved has already
+    # finished loading, regardless of which of the three a caller touches first.
+    from harness.sandbox import SCRATCH_ENV_VAR
+
+    return f"${SCRATCH_ENV_VAR}/{_OFFLOAD_DIRNAME}/{filename}"
+
+
 # Bounded disk. The filename is a content hash, so nothing ever overwrites anything;
 # a long session still spills one file per over-budget result until session close.
 # Keep the newest N — the older a spill is, the less likely anything is still
@@ -147,27 +175,42 @@ _LOOKALIKE_RE = re.compile(r"\[(?=Showing \d+ of \d+ chars\. (?:Full output|Outp
 _UPSTREAM_CUT = "…[truncated "
 # The widest footer this module can write, over the single-line case, the paging
 # case, and every claim, with counts up to ten digits (a 10 GB result — this process
-# could not hold one). Measured at 343 today (the single-line branch is now the
-# widest — it names no call, but its fixed explanation outruns the paging call it
-# replaced). Two consumers size themselves from it: the overflow shrink's tail floor
-# (agent.py) and the accept gate's door-control allowance (tasks/checks.py). A footer
-# that outgrew it would silently cost a pointer in the first and read as a door-control
-# regression in the second, so test_offload_strategy measures this writer against this
-# number rather than anyone re-deriving it by eye.
-MAX_FOOTER_CHARS = 450
+# could not hold one) and a filename at its fixed 20-char width (16 hex + ".txt").
+# Re-measured at 389 today, up from 343: adding the shell route (ch-08's scratch
+# mount) flips which branch is widest — the PAGING case is now it, not the
+# single-line one, because "or search it in a shell, e.g. grep -n '<what you need>'
+# "$CARBON_SCRATCH_DIR/…"" outruns the single-line "or slice it in a shell, e.g. cut
+# -c1-4000 "$CARBON_SCRATCH_DIR/…"" by more than the paging call's own
+# ", start_line=1, end_line=<n>" gave up. Two consumers size themselves from it: the
+# overflow shrink's tail floor (agent.py) and the accept gate's door-control
+# allowance (tasks/checks.py). A footer that outgrew it would silently cost a
+# pointer in the first and read as a door-control regression in the second, so
+# test_offload_strategy measures this writer against this number directly —
+# pinned exactly, not rounded with slack, so the next wording change fails loudly
+# here instead of drifting unnoticed the way this one did.
+MAX_FOOTER_CHARS = 389
 
 
-def _route(line_count: int, ref: str) -> str:
-    """The way back into a multi-line spill; a single line has no route to offer.
+def _route(line_count: int, ref: str, shell: str) -> str:
+    """The way back into a spill, for each of the two tools that can actually reach
+    for one.
 
-    Multi-line spills get read_file paging and nothing else. The old second route
-    (``search_text``, with its own ``pattern`` spelled out) and the old single-line
-    shell slice both depended on a real workspace path a walk or a shell could
-    reach; a virtual ``scratch://`` ref has neither, so both fall away and
-    read_file — which resolves the ref directly — is what is left.
+    Two routes, not one. The old second route (``search_text``, with its own
+    ``pattern`` spelled out) depended on a real workspace path a walk could reach; a
+    virtual ``scratch://`` ref has none, so it fell away and, for one revision,
+    ``read_file`` was what was left — the only call offered, because it is the only
+    tool that resolves the ref. That measured badly: iteration 5's transcripts
+    showed 32 of 32 attempts to recover a spill went through bash (``grep``,
+    ``ls -F``, a python one-liner), none of which can resolve ``scratch://``, and
+    every one failed — task E4 (recover a truncated artifact) scored 0/10. The
+    model reached for the tool it actually had, which this footer did not name. The
+    shell route names it: ``shell_ref`` builds the same file's path as an
+    UNEXPANDED ``$CARBON_SCRATCH_DIR`` reference, so quoting it here is never a
+    host path, only ever the variable's name (harness/sandbox.py sets the value on
+    the ``Sandbox`` that runs the command, not on this text).
 
-    No range is computed for the page. A suggested first page used to be sized
-    against this door so its result could not come back over budget, but
+    No range is computed for the read_file page. A suggested first page used to be
+    sized against this door so its result could not come back over budget, but
     read_file's result carries a continuation hint, and a hint downgrades the
     strategy away from offload (see ``_door``) — so an over-budget page returns an
     excerpt plus "ask for a smaller range", never another spill. That mechanism
@@ -175,23 +218,28 @@ def _route(line_count: int, ref: str) -> str:
     only ever saved the first round trip.
 
     A single line is a different problem, not a smaller one: read_file pages by
-    line, so there is no range inside one line for it to page to, and promising one
-    would just be a route to "no such range". The inline excerpt already carries
-    this line's own head and tail — the same cut every strategy makes — so nothing
-    a call could recover isn't already sitting in the excerpt; the honest answer
-    names no call at all.
+    LINE, so there is no line boundary inside one line for it to page to — a
+    start_line/end_line range would just be a route to "no such range", and that
+    half of the old wording still holds. What no longer holds is the conclusion
+    drawn from it: a shell slices by CHARACTER, so ``cut``/``sed`` can reach the
+    middle of one long line even though read_file structurally cannot. That is the
+    single-line gap iteration 5 named, closed the same way as the multi-line case —
+    by naming the tool that can actually do it, rather than naming no call at all.
     """
     if line_count <= 1:
         return (
-            "one long line, so line paging cannot reach into it; the inline excerpt "
-            "already shows its head and tail — rerun the command with narrower "
-            "output if the middle is needed"
+            f"one long line: read_file(path='{ref}') returns it whole, or slice it in "
+            f'a shell, e.g. cut -c1-4000 "{shell}"'
         )
-    return f"read_file(path='{ref}', start_line=1, end_line=<n>) to page it"
+    return (
+        f"read_file(path='{ref}', start_line=1, end_line=<n>) to page it, "
+        f"or search it in a shell, e.g. grep -n '<what you need>' \"{shell}\""
+    )
 
 
-def _footer(ref: str, *, shown: int, total: int, lines: int, cut_upstream: bool) -> str:
-    """Name the complete copy and hand the model the exact next call to make.
+def _footer(ref: str, shell: str, *, shown: int, total: int, lines: int, cut_upstream: bool) -> str:
+    """Name the complete copy and hand the model the exact next call to make — one
+    for each tool that can reach it (``read_file`` via ``ref``, a shell via ``shell``).
 
     Counts, not text: every number here describes the file on disk, and the widest
     footer this can produce is pinned by ``MAX_FOOTER_CHARS``, which a test measures
@@ -211,7 +259,7 @@ def _footer(ref: str, *, shown: int, total: int, lines: int, cut_upstream: bool)
     )
     return (
         f"\n[Showing {shown} of {total} chars. {claim} ({lines} lines): "
-        f"{ref} — {_route(lines, ref)}]"
+        f"{ref} — {_route(lines, ref, shell)}]"
     )
 
 
@@ -401,8 +449,14 @@ def _offload_to_file(
     # so it cannot push the excerpt past the budget); every other count describes the
     # file, which is what the model is being sent to read.
     complete = text.complete
+    # Same file, same filename — `ref` is `spill_ref(target.name)` (the ONE place a
+    # spill's name becomes a virtual ref; see `_spill`), and `Path(...).name` recovers
+    # that filename back out of it rather than plumbing a second copy through the
+    # return value just for this call.
+    shell = shell_ref(Path(ref).name)
     return excerpt + _footer(
         ref,
+        shell,
         shown=head_chars + tail_chars,
         total=len(complete),
         lines=len(complete.splitlines()),
