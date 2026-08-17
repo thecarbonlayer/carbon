@@ -176,12 +176,28 @@ class Sandbox:
             if self.scratch_dir is not None
             else []
         )
+        # The fixed unprivileged uid below can't read the mount above: a spill is
+        # 0600, owned by the invoking user, and a native Linux host's bind mount
+        # preserves that host uid inside the container (unlike Docker Desktop's macOS
+        # backend, which remaps ownership transparently) — so "nobody" gets EACCES on
+        # its own session's evidence there, even though the same setup works on a Mac.
+        # Relax this only when a scratch dir is actually mounted, and only to the
+        # invoking user's own identity — never to a wider file mode. (harness/
+        # limits.py's `_write_atomically` documents why a wider mode was tried and
+        # reverted: it published complete tool output to every account on the host.)
+        # `hasattr` guards platforms without `os.getuid` (Windows), where this
+        # backend keeps the fixed uid, same as before this change.
+        user = (
+            f"{os.getuid()}:{os.getgid()}"
+            if self.scratch_dir is not None and hasattr(os, "getuid")
+            else "65534:65534"
+        )
         name = f"agent-sbx-{uuid.uuid4().hex[:12]}"  # so a timeout can kill the container
         argv = [
             "docker", "run", "--rm",
             "--name", name,
             "--network", "none",
-            "--user", "65534:65534",
+            "--user", user,
             "--cap-drop", "ALL",
             "--memory", "256m",
             "--pids-limit", "128",

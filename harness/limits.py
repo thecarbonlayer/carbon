@@ -176,18 +176,30 @@ _UPSTREAM_CUT = "…[truncated "
 # The widest footer this module can write, over the single-line case, the paging
 # case, and every claim, with counts up to ten digits (a 10 GB result — this process
 # could not hold one) and a filename at its fixed 20-char width (16 hex + ".txt").
-# Re-measured at 389 today, up from 343: adding the shell route (ch-08's scratch
-# mount) flips which branch is widest — the PAGING case is now it, not the
+#
+# Re-measured at 389 (up from the prior revision's correctly-measured 343): adding
+# the shell route flips which branch is widest — the PAGING case is now it, not the
 # single-line one, because "or search it in a shell, e.g. grep -n '<what you need>'
-# "$CARBON_SCRATCH_DIR/…"" outruns the single-line "or slice it in a shell, e.g. cut
-# -c1-4000 "$CARBON_SCRATCH_DIR/…"" by more than the paging call's own
-# ", start_line=1, end_line=<n>" gave up. Two consumers size themselves from it: the
-# overflow shrink's tail floor (agent.py) and the accept gate's door-control
-# allowance (tasks/checks.py). A footer that outgrew it would silently cost a
-# pointer in the first and read as a door-control regression in the second, so
-# test_offload_strategy measures this writer against this number directly —
-# pinned exactly, not rounded with slack, so the next wording change fails loudly
-# here instead of drifting unnoticed the way this one did.
+# "$CARBON_SCRATCH_DIR/…"" outruns the single-line "or slice it in a shell, e.g.
+# head -c <n> "$CARBON_SCRATCH_DIR/…"" by more than the paging call's own
+# ", start_line=1, end_line=<n>" gave up.
+#
+# Pinned exactly at the measured value, no added headroom — a deliberate choice,
+# not the default. The prior revision's 450-vs-343 gap was ALSO deliberate (a
+# margin chosen on purpose, not a number that had gone stale — re-checked against
+# that revision's own writer and both of its claims held), so this is not "fixing
+# drift"; it is trading that margin away on purpose. Slack is invisible: a future
+# wording change that grows the footer by less than an unused margin passes
+# silently, and only the change that finally crosses the old ceiling shows up as a
+# failure — pinned to whoever last touched this file, not whoever actually grew it.
+# Pinning exactly means every wording change re-measures, immediately, correctly
+# attributed to itself.
+#
+# Two consumers size themselves from it: the overflow shrink's tail floor
+# (agent.py) and the accept gate's door-control allowance (tasks/checks.py). A
+# footer that outgrew it would silently cost a pointer in the first and read as a
+# door-control regression in the second, so test_offload_strategy measures this
+# writer against this number directly rather than anyone re-deriving it by eye.
 MAX_FOOTER_CHARS = 389
 
 
@@ -221,15 +233,27 @@ def _route(line_count: int, ref: str, shell: str) -> str:
     LINE, so there is no line boundary inside one line for it to page to — a
     start_line/end_line range would just be a route to "no such range", and that
     half of the old wording still holds. What no longer holds is the conclusion
-    drawn from it: a shell slices by CHARACTER, so ``cut``/``sed`` can reach the
-    middle of one long line even though read_file structurally cannot. That is the
-    single-line gap iteration 5 named, closed the same way as the multi-line case —
-    by naming the tool that can actually do it, rather than naming no call at all.
+    drawn from it: a shell slices by BYTE, so ``head -c``/``cut``/``dd`` can reach
+    the middle of one long line even though read_file structurally cannot. That is
+    the single-line gap iteration 5 named, closed the same way as the multi-line
+    case — by naming a tool that can actually do it, rather than naming no call at
+    all.
+
+    The byte count is a placeholder (``<n>``), same as ``end_line=<n>`` above it,
+    never a literal figure. An earlier revision wrote ``cut -c1-4000`` — a number
+    with no relationship to THIS call's actual budget, so a small `tool_output`
+    policy could suggest a slice bigger than the door it would re-enter through,
+    spilling a second file to recover from the first. The door has no continuation
+    hint of its own to fall back on here the way a re-submitted read_file page
+    does (see the paragraph above) — the safe number depends on the budget in
+    force *when the model runs the command*, which this footer, written now,
+    cannot see ahead of. Naming no number is the honest version of the same
+    choice already made for the read_file page above.
     """
     if line_count <= 1:
         return (
             f"one long line: read_file(path='{ref}') returns it whole, or slice it in "
-            f'a shell, e.g. cut -c1-4000 "{shell}"'
+            f'a shell, e.g. head -c <n> "{shell}"'
         )
     return (
         f"read_file(path='{ref}', start_line=1, end_line=<n>) to page it, "
@@ -333,8 +357,17 @@ def _write_atomically(target: Path, payload: bytes) -> None:
     shell running as another uid — but the shell the coding wiring actually builds is
     ``Sandbox(trusted=True)``, the same uid, and the chmod overrode the user's umask to
     publish the *complete* tool output (a printenv, a token-bearing log) to every
-    account on the host. Respect the umask; the one route that needs a wider mode
-    doesn't exist here.
+    account on the host. Respect the umask.
+
+    A route that needs a different uid to read this file DOES exist now — ch-08's
+    Docker backend, reading its own session's scratch through a bind mount on a
+    native Linux host, where the mount preserves the host's uid instead of remapping
+    it the way Docker Desktop's macOS backend does. The fix there is still not a
+    wider mode: ``harness/sandbox.py`` runs that one container AS the invoking uid
+    (``--user {uid}:{gid}``, only when a scratch dir is actually mounted) instead of
+    its usual fixed unprivileged one, so the SAME 0600 file that already excludes
+    every other account on the host is exactly what that container needs too. The
+    mode stays put; only the container's borrowed identity moves.
     """
     fd, tmp = tempfile.mkstemp(dir=target.parent, suffix=_PART_SUFFIX)
     part = Path(tmp)

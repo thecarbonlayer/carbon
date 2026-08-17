@@ -59,7 +59,25 @@ def test_docker_backend_mounts_scratch_read_only_at_a_fixed_path(monkeypatch):
     the real path is the only option. Read-only on purpose — a container that could
     rewrite a spill could forge what the harness later attributes it wrote. Asserts
     the constructed argv directly rather than requiring a live docker daemon, which
-    may not be running in this environment."""
+    may not be running in this environment.
+
+    Membership in ``argv`` as a whole is not enough to catch a real placement bug:
+    ``docker run <flags> IMAGE <cmd...>`` treats everything AFTER the image name as
+    the CONTAINER's own command, not a docker flag, so ``-v X -e Y`` sitting past the
+    image is just two inert words handed to ``sh -c`` — the mount silently never
+    happens while a bare ``in argv`` check keeps passing. So this slices to the
+    flags that actually precede the image and asserts membership there instead.
+    (Verified this actually catches that regression: temporarily moving the scratch
+    flags after ``self.image`` in the implementation turns this test red; restoring
+    the correct position turns it green again — see the task report for the
+    mutation evidence.)
+
+    Also covers why ``--user`` changes when a scratch dir is mounted: spills are
+    0600, owned by the invoking user, and a native Linux host's bind mount preserves
+    that host uid inside the container rather than remapping it — so the fixed
+    unprivileged uid this backend otherwise runs as would get EACCES reading its
+    own session's evidence there."""
+    import os
     import subprocess
 
     from harness.sandbox import DOCKER_SCRATCH_MOUNT, SCRATCH_ENV_VAR, Sandbox
@@ -79,17 +97,28 @@ def test_docker_backend_mounts_scratch_read_only_at_a_fixed_path(monkeypatch):
     sb._run_docker("echo ok", workdir=None)
 
     argv = captured["argv"]
+    # Only flags BEFORE the image name are docker-run options; anything after is the
+    # container's own command line — a flag stranded there is not a flag at all.
+    docker_flags = argv[: argv.index(sb.image)]
     # The scratch bind-mount: host path, fixed container path, read-only.
-    assert f"/host/session-42/scratch:{DOCKER_SCRATCH_MOUNT}:ro" in argv
-    assert f"{SCRATCH_ENV_VAR}={DOCKER_SCRATCH_MOUNT}" in argv
+    assert f"/host/session-42/scratch:{DOCKER_SCRATCH_MOUNT}:ro" in docker_flags
+    assert f"{SCRATCH_ENV_VAR}={DOCKER_SCRATCH_MOUNT}" in docker_flags
     # The model must never see the host path — only the fixed mount name travels via -e.
     assert not any(str(a).startswith(SCRATCH_ENV_VAR) and "/host/" in str(a) for a in argv)
+    # With a scratch dir mounted, the container runs as the invoking user — not a
+    # wider file mode — so it can read its own 0600 spill on a native Linux host.
+    assert f"{os.getuid()}:{os.getgid()}" in docker_flags
+    assert "65534:65534" not in docker_flags
 
 
 def test_docker_backend_omits_scratch_mount_when_no_scratch_configured(monkeypatch):
-    """No scratch_dir → no mount, no env var — mirrors the local-path unset test, on
-    the docker path. A stray ``-e CARBON_SCRATCH_DIR=`` with no mount behind it would
-    be worse than nothing: a name that resolves to a directory that isn't there."""
+    """No scratch_dir → no mount, no env var, and the fixed unprivileged uid stays —
+    mirrors the local-path unset test, on the docker path. A stray
+    ``-e CARBON_SCRATCH_DIR=`` with no mount behind it would be worse than nothing: a
+    name that resolves to a directory that isn't there. Likewise, running as the
+    invoking user with nothing mounted for it to read would only widen exposure for
+    no benefit — the identity relaxation is conditioned on the mount, not offered
+    unconditionally."""
     import subprocess
 
     from harness.sandbox import DOCKER_SCRATCH_MOUNT, SCRATCH_ENV_VAR, Sandbox
@@ -106,5 +135,7 @@ def test_docker_backend_omits_scratch_mount_when_no_scratch_configured(monkeypat
     sb._run_docker("echo ok", workdir=None)
 
     argv = captured["argv"]
+    docker_flags = argv[: argv.index(sb.image)]
     assert DOCKER_SCRATCH_MOUNT not in " ".join(argv)
     assert not any(str(a).startswith(f"{SCRATCH_ENV_VAR}=") for a in argv)
+    assert "65534:65534" in docker_flags

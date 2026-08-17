@@ -179,10 +179,17 @@ def test_single_line_output_offers_a_shell_slice_route(tmp_path):
     read_file's start_line/end_line to page to — that part hasn't changed. What has
     is the old conclusion drawn from it: iteration 5's own single-line finding named
     this exact case (task E4 scored 0/10 recovering a truncated artifact), and a
-    shell can slice into the middle of one long line by CHARACTER even though
-    read_file structurally cannot. So the route is not silence any more — read_file
-    is still offered (it returns the line whole, which is sometimes exactly enough),
-    and a shell cut is offered beside it for reaching the middle."""
+    shell can slice into the middle of one long line by BYTE even though read_file
+    structurally cannot. So the route is not silence any more — read_file is still
+    offered (it returns the line whole, which is sometimes exactly enough), and a
+    shell slice is offered beside it for reaching the middle.
+
+    The byte count is a placeholder (``<n>``), same as ``end_line=<n>`` on the
+    multi-line route, never a literal figure — an earlier revision hardcoded
+    ``cut -c1-4000``, a number with no relationship to any particular call's actual
+    budget, so a small ``tool_output`` policy could suggest a slice bigger than the
+    door it would re-enter through and spill a second file recovering from the
+    first."""
     out = truncate_tool_result("x" * 600, _POLICY, scratch_dir=tmp_path)
     name = _spills(tmp_path)[0].name
     ref = spill_ref(name)
@@ -191,7 +198,7 @@ def test_single_line_output_offers_a_shell_slice_route(tmp_path):
     # retyping this by hand is exactly how it drifted out of sync last round.
     expected_route = (
         f"one long line: read_file(path='{ref}') returns it whole, or slice it in "
-        f'a shell, e.g. cut -c1-4000 "{shell}"'
+        f'a shell, e.g. head -c <n> "{shell}"'
     )
     footer_line = out.splitlines()[-1]
     route_part = footer_line.split(" — ", 1)[1].rstrip("]")  # text after ref, before ']'
@@ -202,6 +209,8 @@ def test_single_line_output_offers_a_shell_slice_route(tmp_path):
     assert "search_text(" not in out
     assert "start_line" not in route_part, "no line range: there is only one line"
     assert str(tmp_path) not in out  # the shell route names the var, never the host path
+    assert "head -c <n>" in route_part  # a placeholder, like end_line=<n> above it
+    assert "4000" not in route_part, "no literal byte count tied to no particular budget"
 
 
 def test_footer_advertises_both_routes_and_no_host_path(tmp_path):
