@@ -127,6 +127,40 @@ _PART_SUFFIX = ".part"  # a spill mid-write; only ever named between mkstemp and
 _OURS: set[Path] = set()
 
 
+def forget_spills(scratch_root: str | Path) -> None:
+    """Discard every ``_OURS`` entry that lives under ``scratch_root`` — the
+    bookkeeping half of ending a session, called from an ephemeral
+    ``SessionEnvironment.cleanup()`` (harness/session_env.py) alongside the
+    ``shutil.rmtree`` that removes the directory those entries name.
+
+    Without this, ``_OURS`` only ever grows: it records a Path per spill and never
+    lost one, so a long-lived process (the TUI cycling through ``/new`` sessions, a
+    benchmark fanning out one worker after another) accumulates a permanent entry
+    for every spill any session it ever closed ever made — unbounded for the life
+    of the process, a slow leak with no cap.
+
+    Scoped to ``scratch_root`` rather than a blanket ``_OURS.clear()``: a SHARED
+    ``session_env`` (a fan-out parent's, borrowed by workers that do not own it —
+    ``Agent._owns_env``) may still be referenced elsewhere even after one holder is
+    done with it, and clearing indiscriminately would let a concurrent ``_prune``
+    elsewhere reclaim a file some other holder's transcript still names. Pure
+    in-memory set arithmetic, no filesystem access — this must never be the thing
+    that makes ``cleanup()`` raise (its own contract: "never raises... runs in
+    ``finally`` blocks").
+
+    Callers must gate this on ``durable`` themselves (see ``cleanup()``): a durable
+    session's own earlier spills are named by a transcript that outlives this
+    process (Task 3 — see ``_prune``'s ``durable`` parameter above), so forgetting
+    them here on an ordinary close would reintroduce exactly the bug Task 3 fixed,
+    on the very next reopen's ``_prune``. This function has no way to tell a
+    durable scratch_root from an ephemeral one by the path alone, so it does not
+    try — it always forgets what is asked, unconditionally.
+    """
+    root = Path(scratch_root)
+    stale = {p for p in _OURS if root in p.parents}
+    _OURS.difference_update(stale)
+
+
 def clamp(text: str, max_chars: int = MAX_ITEM_CHARS) -> str:
     """Truncate an item to ``max_chars``, with a marker noting what was dropped."""
     if len(text) <= max_chars:

@@ -68,6 +68,8 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from harness.limits import forget_spills
+
 SCRATCH_PREFIX = "carbon-scratch-"
 SCAVENGE_AGE_S = 24 * 3600
 
@@ -110,10 +112,44 @@ class SessionEnvironment:
         A no-op when ``durable``: that scratch outlives the Agent/process that
         opened it BY DESIGN — it is deleted with the session
         (``delete_session_scratch``), not with whatever happened to call
-        ``cleanup()`` this time."""
+        ``cleanup()`` this time. The early return matters for more than the
+        directory: it also means an ephemeral close never reaches
+        ``forget_spills`` below for a durable scratch — a durable session's own
+        earlier spills are named by a transcript that outlives THIS process (Task
+        3), so forgetting them from ``_OURS`` here would let a later reopen's
+        ``_prune`` reclaim a file that transcript still points at, the exact bug
+        Task 3 fixed. See test_durable_cleanup_does_not_forget_ours_entries."""
         if self.durable:
             return
+        # Bookkeeping half of ending an ephemeral session, alongside the rmtree
+        # below: without this, harness.limits' module-global ``_OURS`` set only
+        # ever grows — one Path per spill, for the rest of the PROCESS's life,
+        # long after the directory it named is gone (Task 4).
+        forget_spills(self.scratch_root)
         shutil.rmtree(self.scratch_root, ignore_errors=True)
+
+
+def _newest_mtime(root: Path) -> float:
+    """The most recent modification time anywhere under ``root``, including ``root``
+    itself.
+
+    A directory's mtime only moves when a DIRECT child is added or removed — writing
+    into an already-existing grandchild (a result landing in ``offload/x.txt`` when
+    ``offload/`` was created earlier in the session) never bumps ``root``'s own mtime
+    again, only ``offload/``'s. Judging staleness from ``root.stat().st_mtime`` alone
+    therefore reads an actively-spilling session as idle the moment the session has
+    simply run longer than ``max_age_s`` — see ``scavenge``. Walking the whole tree
+    and taking the max is what makes "newest write anywhere" the actual signal.
+    Falls back to ``root``'s own mtime when the tree holds nothing else (an empty or
+    just-created scratch, before any child exists to outrank it).
+    """
+    newest = root.stat().st_mtime
+    for child in root.rglob("*"):
+        try:
+            newest = max(newest, child.stat().st_mtime)
+        except OSError:
+            continue  # a child removed mid-walk (another process's concurrent cleanup)
+    return newest
 
 
 def scavenge(max_age_s: float = SCAVENGE_AGE_S) -> int:
@@ -122,6 +158,13 @@ def scavenge(max_age_s: float = SCAVENGE_AGE_S) -> int:
     Opportunistic by design: it runs when the next session starts, so a machine that
     never runs carbon again keeps at most what the OS temp reaper would take anyway.
     Only prefixed, real directories are touched; a same-named symlink is ignored.
+
+    Staleness is judged from the NEWEST mtime anywhere in the tree (``_newest_mtime``),
+    not the root directory's own — a live session whose only recent activity is a
+    write into an already-existing child (``offload/x.txt``) does not bump the root's
+    mtime again, so reading the root alone would reap a session still in use out from
+    under the process using it — see
+    ``test_scavenge_judges_staleness_from_the_newest_write_not_the_roots_own_mtime``.
 
     A durable session's scratch (``local_session_env(..., session=..., sessions_dir=...)``)
     is structurally out of reach here: it lives under ``sessions_dir``, never under
@@ -132,7 +175,7 @@ def scavenge(max_age_s: float = SCAVENGE_AGE_S) -> int:
     removed = 0
     for p in Path(tempfile.gettempdir()).glob(f"{SCRATCH_PREFIX}*"):
         try:
-            if p.is_dir() and not p.is_symlink() and now - p.stat().st_mtime > max_age_s:
+            if p.is_dir() and not p.is_symlink() and now - _newest_mtime(p) > max_age_s:
                 shutil.rmtree(p, ignore_errors=True)
                 removed += 1
         except OSError:

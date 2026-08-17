@@ -141,8 +141,21 @@ def delegate_tool(
     agents_dir: str = ".",
     policy: Policy | None = None,
     tool_output: TruncationPolicy | None = None,
+    session_env: SessionEnvironment | None = None,
 ) -> Tool:
-    """A tool that lets a main agent delegate a self-contained subtask to a subagent."""
+    """A tool that lets a main agent delegate a self-contained subtask to a subagent.
+
+    ``session_env`` closes the gap ``run_subagent``'s own docstring already
+    describes but this factory used to leave unreached: ``_coding_tools``
+    (harness/agent.py) builds the worker registry it hands to this factory's
+    ``tools=`` from the PARENT's ``scratch_root`` — the only one in scope at that
+    point — so a worker whose OWN session opens fresh (``session_env=None``,
+    the default `run_subagent` falls back to) spills into a DIFFERENT scratch than
+    the one its registry's ``read_file`` resolves against. It cannot read back
+    what it just offloaded, and ``run_subagent``'s own ``finally: close()`` then
+    deletes the only copy. Forwarding the parent's env here — the same one
+    ``tools`` was already built from — is what makes the two agree.
+    """
 
     def delegate(task: str) -> str:
         return run_subagent(
@@ -153,6 +166,7 @@ def delegate_tool(
             agents_dir=agents_dir,
             policy=policy,
             tool_output=tool_output,
+            session_env=session_env,
         )
 
     return Tool(
@@ -175,10 +189,15 @@ def fan_out_tool(
     agents_dir: str = ".",
     policy: Policy | None = None,
     tool_output: TruncationPolicy | None = None,
+    session_env: SessionEnvironment | None = None,
 ) -> Tool:
     """A tool that lets the model split work into independent subtasks and run them
     in parallel, each in its own isolated subagent. Results come back labeled and
-    ordered, so the model can read them as one block."""
+    ordered, so the model can read them as one block.
+
+    ``session_env`` — see ``delegate_tool``'s docstring; the same gap, the same fix,
+    forwarded here to ``fan_out`` instead of ``run_subagent`` (``fan_out`` shares it
+    unchanged across every worker it spawns — one parent scratch, one inventory)."""
 
     def fan_out_call(tasks: list[str]) -> str:
         # The model sometimes passes a JSON string instead of a list; iterating that
@@ -193,6 +212,7 @@ def fan_out_tool(
             agents_dir=agents_dir,
             policy=policy,
             tool_output=tool_output,
+            session_env=session_env,
         )
         return "\n\n".join(
             f"[subtask {i}] {task}\n{result}"

@@ -65,6 +65,36 @@ def test_scavenge_removes_only_expired_prefixed_dirs(tmp_path):
             stale.rmdir()
 
 
+def test_scavenge_judges_staleness_from_the_newest_write_not_the_roots_own_mtime(tmp_path):
+    """A live session idling past ``max_age_s`` with its only recent activity one
+    level down (a write into an already-existing ``offload/`` child) must not be
+    reaped: creating ``offload/`` itself bumps the scratch ROOT's mtime once (adding
+    a direct child touches its parent directory), but a file written *inside*
+    ``offload/`` afterward bumps only ``offload/``'s own mtime, never the root's
+    again. Judging staleness from the root's mtime alone — what ``p.stat().st_mtime``
+    on the glob hit does today — reads a session that is actively spilling results
+    as abandoned the moment it has run longer than ``max_age_s``, and the next
+    ``carbon`` process to start ``scavenge()``s it out from under the one still
+    using it.
+
+    Reproduced with a real clock, not a backdated ``os.utime`` (the other scavenge
+    test ages a dir artificially to prove the *removal* half works) — this proves
+    the *survival* half, so the root's mtime is left exactly as directory creation
+    left it, and only the sleep + later write make it stale by wall-clock time.
+    """
+    env = local_session_env(tmp_path)
+    try:
+        (env.scratch_root / "offload").mkdir()  # bumps the root's mtime once, now
+        time.sleep(1.2)  # both the root and offload/ itself age past max_age_s=1
+        (env.scratch_root / "offload" / "x.txt").write_text("still alive")  # fresh, one level down
+        removed = scavenge(max_age_s=1)
+        assert removed == 0
+        assert env.scratch_root.exists(), "a live session's newest write must save it from scavenge"
+        assert (env.scratch_root / "offload" / "x.txt").read_text() == "still alive"
+    finally:
+        env.cleanup()
+
+
 def test_metadata_names_kind_and_storage_policy(tmp_path):
     env = local_session_env(tmp_path)
     try:

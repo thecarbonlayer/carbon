@@ -1130,6 +1130,297 @@ def test_a_workers_own_default_registry_resolves_its_own_spill_within_the_call(t
     assert expected.startswith("log.txt:1: needle-line-0000")  # sanity: head is where expected
 
 
+# --- the model-facing factories (Task 4) ----------------------------------------
+# The three tests above all drive `run_subagent` directly, with every parameter —
+# including `session_env` — spelled out by hand. That is exactly why a gap in the
+# model-facing factories `delegate_tool`/`fan_out_tool` (harness/subagents.py, the
+# "delegate"/"fan_out" tools `_coding_tools` actually registers) survived: both
+# closures forwarded every OTHER `run_subagent`/`fan_out` parameter except
+# `session_env`, so a real delegated worker always opened its OWN fresh scratch
+# while the registry handed to it (built the way `_coding_tools`' `worker_tools()`
+# builds it — bound to the PARENT's `scratch_root`, since that is the only scratch
+# in scope when the registry is built) resolves `read_file` against the PARENT's
+# scratch instead. These drive the actual `Tool` object's `.func`, never
+# `run_subagent`/`fan_out` directly, so a factory that silently drops the parameter
+# cannot hide behind a test that supplies it by hand.
+def _big_search_hit_registry_and_expectation(root: Path) -> str:
+    """Seed ``root`` with enough NEEDLE hits to exceed the small offload budget the
+    tests below use, and return what a direct (undoored) ``search_text`` call finds
+    — the same setup ``test_a_workers_own_default_registry_resolves_its_own_spill_
+    within_the_call`` uses, and the same reason: ``read_file`` is unusable for the
+    FIRST call here, since ``Agent._run`` always sets a ``continuation_hint`` for
+    it (``"Use start_line/end_line..."``), and the door downgrades ``offload_to_file``
+    to ``head_tail`` whenever a hint is present (``_door``, harness/limits.py) — a
+    whole-file read is already re-openable by range, so it is never itself spilled.
+    ``search_text`` carries no such hint, so it is the one default-registry tool
+    that actually exercises the offload path on its FIRST call.
+    """
+    lines = [f"needle-line-{i:04d}: NEEDLE marker text here" for i in range(150)]
+    (root / "log.txt").write_text("\n".join(lines))
+    from harness.tools import search_text
+
+    expected = search_text("NEEDLE", root=root)
+    assert len(expected) > 300, "test setup must actually exceed the door's budget"
+    return expected
+
+
+def test_delegate_tool_forwards_session_env_so_a_worker_can_read_its_own_spill(tmp_path):
+    from harness.session_env import local_session_env
+    from harness.subagents import delegate_tool
+    from harness.tools import default_tools
+
+    root = tmp_path / "ws"
+    root.mkdir()
+    expected = _big_search_hit_registry_and_expectation(root)
+
+    parent_env = local_session_env(tmp_path)
+    try:
+        # Built the way _coding_tools' worker_tools() builds it: bound to the
+        # PARENT's scratch_root, before the worker (or its own session_env) exists.
+        workers = default_tools(str(root), scratch_root=parent_env.scratch_root)
+
+        seen: list[list[dict]] = []
+
+        def responder(messages, **kwargs):
+            seen.append(list(messages))
+            if len(seen) == 1:
+                return LLMResponse(
+                    content="",
+                    tool_calls=[
+                        {
+                            "id": "d1",
+                            "function": {
+                                "name": "search_text",
+                                "arguments": json.dumps({"query": "NEEDLE"}),
+                            },
+                        }
+                    ],
+                )
+            if len(seen) == 2:
+                footer = str(messages[-1]["content"])
+                refs = set(
+                    re.findall(re.escape(SCRATCH_SCHEME) + r"offload/[0-9a-f]{16}\.txt", footer)
+                )
+                assert len(refs) == 1, f"footer should name exactly one file, consistently: {refs}"
+                ref = refs.pop()
+                return LLMResponse(
+                    content="",
+                    tool_calls=[
+                        {
+                            "id": "r1",
+                            "function": {
+                                "name": "read_file",
+                                "arguments": json.dumps({"path": ref}),
+                            },
+                        }
+                    ],
+                )
+            return LLMResponse(content="done")
+
+        tool = delegate_tool(
+            provider=Provider("fake://delegate-session-env", "fake", responder=responder),
+            tools=workers,
+            agents_dir=str(root),
+            tool_output=TruncationPolicy("offload_to_file", 300, 0.5),
+            session_env=parent_env,
+        )
+        tool.func(task="search for NEEDLE, then read back whatever the footer points at")
+
+        # Keyed by tool_call_id, not `next(... role == "tool")`: the transcript by
+        # now holds TWO tool messages (search_text's own offloaded excerpt, id
+        # "d1", then read_file's readback, id "r1") — `next()` over an unfiltered
+        # role check would silently grab the FIRST one and pass vacuously, since
+        # search_text's own excerpt already contains the same head/tail markers
+        # this assertion looks for. Only "r1" is the call under test.
+        tool_results = {
+            m["tool_call_id"]: m["content"] for m in seen[-1] if m.get("role") == "tool"
+        }
+        readback = tool_results["r1"]
+        # Not exact equality: read_file's own (whole-file, no start_line/end_line)
+        # result re-enters the same small door and gets its own head_tail downgrade
+        # — correct, already-pinned behavior, and orthogonal to what this test is
+        # about (see test_a_workers_own_default_registry_resolves_its_own_spill_
+        # within_the_call). What matters is that real content from the actual
+        # spilled file came back at all, from both ends of it, rather than the
+        # "no scratch storage in this context" / "no such file" a worker resolving
+        # against the wrong scratch would produce.
+        assert not readback.startswith("error:"), readback
+        assert "needle-line-0000: NEEDLE marker text here" in readback  # the file's head
+        assert "more than 100 hits; narrow it" in readback  # the file's tail
+        assert expected.startswith("log.txt:1: needle-line-0000")  # sanity: head is where expected
+    finally:
+        parent_env.cleanup()
+
+
+def test_fan_out_tool_forwards_session_env_so_a_worker_can_read_its_own_spill(tmp_path):
+    """The same gap as the ``delegate_tool`` test above, for the OTHER model-facing
+    factory. A single task is enough to pin the wiring — fan_out's own order
+    preservation and concurrency are a different, already-covered concern
+    (tests/episodes/test_ch11.py's ``test_fan_out_preserves_order``)."""
+    from harness.session_env import local_session_env
+    from harness.subagents import fan_out_tool
+    from harness.tools import default_tools
+
+    root = tmp_path / "ws"
+    root.mkdir()
+    expected = _big_search_hit_registry_and_expectation(root)
+
+    parent_env = local_session_env(tmp_path)
+    try:
+        workers = default_tools(str(root), scratch_root=parent_env.scratch_root)
+
+        seen: list[list[dict]] = []
+
+        def responder(messages, **kwargs):
+            seen.append(list(messages))
+            if len(seen) == 1:
+                return LLMResponse(
+                    content="",
+                    tool_calls=[
+                        {
+                            "id": "d1",
+                            "function": {
+                                "name": "search_text",
+                                "arguments": json.dumps({"query": "NEEDLE"}),
+                            },
+                        }
+                    ],
+                )
+            if len(seen) == 2:
+                footer = str(messages[-1]["content"])
+                refs = set(
+                    re.findall(re.escape(SCRATCH_SCHEME) + r"offload/[0-9a-f]{16}\.txt", footer)
+                )
+                assert len(refs) == 1, f"footer should name exactly one file, consistently: {refs}"
+                ref = refs.pop()
+                return LLMResponse(
+                    content="",
+                    tool_calls=[
+                        {
+                            "id": "r1",
+                            "function": {
+                                "name": "read_file",
+                                "arguments": json.dumps({"path": ref}),
+                            },
+                        }
+                    ],
+                )
+            return LLMResponse(content="done")
+
+        tool = fan_out_tool(
+            provider=Provider("fake://fan-out-session-env", "fake", responder=responder),
+            tools=workers,
+            agents_dir=str(root),
+            tool_output=TruncationPolicy("offload_to_file", 300, 0.5),
+            session_env=parent_env,
+        )
+        tool.func(tasks=["search for NEEDLE, then read back whatever the footer points at"])
+
+        # See the delegate_tool test above: keyed by tool_call_id, not a bare
+        # `next(... role == "tool")`, which would silently grab search_text's own
+        # offloaded excerpt (id "d1") instead of read_file's readback (id "r1").
+        tool_results = {
+            m["tool_call_id"]: m["content"] for m in seen[-1] if m.get("role") == "tool"
+        }
+        readback = tool_results["r1"]
+        assert not readback.startswith("error:"), readback
+        assert "needle-line-0000: NEEDLE marker text here" in readback
+        assert "more than 100 hits; narrow it" in readback
+        assert expected.startswith("log.txt:1: needle-line-0000")
+    finally:
+        parent_env.cleanup()
+
+
+# --- the Orchestrator seam (Task 4) ----------------------------------------------
+def test_orchestrator_run_threads_scratch_root_into_a_caller_supplied_registry(tmp_path):
+    """``Orchestrator(tools=...)`` — the caller-supplied branch real callers use
+    (``tasks/checks.py``'s ch-10 accept check, ``Orchestrator(tools=default_tools(
+    ws.root)).run(...)``) — builds that registry BEFORE the worker Agent, and its
+    scratch, exist: ``Orchestrator.run()`` is what constructs the worker, deep
+    inside ``.run()``, so the CALLER has no ``scratch_root`` to give
+    ``default_tools()`` in advance. Its ``read_file``, closed over
+    ``scratch_root=None``, can therefore never resolve a ``scratch://`` ref —
+    including one this SAME worker's own oversized tool result is handed, since a
+    worker's own offload always resolves from ``self.session_env``
+    (harness/agent.py), never from the registry it happens to be holding.
+
+    Registers nothing extra — ``default_tools(str(root))`` alone reproduces the
+    real caller's exact shape, ``search_text``'s built-in result included, so the
+    fix is proven against production wiring, not a hand-built stand-in for it. Only
+    the ``self.tools is not None`` branch is broken; the fallback branch
+    (``self.tools is None``) already threads ``scratch_root`` directly at
+    construction and is unchanged here — see harness/orchestrator.py's ``run()``.
+    """
+    from unittest.mock import patch
+
+    from harness.orchestrator import Orchestrator
+    from harness.tools import default_tools
+
+    root = tmp_path / "ws"
+    root.mkdir()
+    expected = _big_search_hit_registry_and_expectation(root)
+
+    registry = default_tools(str(root))  # exactly tasks/checks.py's real call — no scratch_root
+
+    calls = {"n": 0}
+    captured: dict = {}
+
+    def fake_chat(messages, **kwargs):
+        first = messages[0].get("content", "") if messages else ""
+        if "planner" in first.lower():
+            return LLMResponse(content='["search then read back"]')
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return LLMResponse(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "d1",
+                        "function": {
+                            "name": "search_text",
+                            "arguments": json.dumps({"query": "NEEDLE"}),
+                        },
+                    }
+                ],
+            )
+        if calls["n"] == 2:
+            footer = str(messages[-1]["content"])
+            refs = set(re.findall(re.escape(SCRATCH_SCHEME) + r"offload/[0-9a-f]{16}\.txt", footer))
+            assert len(refs) == 1, f"footer should name exactly one file, consistently: {refs}"
+            ref = refs.pop()
+            return LLMResponse(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "r1",
+                        "function": {"name": "read_file", "arguments": json.dumps({"path": ref})},
+                    }
+                ],
+            )
+        # calls["n"] == 3: the read_file readback is now the last message.
+        captured["readback"] = str(messages[-1]["content"])
+        return LLMResponse(content="done")
+
+    with (
+        patch("harness.orchestrator.chat", side_effect=fake_chat),
+        patch("harness.agent.chat", side_effect=fake_chat),
+        patch(
+            "harness.agent.CONFIG",
+            replace(CONFIG, tool_output=TruncationPolicy("offload_to_file", 300, 0.5)),
+        ),
+    ):
+        Orchestrator(tools=registry).run("search then read back")
+
+    assert "readback" in captured, "setup: the scripted turn must have reached its final call"
+    readback = captured["readback"]
+    # Not exact equality — see the two model-facing-factory tests above for why a
+    # read_file readback re-enters the door and gets its own head_tail downgrade.
+    assert not readback.startswith("error:"), readback
+    assert "needle-line-0000: NEEDLE marker text here" in readback  # the file's head
+    assert "more than 100 hits; narrow it" in readback  # the file's tail
+    assert expected.startswith("log.txt:1: needle-line-0000")  # sanity: head is where expected
+
+
 def test_a_workers_default_tools_are_rooted_at_agents_dir_not_the_process_cwd(tmp_path):
     """A worker given no registry got one rooted at the process's cwd while
     ``agents_dir`` — the tree it was actually handed to read — went unseen; a bare
@@ -1582,3 +1873,64 @@ def test_durable_prune_still_sweeps_abandoned_part_files_but_spares_txt_strays(t
 
     assert not dead.exists(), ".part temps must still be swept even when durable"
     assert stray.exists(), "but *.txt reclaim must be skipped when durable"
+
+
+# --- _OURS bookkeeping outlives the session that made it (Task 4) ---------------
+# `_OURS` is a module-level, per-PROCESS set. `_prune` needs it to grow — a file it
+# names must never be reclaimed while a live transcript still points at it — but
+# nothing before Task 4 ever made it SHRINK: `SessionEnvironment.cleanup()`
+# (harness/session_env.py) only ever `shutil.rmtree`s the directory, never touches
+# this set. A long-lived process (the TUI cycling through /new sessions, a
+# benchmark fanning out one worker after another) accumulates one permanent entry
+# per spill for the rest of the process's life, whether or not the session that
+# made it is still open — a slow memory leak with no cap, only bounded by how long
+# the process happens to run.
+def test_cleanup_forgets_this_sessions_ours_entries(tmp_path):
+    """An ephemeral session's ``cleanup()`` must forget its own spills from
+    ``_OURS``, not just remove the directory they lived in.
+
+    Scoped to what THIS test's own session spilled (``spilled``), not a blanket
+    "``_OURS`` must be empty" — the suite runs many tests in one process, and
+    ``_OURS`` is shared, module-level state other tests are free to still be using
+    when this one runs (before or after, whichever pytest picks).
+    """
+    import harness.limits as limits_mod
+    from harness.session_env import local_session_env
+
+    env = local_session_env(tmp_path)
+    truncate_tool_result("z" * 500, _POLICY, scratch_dir=env.scratch_root)
+    spilled = _spills(env.scratch_root)
+    assert spilled, "setup: the call above must have actually spilled a file"
+    assert set(spilled) <= limits_mod._OURS, "setup: _OURS must record what it just wrote"
+
+    env.cleanup()
+
+    assert not (limits_mod._OURS & set(spilled)), (
+        "cleanup() must forget this session's spills from _OURS, not just rmtree "
+        "the directory they lived in"
+    )
+
+
+def test_durable_cleanup_does_not_forget_ours_entries(tmp_path):
+    """A durable session's ``cleanup()`` is a no-op BY DESIGN (harness/session_env.py)
+    — verified here, not assumed, because Task 3 made ``_OURS`` load-bearing for
+    durable pruning (``test_durable_spills_survive_their_own_sessions_reopen``
+    above): if a durable ``close()`` ever DID reach ``forget_spills``, the very next
+    ``_prune`` from ANOTHER process reopening this same session would reclaim files
+    this session's own persisted transcript still names — exactly the bug Task 3
+    fixed, reintroduced through the bookkeeping side instead of the directory side.
+    A durable ``cleanup()`` must leave ``_OURS`` completely untouched.
+    """
+    import harness.limits as limits_mod
+    from harness.session_env import local_session_env
+
+    env = local_session_env(tmp_path, session="s1", sessions_dir=tmp_path / ".sessions")
+    truncate_tool_result("z" * 500, _POLICY, scratch_dir=env.scratch_root, durable=True)
+    spilled = _spills(env.scratch_root)
+    assert spilled, "setup: the call above must have actually spilled a file"
+    assert set(spilled) <= limits_mod._OURS, "setup: _OURS must record what it just wrote"
+
+    env.cleanup()  # a no-op — durable
+
+    assert set(spilled) <= limits_mod._OURS, "a durable cleanup() must not forget its own spills"
+    assert env.scratch_root.exists(), "sanity: durable cleanup() must not remove the scratch either"

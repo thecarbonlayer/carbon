@@ -126,6 +126,73 @@ def test_delegates_inherit_the_parent_provider():
     assert workers_saw, "delegate fell back to the environment provider"
 
 
+def test_coding_tools_threads_session_env_into_delegate_and_fan_out():
+    """``delegate_tool``/``fan_out_tool`` accepting ``session_env`` (Task 4) is
+    necessary but not sufficient — something has to actually PASS it, and that
+    something is ``_coding_tools`` (harness/agent.py), the one production caller
+    both tools go through. Driven through a real ``Agent`` + its REAL registry, not
+    the bare factories called directly by hand (the way test_offload_strategy.py's
+    ``test_delegate_tool_forwards_session_env_...``/``test_fan_out_tool_forwards_
+    session_env_...`` prove the factories themselves) — a regression that drops
+    ``session_env=session_env`` from just the two ``_coding_tools`` registration
+    calls, while leaving both factories' own plumbing intact, would pass every
+    other test in this suite, this one included if it isn't driven end to end.
+
+    Proven the same way those two tests prove it: the WORKER offloads its own
+    oversized result, then reads it back through its own registered ``read_file``.
+    """
+    import re
+
+    from harness.harness_config import TruncationPolicy
+    from harness.limits import SCRATCH_SCHEME
+
+    root = Path(tempfile.mkdtemp())
+    lines = [f"needle-line-{i:04d}: NEEDLE marker text here" for i in range(150)]
+    (root / "log.txt").write_text("\n".join(lines))
+
+    worker_calls = {"n": 0}
+    captured: dict = {}
+
+    def script(messages, **kwargs):
+        if any("focused worker" in str(m.get("content", "")) for m in messages):
+            worker_calls["n"] += 1
+            if worker_calls["n"] == 1:
+                return _tool_call("search_text", query="NEEDLE")
+            if worker_calls["n"] == 2:
+                footer = str(messages[-1]["content"])
+                refs = set(
+                    re.findall(re.escape(SCRATCH_SCHEME) + r"offload/[0-9a-f]{16}\.txt", footer)
+                )
+                assert len(refs) == 1, f"footer should name exactly one file: {refs}"
+                return _tool_call("read_file", path=refs.pop())
+            # worker_calls["n"] == 3: the read_file readback is now the last message.
+            captured["readback"] = str(messages[-1]["content"])
+            return LLMResponse(content="worker done")
+        if not captured.get("delegated"):
+            captured["delegated"] = True
+            return _tool_call("delegate", task="search then read back")
+        return LLMResponse(content="parent done")
+
+    provider = _calls(script)
+    agent = Agent(provider=provider)
+    agent.tools = _coding_tools(
+        Workspace(root=root),
+        exclude_session=None,
+        provider=provider,  # the worker must run on THIS script, not the env default
+        session_env=agent.session_env,
+        tool_output=TruncationPolicy("offload_to_file", 300, 0.5),
+    )
+    agent.run("delegate: search then read back")
+
+    assert "readback" in captured, (
+        "setup: the scripted worker turn must have reached its final call"
+    )
+    readback = captured["readback"]
+    assert not readback.startswith("error:"), readback
+    assert "needle-line-0000: NEEDLE marker text here" in readback  # the file's head
+    assert "more than 100 hits; narrow it" in readback  # the file's tail
+
+
 def test_tui_builds_its_belt_from_the_shared_builder():
     """The TUI hand-rolled its own registry, which is how its workers ended up
     reading the process cwd instead of the worktree."""

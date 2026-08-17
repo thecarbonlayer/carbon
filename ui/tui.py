@@ -228,19 +228,30 @@ class AgentTUI(App):
             agents_dir=str(self.workspace.root),  # AGENTS.md lives where the agent works
             workspace_root=str(self.workspace.root),  # …and so does read_file/write_file
         )
-        tools = agent_mod._coding_tools(
-            self.workspace,
-            exclude_session=session,  # recall across *other* sessions
-            provider=self.provider,
-            model=self.provider.model,
-            sessions_dir=self.sessions_dir,
-            session_env=agent.session_env,
-        )
-        if self.extensions:
-            from harness.extensions import load_extensions
+        # The try opens HERE, immediately after the Agent (and the session_env it
+        # just created and owns) exist — the same shape harness/agent.py's
+        # _run_repl already establishes. _coding_tools, and (with --extensions)
+        # load_extensions below — which runs arbitrary user code from
+        # .carbon/extensions/ — can both raise, and a raise here used to propagate
+        # straight out of _build_agent with agent.close() never called, leaking
+        # the scratch this Agent already allocated in __init__.
+        try:
+            tools = agent_mod._coding_tools(
+                self.workspace,
+                exclude_session=session,  # recall across *other* sessions
+                provider=self.provider,
+                model=self.provider.model,
+                sessions_dir=self.sessions_dir,
+                session_env=agent.session_env,
+            )
+            if self.extensions:
+                from harness.extensions import load_extensions
 
-            load_extensions(tools, *agent_mod._extension_dirs(self.workspace.root))
-        agent.tools = tools
+                load_extensions(tools, *agent_mod._extension_dirs(self.workspace.root))
+            agent.tools = tools
+        except BaseException:
+            agent.close()
+            raise
         return agent
 
     # --- layout -------------------------------------------------------------

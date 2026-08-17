@@ -934,14 +934,28 @@ def _coding_tools(
     tools.register(bash_tool(Sandbox(trusted=True, timeout=120), workdir=root))
     tools.register(search_memory_tool(memory_dir, exclude=exclude_session))
     workers = worker_tools()
+    # session_env=session_env (the PARENT's, the same one `workers` was just built
+    # from above): a delegated worker's OWN offloads must land in the same scratch
+    # `workers`' read_file resolves against, or it can never read back what it just
+    # spilled (Task 4) — see delegate_tool/fan_out_tool's own docstrings.
     tools.register(
         delegate_tool(
-            model=model, provider=provider, tools=workers, agents_dir=root, tool_output=tool_output
+            model=model,
+            provider=provider,
+            tools=workers,
+            agents_dir=root,
+            tool_output=tool_output,
+            session_env=session_env,
         )
     )
     tools.register(
         fan_out_tool(
-            model=model, provider=provider, tools=workers, agents_dir=root, tool_output=tool_output
+            model=model,
+            provider=provider,
+            tools=workers,
+            agents_dir=root,
+            tool_output=tool_output,
+            session_env=session_env,
         )
     )
     return tools
