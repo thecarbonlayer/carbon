@@ -153,9 +153,26 @@ class Agent:
         # that share one environment across agents (fan-out workers, a test) — a
         # shared env is the CREATOR's to clean, so ownership tracks construction.
         self._owns_env = session_env is None
-        self.session_env = session_env or local_session_env(
-            workspace_root=self.workspace_root or self.agents_dir
-        )
+        # A durable session (``session`` given, ``sessions_dir`` below) gets a scratch
+        # tied to the SESSION's lifetime, not this Agent's: reopening the same session
+        # must land on the same scratch, so a persisted transcript's scratch:// refs
+        # (offload_to_file) still resolve after a restart (harness/session_env.py).
+        # Ownership still tracks CONSTRUCTION — this Agent built it, so it is still
+        # the one that would close it — but a durable SessionEnvironment's own
+        # cleanup() is a no-op by its own rule, so close() below never removes a
+        # durable session's scratch; only delete_session_scratch() does.
+        if session_env is not None:
+            self.session_env = session_env
+        elif session:
+            self.session_env = local_session_env(
+                workspace_root=self.workspace_root or self.agents_dir,
+                session=session,
+                sessions_dir=sessions_dir,
+            )
+        else:
+            self.session_env = local_session_env(
+                workspace_root=self.workspace_root or self.agents_dir
+            )
         self.tools = tools
         self.approve = approve
         self.approval_required = approval_required or set()
@@ -227,7 +244,16 @@ class Agent:
 
     def close(self) -> None:
         """End-of-session housekeeping: remove the private scratch if this Agent
-        created it. Idempotent, never raises — callers run it in ``finally``."""
+        created it. Idempotent, never raises — callers run it in ``finally``.
+
+        A no-op on the scratch itself when ``self.session_env.durable`` is true
+        (a session opened with ``session=``): ownership still tracks construction
+        (``_owns_env``), but a durable ``SessionEnvironment.cleanup()`` refuses to
+        remove it — that scratch is tied to the SESSION's lifetime, not this
+        Agent's, so a session switch or process exit must not delete refs a
+        persisted transcript still points at. Remove it explicitly with
+        ``delete_session_scratch`` (harness/session_env.py), e.g. alongside
+        ``harness.memory.delete_session``."""
         if self._owns_env:
             self.session_env.cleanup()
 
