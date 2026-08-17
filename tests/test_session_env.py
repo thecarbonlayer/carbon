@@ -204,6 +204,97 @@ def test_scavenge_does_not_touch_durable_scratch(tmp_path):
     assert (env.scratch_root / "x.txt").read_text() == "keep me"
 
 
+# --- CARBON_SCRATCH_TEST_ROOT: ownership by location, not by diffing ------------
+# tests/conftest.py's session-scoped `_isolated_scratch_root` fixture relies on
+# this mechanism to fix a P1: the old per-test fixture swept `carbon-scratch-*` by
+# snapshot-diffing the REAL OS temp dir, which cannot tell "this test's own leak"
+# from "a directory a concurrent, unrelated process (a live measurement) created
+# in that same window" — and deleted the latter right along with the former. These
+# two tests pin the mechanism directly, hermetically (a real system temp dir is
+# never touched — both the "real" and the redirected root are tmp_path children).
+def test_scavenge_default_root_follows_the_test_root_override(tmp_path, monkeypatch):
+    """With CARBON_SCRATCH_TEST_ROOT set, scavenge()'s bare default (root=None —
+    exactly how local_session_env() calls it) sweeps the REDIRECTED root: our own
+    stray inside it is removed, and a stray outside it — standing in for a
+    concurrent process's real scratch, sitting in what would be the real OS temp
+    dir — is never even glob-reachable, let alone touched."""
+    from harness.session_env import SCRATCH_PREFIX, scavenge
+
+    real_system_temp = tmp_path / "real-os-tmp"
+    real_system_temp.mkdir()
+    foreign = real_system_temp / f"{SCRATCH_PREFIX}another-process-1234"
+    foreign.mkdir(mode=0o700)
+    (foreign / "evidence.txt").write_text("a concurrent measurement's spill")
+
+    test_root = tmp_path / "pytest-owned-scratch"
+    test_root.mkdir()
+    ours = test_root / f"{SCRATCH_PREFIX}ours-stale"
+    ours.mkdir(mode=0o700)
+    old = time.time() - 100_000
+    os.utime(ours, (old, old))
+
+    monkeypatch.setenv("CARBON_SCRATCH_TEST_ROOT", str(test_root))
+    # Nothing below should ever reach for this while the override is set — kept
+    # pointed elsewhere so a fallback to it would show up as a wrong answer, not
+    # a coincidentally-right one.
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(real_system_temp))
+
+    removed = scavenge(max_age_s=86_400)  # bare default root, no explicit root=
+
+    assert removed == 1
+    assert not ours.exists(), "our own stray, inside the redirected root, must go"
+    assert foreign.exists(), "a directory outside the redirected root is untouched"
+    assert (foreign / "evidence.txt").read_text() == "a concurrent measurement's spill"
+
+
+def test_ephemeral_scratch_honors_the_test_root_override(tmp_path, monkeypatch):
+    """The creation half of the same mechanism: a NEW ephemeral scratch lands
+    under CARBON_SCRATCH_TEST_ROOT when it is set, never under the real OS temp
+    dir — so nothing a test builds can ever collide with, or be mistaken for, a
+    concurrent process's own scratch in the first place."""
+    from harness.session_env import local_session_env
+
+    real_system_temp = tmp_path / "real-os-tmp"
+    real_system_temp.mkdir()
+    test_root = tmp_path / "pytest-owned-scratch"
+    test_root.mkdir()
+
+    monkeypatch.setenv("CARBON_SCRATCH_TEST_ROOT", str(test_root))
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(real_system_temp))
+
+    env = local_session_env(tmp_path)
+    try:
+        assert env.scratch_root.parent == test_root
+        assert not any(real_system_temp.iterdir()), "nothing landed in the 'real' temp dir"
+    finally:
+        env.cleanup()
+
+
+def test_this_suites_own_fixture_actually_redirects_a_fresh_agent():
+    """Integration check on the fixture itself (conftest.py's session-scoped
+    ``_isolated_scratch_root``), not just the mechanism the two tests above pin in
+    isolation: by the time ANY test runs, ``CARBON_SCRATCH_TEST_ROOT`` must already
+    be set, and a perfectly ordinary, freshly-built ``Agent`` — no special wiring
+    of its own — must land under it rather than under the real OS temp dir this
+    process could otherwise share with a concurrent live measurement."""
+    from harness.agent import Agent
+    from harness.session_env import SCRATCH_TEST_ROOT_ENV
+
+    configured = os.environ.get(SCRATCH_TEST_ROOT_ENV)
+    assert configured, "the session fixture must set this before any test body runs"
+
+    a = Agent()
+    try:
+        # The scratch's immediate parent is the fixture's own root — not merely
+        # "somewhere under the real temp dir," which the fixture's root itself
+        # also technically is (mkdtemp has to put its throwaway root somewhere).
+        # Isolation comes from being confined to this ONE uniquely-named
+        # subdirectory, not from avoiding the temp area altogether.
+        assert a.session_env.scratch_root.resolve().parent == Path(configured).resolve()
+    finally:
+        a.close()
+
+
 # --- the Agent's ownership of a SessionEnvironment -----------------------------
 # Task 4: Agent constructs its own SessionEnvironment when none is supplied, and
 # close() ends that scratch's lifecycle — but only when the Agent is the one that
@@ -258,18 +349,23 @@ def test_agent_with_a_session_gets_a_durable_scratch_that_survives_close(tmp_pat
 
 # --- leak detection at the real driving code paths -----------------------------
 # The tests above call Agent.close()/env.cleanup() directly — real proof the
-# CONTRACT is right, but not proof a real caller actually triggers it. The
-# autouse `_sweep_scratch_dirs_this_test_leaked` fixture (conftest.py) removes
-# every stray `carbon-scratch-*` dir left behind after EACH test regardless of
-# why it was left — which is exactly why a regression in `Agent.close()` (the
-# cleanup call quietly dropped, or a caller that stops running it in `finally`)
-# would not fail the suite: the fixture hides the very symptom that first
-# exposed this leak class (755 stray dirs after a full run, ~330x slower
-# scavenge()). These assert inside the test body, snapshot-before/compare-after,
-# BEFORE that fixture's own sweep gets a turn — so a broken close() shows up
-# here, in seconds, instead of only in a slow scavenge() on some future session.
+# CONTRACT is right, but not proof a real caller actually triggers it. conftest.py's
+# session-scoped `_isolated_scratch_root` fixture redirects every ephemeral scratch
+# this whole test session creates into its own throwaway root (never the real OS
+# temp dir), so a per-test sweep is no longer part of the picture at all — but that
+# is exactly why `_scratch_dirs()` below must follow the SAME redirect
+# (`scratch_parent_dir()`) rather than hardcode `tempfile.gettempdir()`: hardcoded,
+# it would watch a directory nothing lands in for the rest of the run, and
+# `leaked = _scratch_dirs() - before` would be `set() - set()` regardless of
+# whether `close()` actually ran — a guard that cannot go red. These assert inside
+# the test body, snapshot-before/compare-after, independent of any fixture's own
+# sweep — so a broken close() (the cleanup call quietly dropped, or a caller that
+# stops running it in `finally`) shows up here, in seconds, the same way it did
+# before the redirect existed.
 def _scratch_dirs() -> set[Path]:
-    return set(Path(tempfile.gettempdir()).glob(f"{SCRATCH_PREFIX}*"))
+    from harness.session_env import scratch_parent_dir
+
+    return set(scratch_parent_dir().glob(f"{SCRATCH_PREFIX}*"))
 
 
 def test_run_once_leaves_no_scratch_dir_behind(tmp_path):

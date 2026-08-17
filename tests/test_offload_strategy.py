@@ -1712,6 +1712,69 @@ def test_the_agents_registered_read_file_tool_resolves_the_footer_it_wrote(tmp_p
     assert result == blob
 
 
+def test_the_agents_own_bash_tool_can_read_back_what_its_footer_named(tmp_path):
+    """The other half of the gap the test above pins for ``read_file``: the
+    ``Sandbox`` wrapped as the Agent's OWN bash tool must ALSO carry this
+    session's ``scratch_root``, or a footer's shell route
+    (``$CARBON_SCRATCH_DIR/offload/<hash>.txt`` — ``harness/limits.py``'s
+    ``shell_ref``) names a variable no wiring ever set. That is not a smaller
+    version of the read_file gap; it is the ONE that iteration 5's live
+    measurement actually found: 32 of 32 attempts to recover a spill went
+    through bash (``grep``, ``ls -F``, a python one-liner) — the model reached
+    for the tool it actually had, and every attempt failed because nothing
+    offered bash a route at all. ch-08 added the route; a review of THIS task
+    found the same threaded-but-never-passed shape that hit read_file before it:
+    ``Sandbox`` grew a ``scratch_dir`` parameter and ``_coding_tools`` computed
+    ``scratch_root`` right above this call, but the call itself never passed it.
+
+    Drives a real oversized tool result through a real Agent's door — built by
+    ``_coding_tools()``, the SAME builder every production entrypoint (run_once,
+    the REPL, the TUI) uses — and then has that SAME agent's own bash tool, through
+    the REGISTRY, read the spill back via the exact shell route its own footer
+    just advertised. Never a hand-built Sandbox, never a hand-typed ref.
+    """
+    from harness.agent import _coding_tools
+    from harness.workspace import Workspace
+
+    blob = "\n".join(f"line-{i:04d}" for i in range(200))
+    agent = Agent(
+        provider=_scripted(_dump_turn()),
+        agents_dir=str(tmp_path),
+        tool_output=TruncationPolicy("offload_to_file", 200, 0.5),
+    )
+    # Built the way every production entrypoint builds an agent's tools: the
+    # session's scratch has to exist before the tools that read out of it do, so
+    # this is built AFTER the Agent — never a registry the test wires by hand.
+    tools = _coding_tools(
+        Workspace(root=str(tmp_path)),
+        exclude_session=None,
+        sessions_dir=str(tmp_path / "sessions"),
+        session_env=agent.session_env,
+    )
+    tools.register(
+        Tool(
+            name="dump",
+            description="Return a large blob.",
+            parameters={"type": "object", "properties": {}, "required": []},
+            func=lambda: blob,
+            mutates=False,
+        )
+    )
+    agent.tools = tools
+
+    agent.run("go")
+
+    tool_msg = next(m for m in agent.messages if m.get("role") == "tool")
+    shell_route = re.search(r"\$CARBON_SCRATCH_DIR/offload/[0-9a-f]{16}\.txt", tool_msg["content"])
+    assert shell_route, f"footer should name the shell route: {tool_msg['content']!r}"
+
+    # The model's OWN bash tool, through the REGISTRY — resolves the variable
+    # itself, exactly as a real shell would when the model runs this command.
+    result = agent.tools.call("bash", json.dumps({"command": f'cat "{shell_route.group(0)}"'}))
+
+    assert blob in result
+
+
 # --- housekeeping in the session scratch directory -----------------------------
 def test_spill_lands_in_scratch_never_in_workspace(tmp_path, monkeypatch):
     ws = tmp_path / "ws"

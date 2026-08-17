@@ -931,7 +931,19 @@ def _coding_tools(
     tools.register(write_file_tool(workspace))
     tools.register(edit_file_tool(workspace))
     tools.register(apply_patch_tool(workspace))
-    tools.register(bash_tool(Sandbox(trusted=True, timeout=120), workdir=root))
+    # scratch_dir=scratch_root: this Sandbox backs the AGENT'S OWN bash tool, so its
+    # $CARBON_SCRATCH_DIR must resolve to the SAME scratch the door's footer just
+    # named (harness/limits.py's shell_ref) and read_file's scratch_root above
+    # already resolves. Omitting it was live until this fix: the footer advertised
+    # the shell route unconditionally, but nothing had ever wired this Sandbox to
+    # a real directory, so the model's own bash tool followed an advertised route
+    # into an unset variable — the exact failure a live measurement found (32 of
+    # 32 attempts to recover a spill went through bash, none of which could
+    # resolve it). See test_the_agents_own_bash_tool_can_read_back_what_its_footer_named
+    # (tests/test_offload_strategy.py).
+    tools.register(
+        bash_tool(Sandbox(trusted=True, timeout=120, scratch_dir=scratch_root), workdir=root)
+    )
     tools.register(search_memory_tool(memory_dir, exclude=exclude_session))
     workers = worker_tools()
     # session_env=session_env (the PARENT's, the same one `workers` was just built

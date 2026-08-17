@@ -61,6 +61,7 @@ Provider-neutral on purpose: a remote/container implementation replaces
 
 from __future__ import annotations
 
+import os
 import secrets
 import shutil
 import tempfile
@@ -72,6 +73,23 @@ from harness.limits import forget_spills
 
 SCRATCH_PREFIX = "carbon-scratch-"
 SCAVENGE_AGE_S = 24 * 3600
+# A seam for the TEST SUITE (tests/conftest.py), never for a real invocation — no
+# production caller ever sets this. When present, it redirects BOTH halves of
+# ephemeral scratch below to a directory of the caller's choosing instead of the
+# real OS temp dir: where a NEW scratch is created (this module's own
+# ``tempfile.mkdtemp`` call) and where ``scavenge()`` looks by default
+# (``root=None``) — see ``scratch_parent_dir()``, the one place both read this.
+#
+# Why this exists: the old test fixture swept ``carbon-scratch-*`` by snapshotting
+# the REAL OS temp dir before a test and removing whatever was new after — which
+# cannot tell "this test's own leak" from "a directory a DIFFERENT process (a live
+# measurement, running concurrently on the same machine) created in that same
+# window." Redirecting creation itself, rather than diffing after the fact, is
+# what makes ownership sound: a concurrent process never sees an env var set only
+# in the test process's own environment, so its scratch keeps landing in the real
+# temp dir — structurally out of reach of a sweep confined to the redirected root,
+# not merely excluded by a check that could be wrong.
+SCRATCH_TEST_ROOT_ENV = "CARBON_SCRATCH_TEST_ROOT"
 
 LOCAL_METADATA = {
     "kind": "local",
@@ -89,6 +107,22 @@ DURABLE_METADATA = {
         "scavenged (outside the OS temp dir scavenge() sweeps)"
     ),
 }
+
+
+def scratch_parent_dir() -> Path:
+    """Where a NEW ephemeral scratch is created, and where ``scavenge()`` looks by
+    default (``root=None``) — computed the SAME way in both places (this is the
+    only function either one calls for it) so the two can never point at
+    different directories.
+
+    ``SCRATCH_TEST_ROOT_ENV`` overrides it when set; unset — every real
+    invocation — this is exactly ``tempfile.gettempdir()``, unchanged from before
+    this seam existed. Re-read on every call, deliberately not cached: tests set
+    and clear the env var around a fixture's lifetime, and a stale cached answer
+    would silently point a later call at whichever directory happened to be live
+    when this was first evaluated."""
+    override = os.environ.get(SCRATCH_TEST_ROOT_ENV)
+    return Path(override) if override else Path(tempfile.gettempdir())
 
 
 @dataclass(frozen=True)
@@ -174,19 +208,21 @@ def scavenge(max_age_s: float = SCAVENGE_AGE_S, *, root: str | Path | None = Non
     the OS temp dir this glob searches, so no ``max_age_s`` can make this function
     remove it — see ``test_scavenge_does_not_touch_durable_scratch``.
 
-    ``root`` overrides where this sweeps (default: the real OS temp dir,
-    ``tempfile.gettempdir()``) — a seam for tests, not a production knob: every
-    production caller (``local_session_env``) omits it and gets the real sweep,
-    unchanged. A test exercising an aggressive ``max_age_s`` (short enough to run
-    fast) against the REAL temp dir risks reaping a genuinely still-running
-    session's scratch on a shared or long-lived machine — reproduced by a
-    reviewer, a real 60-second-old stray on the machine this suite ran on. A
-    dedicated ``root`` keeps a test's sweep confined to what the test itself
-    created.
+    ``root`` overrides where THIS ONE CALL sweeps — a seam for a test that wants
+    an aggressive ``max_age_s`` (short enough to run fast) confined to a directory
+    it built itself: run that against the REAL temp dir instead and it risks
+    reaping a genuinely still-running session's scratch on a shared or long-lived
+    machine — reproduced by a reviewer, a real 60-second-old stray on the machine
+    this suite ran on.
+
+    Left at its default (``None``), this follows ``scratch_parent_dir()`` — the
+    real OS temp dir, unless ``SCRATCH_TEST_ROOT_ENV`` is set (tests/conftest.py's
+    session fixture sets it for the whole suite, never a single call). Every
+    production invocation leaves both alone and gets the real sweep, unchanged.
     """
     now = time.time()
     removed = 0
-    sweep_root = Path(root) if root is not None else Path(tempfile.gettempdir())
+    sweep_root = Path(root) if root is not None else scratch_parent_dir()
     for p in sweep_root.glob(f"{SCRATCH_PREFIX}*"):
         try:
             if p.is_dir() and not p.is_symlink() and now - _newest_mtime(p) > max_age_s:
@@ -251,7 +287,11 @@ def local_session_env(
         scratch.mkdir(mode=0o700, exist_ok=True)
         return SessionEnvironment(session, root, scratch, dict(DURABLE_METADATA), durable=True)
     sid = session_id or secrets.token_hex(8)
-    scratch = Path(tempfile.mkdtemp(prefix=f"{SCRATCH_PREFIX}{sid}-"))
+    # dir=scratch_parent_dir(): the real OS temp dir, unless SCRATCH_TEST_ROOT_ENV
+    # redirects it (see that function and the constant's own docstring above) —
+    # the bare scavenge() call just above already swept the SAME directory this
+    # lands in, by construction.
+    scratch = Path(tempfile.mkdtemp(prefix=f"{SCRATCH_PREFIX}{sid}-", dir=scratch_parent_dir()))
     return SessionEnvironment(sid, root, scratch, dict(LOCAL_METADATA))
 
 

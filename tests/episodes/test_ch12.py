@@ -14,6 +14,7 @@ from harness.sandbox import Sandbox, bash_tool
 from harness.tools import default_tools
 from harness.workspace import Workspace, write_file_tool
 from model import LLMResponse
+from tasks.checks import _build_ch12_agent
 
 AGENTS = "## Testing\n```\npython3 test_thing.py\n```\n"
 PASS = "print('ok')\n"
@@ -122,3 +123,20 @@ def test_no_declared_command_no_gate():
         out = a.send("write foo.py")
     assert out == "done"
     assert not _pushbacks(a)
+
+
+def test_ch12_agents_bash_tool_reaches_its_own_scratch():
+    """``_build_ch12_agent`` (tasks/checks.py) is shared by the ch-12 accept check
+    AND its demo — proven here directly against that real production helper, not
+    the independent stand-in ``_agent()`` above builds for this file's own
+    verification-gate tests. No live model needed: only ``.send()`` (the model
+    loop) is skipped — the bash tool the helper actually wires runs for real."""
+    a, ws = _build_ch12_agent()
+    try:
+        out = a.tools.call(
+            "bash", json.dumps({"command": 'echo PROOF > "$CARBON_SCRATCH_DIR/probe.txt"'})
+        )
+        assert out.startswith("[exit 0"), out
+        assert (a.session_env.scratch_root / "probe.txt").read_text().strip() == "PROOF"
+    finally:
+        a.close()

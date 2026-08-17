@@ -5,6 +5,7 @@ and the model continues to a final answer. Folded in: the approval gate for
 boundary-crossing tools, and file editing over a scoped workspace.
 """
 
+import json
 from unittest.mock import patch
 
 import pytest
@@ -14,6 +15,7 @@ from harness.sandbox import Sandbox, bash_tool
 from harness.tools import Tool, ToolRegistry, read_file_tool
 from harness.workspace import Workspace, edit_file_tool, write_file_tool
 from model import LLMResponse
+from tasks.checks import _build_workspace_agent
 
 
 def test_tool_call_loop_executes_and_returns(tmp_path):
@@ -137,3 +139,21 @@ def test_bash_runs_in_workspace(tmp_path):
     ws.write("hi.txt", "HELLO-WS")
     bash = bash_tool(Sandbox(prefer_docker=False), workdir=str(ws.root))
     assert "HELLO-WS" in bash.func(command="cat hi.txt")  # bash sees the written file
+
+
+def test_workspace_agents_bash_tool_reaches_its_own_scratch():
+    """``_build_workspace_agent`` (tasks/checks.py) is shared by the ch-05 accept
+    check AND its demo — proven here directly against that real production
+    helper, not a hand-built stand-in, so a regression in the helper itself would
+    be caught. No live model needed: only ``.send()`` (the model loop) is
+    skipped — the bash tool the helper actually wires runs for real, through the
+    registry, exactly as the model would call it."""
+    a, ws = _build_workspace_agent()
+    try:
+        out = a.tools.call(
+            "bash", json.dumps({"command": 'echo PROOF > "$CARBON_SCRATCH_DIR/probe.txt"'})
+        )
+        assert out.startswith("[exit 0"), out
+        assert (a.session_env.scratch_root / "probe.txt").read_text().strip() == "PROOF"
+    finally:
+        a.close()

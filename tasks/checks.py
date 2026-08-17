@@ -265,15 +265,18 @@ def _accept_ch05_approval() -> bool:
         asked.append((name, args))
         return False
 
-    tools = default_tools()
-    tools.register(bash_tool(Sandbox()))
+    # Agent before tools (the canonical order, harness/agent.py's run_once): the
+    # Sandbox below needs THIS agent's own session scratch, which does not exist
+    # until the Agent is constructed.
     a = agent.Agent(
         system="Use the bash tool to run shell commands when asked.",
-        tools=tools,
         approve=deny,
         approval_required={"bash"},
     )
     try:
+        tools = default_tools()
+        tools.register(bash_tool(Sandbox(scratch_dir=a.session_env.scratch_root)))
+        a.tools = tools
         a.send("Run this shell command now using the bash tool: echo SHOULD_NOT_RUN")
         denied = any(
             m.get("role") == "tool" and "denied" in m["content"].lower() for m in a.messages
@@ -291,15 +294,24 @@ def _build_workspace_agent():
     from harness.workspace import Workspace, edit_file_tool, write_file_tool
 
     ws = Workspace()  # fresh scratch dir
+    # Agent before tools (the canonical order, harness/agent.py's run_once): the
+    # bash Sandbox below needs THIS agent's own session scratch, which does not
+    # exist until the Agent is constructed — see
+    # tests/episodes/test_ch05.py::test_workspace_agents_bash_tool_reaches_its_own_scratch.
+    a = agent.Agent(
+        system="You build files. Use write_file to create them and bash to run them.",
+    )
     tools = default_tools()
     tools.register(write_file_tool(ws))
     tools.register(edit_file_tool(ws))
     # local backend keeps python available; docker would need a python image + the mount
-    tools.register(bash_tool(Sandbox(prefer_docker=False), workdir=str(ws.root)))
-    a = agent.Agent(
-        system="You build files. Use write_file to create them and bash to run them.",
-        tools=tools,
+    tools.register(
+        bash_tool(
+            Sandbox(prefer_docker=False, scratch_dir=a.session_env.scratch_root),
+            workdir=str(ws.root),
+        )
     )
+    a.tools = tools
     return a, ws  # caller owns a.close()
 
 
@@ -350,14 +362,16 @@ def _demo_ch05() -> None:
     finally:
         a.close()
 
-    tools = default_tools()
-    tools.register(bash_tool(Sandbox()))
+    # Agent before tools (see _build_workspace_agent above): the Sandbox needs
+    # THIS agent's own session scratch, which does not exist until it is built.
     gated = agent.Agent(
         system="Use bash when asked.",
-        tools=tools,
         approve=lambda n, args: False,
         approval_required={"bash"},
     )
+    tools = default_tools()
+    tools.register(bash_tool(Sandbox(scratch_dir=gated.session_env.scratch_root)))
+    gated.tools = tools
     try:
         print("— a boundary-crossing tool, denied by the gate —")
         print("bot>", gated.send("Run: echo hello (use bash)"))
@@ -646,22 +660,25 @@ def _accept_ch08_sandbox() -> bool:
     from harness.sandbox import Sandbox, bash_tool
     from harness.tools import default_tools
 
-    sandbox = Sandbox()
-
     # Containment: a parent-process secret must not be visible inside the sandbox.
+    # A standalone Sandbox — this half never runs through an Agent, so there is no
+    # session scratch to wire it to.
     os.environ["SANDBOX_SECRET"] = "POULTRY-FARM"
     try:
-        contained = sandbox.run("printenv SANDBOX_SECRET || echo CLEAN")
+        contained = Sandbox().run("printenv SANDBOX_SECRET || echo CLEAN")
     finally:
         del os.environ["SANDBOX_SECRET"]
     leaked = "POULTRY-FARM" in contained.stdout
     print(f"backend={contained.backend} secret_leaked={leaked}")
 
-    # Execution: the model drives the sandboxed bash tool.
-    tools = default_tools()
-    tools.register(bash_tool(sandbox))
-    a = agent.Agent(system="Use the bash tool to run shell commands.", tools=tools)
+    # Execution: the model drives the sandboxed bash tool. Agent before tools (see
+    # _build_workspace_agent, tasks/checks.py): this Sandbox needs THIS agent's own
+    # session scratch, which does not exist until the Agent is constructed.
+    a = agent.Agent(system="Use the bash tool to run shell commands.")
     try:
+        tools = default_tools()
+        tools.register(bash_tool(Sandbox(scratch_dir=a.session_env.scratch_root)))
+        a.tools = tools
         reply = a.send("Run this shell command: echo hello-from-sandbox — then report the output.")
         ran = any(m.get("role") == "tool" for m in a.messages)
     finally:
@@ -707,10 +724,14 @@ def _demo_ch08() -> None:
     from harness.tools import default_tools, read_file
     from harness.verification import run_python
 
-    tools = default_tools()
-    tools.register(bash_tool(Sandbox()))
-    a = agent.Agent(tools=tools)
+    # Agent before tools (see _build_workspace_agent, tasks/checks.py): the
+    # Sandbox needs THIS agent's own session scratch, which does not exist until
+    # the Agent is constructed.
+    a = agent.Agent()
     try:
+        tools = default_tools()
+        tools.register(bash_tool(Sandbox(scratch_dir=a.session_env.scratch_root)))
+        a.tools = tools
         print("bot>", a.send("Use bash to print the current working directory and the date."))
     finally:
         a.close()
@@ -942,14 +963,22 @@ def _build_ch12_agent():
     ws = Workspace()
     ws.write("AGENTS.md", _CH12_AGENTS_MD)  # declares the test command
     ws.write("test_is_prime.py", _CH12_TEST)  # the external oracle, seeded by us
+    # Agent before tools (the canonical order, harness/agent.py's run_once): the
+    # bash Sandbox below needs THIS agent's own session scratch, which does not
+    # exist until the Agent is constructed — see
+    # tests/episodes/test_ch12.py::test_ch12_agents_bash_tool_reaches_its_own_scratch.
+    a = agent.Agent(system=agent.DEFAULT_SYSTEM, agents_dir=str(ws.root), verify_attempts=4)
     tools = default_tools()
     tools.register(write_file_tool(ws))
     tools.register(edit_file_tool(ws))
     # trusted bash so the declared command runs in a real env (deps-free here)
-    tools.register(bash_tool(Sandbox(trusted=True, timeout=60), workdir=str(ws.root)))
-    a = agent.Agent(
-        system=agent.DEFAULT_SYSTEM, tools=tools, agents_dir=str(ws.root), verify_attempts=4
+    tools.register(
+        bash_tool(
+            Sandbox(trusted=True, timeout=60, scratch_dir=a.session_env.scratch_root),
+            workdir=str(ws.root),
+        )
     )
+    a.tools = tools
     return a, ws  # caller owns a.close()
 
 
@@ -969,6 +998,10 @@ def _accept_ch12() -> bool:
         observed = a._observed_pass(_CH12_COMMAND, 0)
     finally:
         a.close()
+    # Not an Agent's bash tool — a standalone independent re-run this CHECKER uses
+    # to cross-validate the harness's own "observed a passing run" claim, after the
+    # Agent (and its scratch) is already closed. No scratch_dir: there is no footer
+    # here for any route to advertise.
     final = Sandbox(trusted=True).run(_CH12_COMMAND, workdir=str(ws.root))
     wrote = (ws.root / "is_prime.py").is_file()
     print(
