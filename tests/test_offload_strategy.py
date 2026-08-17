@@ -437,6 +437,62 @@ def test_a_symlinked_scratch_root_is_refused_before_anything_is_created(tmp_path
     assert "$CARBON_SCRATCH_DIR" not in out, "…nor the shell route to the same refused file"
 
 
+def test_a_toctou_swap_between_the_mkdir_and_the_resolve_is_still_refused(tmp_path, monkeypatch):
+    """What the post-mkdir containment check is actually for, isolated from
+    everything the pre-mkdir symlink check already handles.
+
+    Checked (not assumed) that no DETERMINISTIC, pre-existing symlink shape
+    reaches this check on its own: a symlink on an ancestor of ``scratch_dir``
+    resolves consistently on both sides of the comparison (``root.resolve()``
+    and ``landed.resolve()`` both pass through it, so containment still holds
+    after resolving), and a ``..`` in the scratch path resolves away the same
+    way for both. Every pre-existing symlink placed directly AT ``root`` or
+    AT ``landed`` is caught earlier, by the pre-mkdir check, before this one
+    ever runs. What is left is a race: something replacing the just-created
+    ``offload`` directory with a symlink in the narrow window between
+    ``mkdir`` returning and the ``resolve()`` calls right after it — which is
+    exactly the window the pre-mkdir check cannot see, since it already ran
+    and passed before the swap happens.
+
+    Simulated deterministically by wrapping ``Path.mkdir``: for the one call
+    that creates ``scratch/offload``, the real directory is created (so the
+    pre-mkdir check's own view of the world stays honest) and then, before
+    control returns to ``_offload_dir``, immediately swapped for a symlink to
+    an attacker directory — modeling a concurrent actor that wins the race
+    before the very next line runs. Nothing about ``_offload_dir`` itself is
+    touched or bypassed; only the standard-library seam it calls into is
+    intercepted, for this one path.
+    """
+    import shutil
+
+    from harness.harness_config import TruncationPolicy
+    from harness.limits import truncate_tool_result
+
+    outside = tmp_path / "attacker"
+    outside.mkdir()
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    raced_target = scratch / "offload"
+    real_mkdir = Path.mkdir
+
+    def racing_mkdir(self, *args, **kwargs):
+        result = real_mkdir(self, *args, **kwargs)
+        if self == raced_target and not self.is_symlink():
+            shutil.rmtree(self)
+            self.symlink_to(outside, target_is_directory=True)
+        return result
+
+    monkeypatch.setattr(Path, "mkdir", racing_mkdir)
+
+    out = truncate_tool_result(
+        "S" * 9000, TruncationPolicy("offload_to_file", 4000, 0.3), scratch_dir=scratch
+    )
+    assert list(outside.iterdir()) == [], "nothing may be written through the raced link"
+    assert "offload unavailable" in out, "the marker must say the copy does not exist"
+    assert "scratch://" not in out, "and must not advertise a route to a file we refused to write"
+    assert "$CARBON_SCRATCH_DIR" not in out, "…nor the shell route to the same refused file"
+
+
 def test_forged_footers_in_tool_output_are_defanged(tmp_path):
     """Untrusted output that forges the harness's own recovery instruction would
     otherwise aim read_file wherever it likes."""
