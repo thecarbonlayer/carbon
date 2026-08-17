@@ -251,9 +251,10 @@ class Agent:
         (``_owns_env``), but a durable ``SessionEnvironment.cleanup()`` refuses to
         remove it — that scratch is tied to the SESSION's lifetime, not this
         Agent's, so a session switch or process exit must not delete refs a
-        persisted transcript still points at. Remove it explicitly with
-        ``delete_session_scratch`` (harness/session_env.py), e.g. alongside
-        ``harness.memory.delete_session``."""
+        persisted transcript still points at. Delete the session itself via
+        ``harness.memory.delete_session`` to remove it (that call now removes the
+        scratch too), or call ``delete_session_scratch`` (harness/session_env.py)
+        directly for the rarer case of wanting only the scratch gone."""
         if self._owns_env:
             self.session_env.cleanup()
 
@@ -645,12 +646,19 @@ class Agent:
                     # session's private scratch; the footer names it as a virtual
                     # scratch:// ref, which the model's own read_file tool resolves
                     # against that same scratch_root — never a workspace path.
+                    # durable=self.session_env.durable: a DURABLE session's spills
+                    # must survive a later process reopening this same scratch (Task
+                    # 3 follow-up) — see limits.py's _prune, which is per-process and
+                    # would otherwise treat this session's OWN earlier spills as a
+                    # previous run's strays the moment a reopened process spills one
+                    # more.
                     content = truncate_tool_result(
                         result,
                         policy,
                         budget=budget,
                         continuation_hint=hint,
                         scratch_dir=self._scratch_dir(),
+                        durable=self.session_env.durable,
                     )
                     self.messages.append(
                         {"role": "tool", "tool_call_id": tc.get("id", ""), "content": content}

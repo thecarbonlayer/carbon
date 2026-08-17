@@ -1410,3 +1410,42 @@ def test_pruning_reclaims_an_earlier_run_s_spills(tmp_path):
     assert len(_spills(tmp_path)) == MAX_OFFLOAD_FILES
     assert not (offload / f"{0:016x}.txt").exists()  # oldest out first
     assert (offload / f"{MAX_OFFLOAD_FILES + 9:016x}.txt").exists()
+
+
+def test_durable_spills_survive_their_own_sessions_reopen(tmp_path):
+    """Reviewer's probe on Task 3's durable scratch, reproduced directly.
+
+    ``_OURS`` (the set that tells ``_prune`` "this session's transcript still names
+    this file, never reclaim it") is a module-level, per-PROCESS set — empty again
+    on every fresh process. ``test_pruning_reclaims_an_earlier_run_s_spills`` above
+    proves that is exactly right for an EPHEMERAL scratch: a new process's stray
+    ``*.txt`` files really are unreferenced, since nothing survived the old process
+    to reference them.
+
+    A DURABLE scratch (harness/session_env.py) breaks that assumption: its files
+    are named by a TRANSCRIPT that outlives the process that wrote them (that is
+    the entire point of Task 3). Without threading ``durable`` through to
+    ``_spill``/``_prune``, a reopened durable session's own prior spills are
+    indistinguishable from "a previous run's strays" the moment it writes one more
+    — the process boundary that makes the ephemeral case correct is exactly what
+    makes the durable case wrong. ``_OURS.clear()`` below simulates that boundary
+    explicitly (a fresh process's ``_OURS`` starts empty); without the fix, this
+    reproduces the reviewer's numbers exactly: 100 spills, reopen, spill one more,
+    lose 37 (down to MAX_OFFLOAD_FILES=64).
+    """
+    import harness.limits as limits_mod
+
+    # "Session run 1": 100 distinct spills, durable.
+    for i in range(100):
+        truncate_tool_result(f"{i}" + "z" * 500, _POLICY, scratch_dir=tmp_path, durable=True)
+    assert len(_spills(tmp_path)) == 100
+
+    # "Restart": a fresh process's _OURS is empty — this line IS the process
+    # boundary the reviewer's finding depends on; without it the bug can't
+    # reproduce inside one continuous test function.
+    limits_mod._OURS.clear()
+
+    # "Session run 2": reopen the same durable scratch, spill ONE more.
+    truncate_tool_result("reopen" + "z" * 500, _POLICY, scratch_dir=tmp_path, durable=True)
+
+    assert len(_spills(tmp_path)) == 101, "every spill from the reopened session must survive"

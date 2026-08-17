@@ -100,6 +100,12 @@ def shell_ref(filename: str) -> str:
 # a long session still spills one file per over-budget result until session close.
 # Keep the newest N — the older a spill is, the less likely anything is still
 # following its footer.
+#
+# EPHEMERAL sessions only. A DURABLE session (harness/session_env.py, Task 3) grows
+# unbounded by this constant across a reopen instead — it is bounded by the SESSION's
+# own lifetime (harness.memory.delete_session / delete_session_scratch), not by this
+# count, because its footers are read by a transcript that outlives any one process.
+# See ``_prune``'s ``durable`` parameter.
 MAX_OFFLOAD_FILES = 64
 _PART_SUFFIX = ".part"  # a spill mid-write; only ever named between mkstemp and rename
 
@@ -107,8 +113,17 @@ _PART_SUFFIX = ".part"  # a spill mid-write; only ever named between mkstemp and
 # and the temp files it is still writing. ``_prune`` skips them — a footer whose file
 # was reclaimed underneath it is worse than a directory a little over its bound, since
 # the model then follows a live-looking route to "no such file" with nothing telling it
-# the copy ever existed. A session that spills more than MAX_OFFLOAD_FILES times
-# therefore exceeds the bound until the process exits; that is the intended trade.
+# the copy ever existed. An EPHEMERAL session that spills more than MAX_OFFLOAD_FILES
+# times therefore exceeds the bound until the process exits; that is the intended trade.
+#
+# Per-PROCESS is exactly what makes that reasoning WRONG for a DURABLE session: this
+# set starts empty again on every reopen, so a durable session's own earlier spills —
+# real, still named by its persisted transcript, just written by a now-dead process —
+# are indistinguishable from "a previous run's strays" by membership in this set alone.
+# ``_prune``'s ``durable`` parameter is what tells the two apart instead of relying on
+# ``_OURS``, which structurally cannot: see test_durable_spills_survive_their_own_
+# sessions_reopen (tests/test_offload_strategy.py), which reproduces the reviewer's
+# measured "100 spills, reopen, spill one more, lose 37" without it.
 _OURS: set[Path] = set()
 
 
@@ -147,13 +162,23 @@ def _cut_head_tail(text: str, content_budget: int, tail_fraction: float, marker:
 
 
 def _keep_head(
-    text: _Text, content_budget: int, _tail_fraction: float, marker: str, _scratch: Path | None
+    text: _Text,
+    content_budget: int,
+    _tail_fraction: float,
+    marker: str,
+    _scratch: Path | None,
+    _durable: bool,
 ) -> str:
     return text.shown[:content_budget] + marker
 
 
 def _head_tail(
-    text: _Text, content_budget: int, tail_fraction: float, marker: str, _scratch: Path | None
+    text: _Text,
+    content_budget: int,
+    tail_fraction: float,
+    marker: str,
+    _scratch: Path | None,
+    _durable: bool,
 ) -> str:
     return _cut_head_tail(text.shown, content_budget, tail_fraction, marker)
 
@@ -324,7 +349,7 @@ class _OffloadUnavailable(Exception):
     """No complete copy could be written; the caller degrades to an inline excerpt."""
 
 
-def _prune(offload_dir: Path) -> None:
+def _prune(offload_dir: Path, *, durable: bool = False) -> None:
     """Keep the newest ``MAX_OFFLOAD_FILES`` spills, drop older strays and dead temps.
 
     Never anything in ``_OURS``: this session's transcript names those files, so
@@ -333,6 +358,17 @@ def _prune(offload_dir: Path) -> None:
     unconditionally — a write killed between mkstemp and rename, whose name no reader
     was ever given — and they have to go through here, or a process killed mid-write
     leaks past the disk bound the ``*.txt`` sweep is enforcing.
+
+    ``durable=True`` skips the ``*.txt`` reclaim entirely (the abandoned-``.part``
+    sweep above still runs either way — nothing, durable or not, ever names one of
+    those). ``_OURS`` is a module-level, per-PROCESS set: empty again on every
+    reopen, so it cannot tell "a previous PROCESS's strays" (safe to reclaim) apart
+    from "a previous RUN of this same durable SESSION's real spills, still named by
+    its persisted transcript" (must not be reclaimed) — the two look identical by
+    membership in ``_OURS`` alone. ``durable`` is the caller's answer to that
+    question instead: a durable scratch is bounded by the session's own lifetime
+    (``harness.memory.delete_session`` / ``delete_session_scratch``), not by this
+    count. See test_durable_spills_survive_their_own_sessions_reopen.
     """
     strays: list[Path] = []
     ours = 0
@@ -345,6 +381,8 @@ def _prune(offload_dir: Path) -> None:
                 path.unlink()
         elif path.suffix == ".txt":
             strays.append(path)
+    if durable:
+        return
     keep = max(0, MAX_OFFLOAD_FILES - ours)
     strays.sort(key=lambda p: p.stat().st_mtime)
     for stale in strays[: max(0, len(strays) - keep)]:
@@ -457,13 +495,17 @@ def _offload_dir(scratch_dir: Path | None) -> Path:
     return landed
 
 
-def _spill(text: str, scratch_dir: Path | None) -> str:
+def _spill(text: str, scratch_dir: Path | None, *, durable: bool = False) -> str:
     """Write the complete text under the session scratch; return its VIRTUAL ref.
 
     The filename is a content hash — deterministic per call, so a retried or repeated
     identical result re-lands on the same file instead of littering scratch. The
     encoding is explicit here and on ``read_file``'s side, so the round trip does not
     depend on the host's locale.
+
+    ``durable`` is forwarded to ``_prune`` unchanged — see its docstring for why the
+    per-process ``_OURS`` set cannot make this call on its own for a session whose
+    transcript (and therefore whose live footers) can outlive this process.
     """
     landed = _offload_dir(scratch_dir)
     payload = text.encode("utf-8")
@@ -474,7 +516,7 @@ def _spill(text: str, scratch_dir: Path | None) -> str:
     # file: from here on pruning must leave it alone.
     _OURS.add(target)
     with suppress(OSError):  # housekeeping must never cost us the copy we just wrote
-        _prune(landed)
+        _prune(landed, durable=durable)
     return spill_ref(target.name)
 
 
@@ -491,7 +533,12 @@ def _why(exc: Exception) -> str:
 
 
 def _offload_to_file(
-    text: _Text, content_budget: int, tail_fraction: float, marker: str, scratch_dir: Path | None
+    text: _Text,
+    content_budget: int,
+    tail_fraction: float,
+    marker: str,
+    scratch_dir: Path | None,
+    durable: bool,
 ) -> str:
     """Recoverable truncation: write the COMPLETE text to a session scratch file, keep
     the ``head_tail`` excerpt inline, and append a footer naming the file.
@@ -506,11 +553,15 @@ def _offload_to_file(
     tool call and an unsaved session — strictly worse than the inline excerpt every
     other strategy would have produced. A failed write degrades to exactly that, and
     the marker says so instead of pretending a file exists.
+
+    ``durable`` is forwarded to ``_spill`` unchanged — see ``_prune`` for why a
+    durable session's own earlier spills must never be pruned on the strength of
+    this process's (empty, on a reopen) ``_OURS`` set alone.
     """
     try:
         # The tool's bytes, not the model's copy of them: this file is re-read, diffed,
         # applied and checksummed, and a relabeled line inside it is silent corruption.
-        ref = _spill(text.complete, scratch_dir)
+        ref = _spill(text.complete, scratch_dir, durable=durable)
     except (_OffloadUnavailable, OSError, UnicodeError) as exc:
         note = _note(marker, _why(exc))
         return _cut_head_tail(text.shown, content_budget, tail_fraction, note)
@@ -542,7 +593,10 @@ class _TruncationStrategy:
     # places it, rather than the caller gluing one fixed shape onto every strategy's
     # output. offload_to_file also appends its own footer AFTER the excerpt: only
     # the strategy knows the path it wrote, so only it can name the recovery route.
-    apply: Callable[[_Text, int, float, str, Path | None], str]
+    # Trailing bool: ``durable`` (Task 3 follow-up) — ignored by the two inline
+    # strategies (nothing prunable about text that never touches disk), consumed
+    # only by offload_to_file, which is the only one that can reach ``_prune``.
+    apply: Callable[[_Text, int, float, str, Path | None, bool], str]
     # Does the strategy leave a recovery route of its own? The caller's
     # continuation_hint is then dropped rather than competing with it (see truncate).
     routes_recovery: bool = False
@@ -590,6 +644,7 @@ def truncate(
     budget: int | None = None,
     continuation_hint: str | None = None,
     scratch_dir: str | Path | None = None,
+    durable: bool = False,
 ) -> str:
     """Apply one vetted truncation strategy to text the harness or the user chose.
 
@@ -597,6 +652,12 @@ def truncate(
     content a later ``apply_patch``/``edit_file`` may have to match character for
     character. So it is cut and never rewritten. Tool output goes through
     ``truncate_tool_result`` instead.
+
+    ``durable`` mirrors ``scratch_dir``: it is meaningless unless this call reaches
+    ``offload_to_file`` (today, no caller of THIS entrance passes a ``scratch_dir``,
+    so it never does — see ``truncate_tool_result`` for the one that matters), and is
+    accepted here anyway so the two entrances share one signature rather than one of
+    them silently defaulting to "always prunable" the day a caller changes that.
     """
     return _door(
         _Text(text, text),
@@ -604,6 +665,7 @@ def truncate(
         budget=budget,
         continuation_hint=continuation_hint,
         scratch_dir=scratch_dir,
+        durable=durable,
     )
 
 
@@ -614,6 +676,7 @@ def truncate_tool_result(
     budget: int | None = None,
     continuation_hint: str | None = None,
     scratch_dir: str | Path | None = None,
+    durable: bool = False,
 ) -> str:
     """The same door for TOOL OUTPUT — the untrusted domain, defanged on the way in.
 
@@ -626,6 +689,10 @@ def truncate_tool_result(
     Every result comes through here, including under-budget ones and whatever strategy
     is selected: the guard that used to sit inside one strategy's over-budget path was
     inert in three of four realistic cases and never fired under the shipped default.
+
+    ``durable`` is the caller's ``session_env.durable`` (agent.py passes it straight
+    through): whether a spill this call makes must survive being pruned by a LATER,
+    different process reopening the same session. See ``_prune``.
     """
     return _door(
         _Text(_defang(text), text),
@@ -633,6 +700,7 @@ def truncate_tool_result(
         budget=budget,
         continuation_hint=continuation_hint,
         scratch_dir=scratch_dir,
+        durable=durable,
     )
 
 
@@ -643,6 +711,7 @@ def _door(
     budget: int | None = None,
     continuation_hint: str | None = None,
     scratch_dir: str | Path | None = None,
+    durable: bool = False,
 ) -> str:
     """The door itself, shared by both trust domains.
 
@@ -651,8 +720,11 @@ def _door(
     unavoidable, losing the fact that bytes were lost is not — and under
     ``offload_to_file`` the bytes are not even lost, only moved to a file in the
     session's private scratch that the marker's footer names. The inline strategies
-    ignore ``scratch_dir``; offload degrades to an inline excerpt without one rather
-    than guessing a directory (the process cwd is not the session's scratch).
+    ignore ``scratch_dir`` (and ``durable``); offload degrades to an inline excerpt
+    without a ``scratch_dir`` rather than guessing a directory (the process cwd is
+    not the session's scratch). ``durable`` only matters to offload too — it is
+    whether the file just written must survive being pruned by a LATER process that
+    reopens this same session (harness/session_env.py; see ``_prune``).
 
     This is the one door: every result the model sees comes through here exactly once,
     which is what lets the rules below be this short.
@@ -689,4 +761,4 @@ def _door(
     # cwd instead of degrading — the empty string has to be caught here, before it is
     # ever wrapped in a Path, because a Path object is truthy no matter what it names.
     scratch = Path(scratch_dir) if scratch_dir else None
-    return strat.apply(text, max_chars, policy.tail_fraction, marker, scratch)
+    return strat.apply(text, max_chars, policy.tail_fraction, marker, scratch, durable)

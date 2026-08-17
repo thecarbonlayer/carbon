@@ -509,7 +509,10 @@ class AgentTUI(App):
         self.query_one("#prompt", Input).focus()
 
     def _reset_session(self) -> None:
-        """Clear the current session's history + trace, keeping the same name."""
+        """Clear the current session's history, trace, and scratch (all three —
+        ``memory.delete_session`` removes the scratch too, since Task 3's durable
+        sessions), keeping the same name. ``_open_session`` below then reopens that
+        name fresh, which recreates an empty scratch for it."""
         session = self.agent.session or "cli"
         delete_session(session, self.sessions_dir)
         self._open_session(session)

@@ -1,4 +1,4 @@
-"""Session-scoped runtime storage — the harness's private scratch, outside the repo.
+"""Session-scoped runtime storage — the harness's private scratch.
 
 The workspace is the user's durable project; everything the HARNESS creates at run
 time (offloaded tool output today) is runtime state with a different lifecycle and a
@@ -7,7 +7,9 @@ different audience. Holding runtime state inside the workspace made it repo-visi
 cost was a security task counting a harness cache file as a workspace leak.
 
 The contract, which tests enforce clause by clause:
-  - scratch is PRIVATE (0700, unpredictable name via mkdtemp) and OUTSIDE the repo;
+  - an EPHEMERAL session's scratch (the default) is PRIVATE (0700), UNPREDICTABLE
+    (mkdtemp draws its name from a CSPRNG, not the session id), and lives entirely
+    OUTSIDE the repo — the OS temp dir, unrelated to any project tree;
   - an EPHEMERAL session's scratch lives exactly as long as the session:
     ``cleanup()`` removes it, callers run that in ``finally`` (success, failure,
     cancellation alike);
@@ -19,16 +21,37 @@ The contract, which tests enforce clause by clause:
     sitting until scavenge's next pass, not "at most one" for the process;
     ``close()`` is the contract for everything else;
   - a DURABLE session (``local_session_env(..., session=..., sessions_dir=...)``)
-    is the one exception to "cleanup() removes it": its scratch lives at a
-    deterministic path under ``sessions_dir`` and is tied to the SESSION's
-    lifetime, not to whichever process happens to have it open — because a
-    persisted transcript can hold ``scratch://`` refs (``offload_to_file``) that
-    must still resolve the next time the same session is reopened. Its
-    ``cleanup()`` is a no-op; only ``delete_session_scratch()`` (or deleting the
-    session itself) ends it. Structurally out of ``scavenge()``'s reach too — it
-    lives under ``sessions_dir``, never the OS temp dir ``scavenge()`` sweeps;
-  - another session cannot name it (unpredictable component, or — for a durable
-    session — the sanitized session id) or read it (0700, sessions_dir included);
+    trades BOTH ephemeral guarantees above for a deterministic path under
+    ``sessions_dir`` instead: PREDICTABLE by design (reopening the same session must
+    land on the same scratch — see the naming-collision note below), and not
+    guaranteed to be outside the repo (``sessions_dir`` defaults to project-relative
+    ``.sessions``; that it usually ends up gitignored is a caller convention, not
+    something this module enforces). What it keeps: still PRIVATE (0700 — see the
+    mode caveat below), and tied to the SESSION's lifetime rather than to whichever
+    process happens to have it open, because a persisted transcript can hold
+    ``scratch://`` refs (``offload_to_file``) that must still resolve the next time
+    the same session is reopened. Its ``cleanup()`` is a no-op; only
+    ``delete_session_scratch()`` — or deleting the session itself via
+    ``harness.memory.delete_session``, which now calls that too — ends it.
+    Structurally out of ``scavenge()``'s reach as well: it lives under
+    ``sessions_dir``, never the OS temp dir ``scavenge()`` sweeps;
+  - PRIVATE (0700) holds for the leaf scratch directory in both lifetimes, and for a
+    freshly-created ``sessions_dir``. Two caveats, both about creation, not a hole
+    anything can walk through: ``mkdir(parents=True)`` applies ``mode`` only to the
+    directory it was actually asked to create, so any intermediate parent
+    ``local_session_env`` has to create along the way (whichever of
+    ``sessions_dir``'s own ancestors are ALSO missing) lands at the platform default
+    instead — verified empirically at 0755 here, umask-dependent, not assumed from
+    the docs; and a ``sessions_dir`` or scratch dir that already existed before this
+    call (e.g. one ``memory.py``'s ``save_session`` created first, which does not
+    restrict its own mode) is left at whatever mode it already had;
+  - another session cannot NAME an ephemeral scratch (the mkdtemp component is
+    unguessable). A durable session's name IS its sanitized session id — deliberately
+    predictable, not secret — so two DIFFERENT raw ids that sanitize to the same
+    component collide on purpose: ``"a/b"`` and ``"b"`` both land on ``"b.scratch"``,
+    the identical collapsing ``harness/memory.py:_path`` already accepts for the
+    ``.jsonl`` file (see ``_safe_session_dirname``). That is a caller-created naming
+    collision, not a break-in from outside the sanitization rule;
   - ``metadata`` states what kind of environment this is and its storage policy, so
     a results manifest can record what the measurement ran on.
 
@@ -123,9 +146,15 @@ def _safe_session_dirname(session: str) -> str:
     Same rule ``harness/memory.py:_path`` already applies to a session id headed for
     a filename: take only the FINAL path component (``Path(session).name``), so a
     value like ``"../../etc/passwd"`` collapses to ``"passwd"`` and can't walk a
-    durable scratch dir outside ``sessions_dir``. ``memory.py`` falls back to
-    ``"session"`` when that component is empty (e.g. the id was ``".."`` or ``"."``
-    or ``"/"``); this mirrors that fallback too, so the two modules never disagree
+    durable scratch dir outside ``sessions_dir``. The empty-component fallback to
+    ``"session"`` fires for ``"."``, ``"/"``, or ``""`` — verified empirically, NOT
+    for ``".."``: ``Path("..").name`` is the literal two-character string ``".."``,
+    not empty, so an id of exactly ``".."`` does not hit this fallback at all. It
+    sanitizes to the ordinary, contained component ``".."``, landing the scratch at
+    ``"...scratch"`` — a normal filename (three dots, then letters) that is safe
+    precisely because it is NOT the path component ``".."``; nothing downstream
+    interprets it as "go up a directory". This mirrors ``memory.py``'s fallback
+    exactly (same trigger, same replacement), so the two modules never disagree
     about what a given session id sanitizes to.
     """
     return Path(session).name or "session"
@@ -171,14 +200,19 @@ def local_session_env(
 
 def delete_session_scratch(session: str, sessions_dir: str | Path) -> None:
     """Explicitly end a durable session's scratch lifetime — the ``cleanup()`` a
-    durable ``SessionEnvironment`` refuses to do for itself. Pairs with
-    ``harness.memory.delete_session`` (its messages/trace) so a full session delete
-    can remove both. Idempotent: a missing directory is not an error.
+    durable ``SessionEnvironment`` refuses to do for itself. Idempotent: a missing
+    directory is not an error.
+
+    ``harness.memory.delete_session`` calls this directly now (its messages/trace,
+    then this), so a session delete removes both without a caller having to
+    remember to pair the two — ``ui/tui.py``'s ``/reset`` is the one production
+    caller and gets it for free. This stays a public, standalone function for the
+    rarer case of wanting only the scratch gone.
 
     Takes the session id, not a ``SessionEnvironment``, and recomputes the same
     sanitized path ``local_session_env`` would (see ``_safe_session_dirname``) — so
-    a caller who only has the id on hand (e.g. a ``/reset``-style command) doesn't
-    need a live env to remove it.
+    a caller who only has the id on hand (e.g. ``memory.delete_session``, or a
+    ``/reset``-style command) doesn't need a live env to remove it.
     """
     scratch = Path(sessions_dir) / f"{_safe_session_dirname(session)}.scratch"
     shutil.rmtree(scratch, ignore_errors=True)
