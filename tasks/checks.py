@@ -274,7 +274,10 @@ def _accept_ch05_approval() -> bool:
         approval_required={"bash"},
     )
     try:
-        tools = default_tools()
+        # scratch_root=: the matching half of the SAME footer bash can now
+        # resolve (see the Sandbox below) — without it, read_file still could
+        # not resolve the scratch:// route the same footer also names.
+        tools = default_tools(scratch_root=a.session_env.scratch_root)
         tools.register(bash_tool(Sandbox(scratch_dir=a.session_env.scratch_root)))
         a.tools = tools
         a.send("Run this shell command now using the bash tool: echo SHOULD_NOT_RUN")
@@ -301,17 +304,29 @@ def _build_workspace_agent():
     a = agent.Agent(
         system="You build files. Use write_file to create them and bash to run them.",
     )
-    tools = default_tools()
-    tools.register(write_file_tool(ws))
-    tools.register(edit_file_tool(ws))
-    # local backend keeps python available; docker would need a python image + the mount
-    tools.register(
-        bash_tool(
-            Sandbox(prefer_docker=False, scratch_dir=a.session_env.scratch_root),
-            workdir=str(ws.root),
+    # The try opens HERE, immediately after the Agent (and the session scratch it
+    # just created and owns) exist — the same shape ui/tui.py's _build_agent
+    # uses. Tool-building below can raise, and a raise here used to propagate
+    # straight out of this function with a.close() never called, leaking the
+    # scratch this Agent already allocated in __init__.
+    try:
+        # scratch_root=: the matching half of the SAME footer bash can now
+        # resolve (see the Sandbox below) — without it, read_file still could
+        # not resolve the scratch:// route the same footer also names.
+        tools = default_tools(scratch_root=a.session_env.scratch_root)
+        tools.register(write_file_tool(ws))
+        tools.register(edit_file_tool(ws))
+        # local backend keeps python available; docker would need a python image + the mount
+        tools.register(
+            bash_tool(
+                Sandbox(prefer_docker=False, scratch_dir=a.session_env.scratch_root),
+                workdir=str(ws.root),
+            )
         )
-    )
-    a.tools = tools
+        a.tools = tools
+    except BaseException:
+        a.close()
+        raise
     return a, ws  # caller owns a.close()
 
 
@@ -364,15 +379,21 @@ def _demo_ch05() -> None:
 
     # Agent before tools (see _build_workspace_agent above): the Sandbox needs
     # THIS agent's own session scratch, which does not exist until it is built.
+    # The try opens immediately after, same as _accept_ch05_approval above —
+    # tool-building can raise, and a raise before the try used to leak the
+    # scratch this Agent already allocated.
     gated = agent.Agent(
         system="Use bash when asked.",
         approve=lambda n, args: False,
         approval_required={"bash"},
     )
-    tools = default_tools()
-    tools.register(bash_tool(Sandbox(scratch_dir=gated.session_env.scratch_root)))
-    gated.tools = tools
     try:
+        # scratch_root=: the matching half of the SAME footer bash can now
+        # resolve (see the Sandbox below) — without it, read_file still could
+        # not resolve the scratch:// route the same footer also names.
+        tools = default_tools(scratch_root=gated.session_env.scratch_root)
+        tools.register(bash_tool(Sandbox(scratch_dir=gated.session_env.scratch_root)))
+        gated.tools = tools
         print("— a boundary-crossing tool, denied by the gate —")
         print("bot>", gated.send("Run: echo hello (use bash)"))
         print("(the gate denied the bash call — it never executed)\n")
@@ -676,7 +697,10 @@ def _accept_ch08_sandbox() -> bool:
     # session scratch, which does not exist until the Agent is constructed.
     a = agent.Agent(system="Use the bash tool to run shell commands.")
     try:
-        tools = default_tools()
+        # scratch_root=: the matching half of the SAME footer bash can now
+        # resolve (see the Sandbox below) — without it, read_file still could
+        # not resolve the scratch:// route the same footer also names.
+        tools = default_tools(scratch_root=a.session_env.scratch_root)
         tools.register(bash_tool(Sandbox(scratch_dir=a.session_env.scratch_root)))
         a.tools = tools
         reply = a.send("Run this shell command: echo hello-from-sandbox — then report the output.")
@@ -729,7 +753,10 @@ def _demo_ch08() -> None:
     # the Agent is constructed.
     a = agent.Agent()
     try:
-        tools = default_tools()
+        # scratch_root=: the matching half of the SAME footer bash can now
+        # resolve (see the Sandbox below) — without it, read_file still could
+        # not resolve the scratch:// route the same footer also names.
+        tools = default_tools(scratch_root=a.session_env.scratch_root)
         tools.register(bash_tool(Sandbox(scratch_dir=a.session_env.scratch_root)))
         a.tools = tools
         print("bot>", a.send("Use bash to print the current working directory and the date."))
@@ -968,17 +995,29 @@ def _build_ch12_agent():
     # exist until the Agent is constructed — see
     # tests/episodes/test_ch12.py::test_ch12_agents_bash_tool_reaches_its_own_scratch.
     a = agent.Agent(system=agent.DEFAULT_SYSTEM, agents_dir=str(ws.root), verify_attempts=4)
-    tools = default_tools()
-    tools.register(write_file_tool(ws))
-    tools.register(edit_file_tool(ws))
-    # trusted bash so the declared command runs in a real env (deps-free here)
-    tools.register(
-        bash_tool(
-            Sandbox(trusted=True, timeout=60, scratch_dir=a.session_env.scratch_root),
-            workdir=str(ws.root),
+    # The try opens HERE, immediately after the Agent (and the session scratch it
+    # just created and owns) exist — the same shape ui/tui.py's _build_agent
+    # uses. Tool-building below can raise, and a raise here used to propagate
+    # straight out of this function with a.close() never called, leaking the
+    # scratch this Agent already allocated in __init__.
+    try:
+        # scratch_root=: the matching half of the SAME footer bash can now
+        # resolve (see the Sandbox below) — without it, read_file still could
+        # not resolve the scratch:// route the same footer also names.
+        tools = default_tools(scratch_root=a.session_env.scratch_root)
+        tools.register(write_file_tool(ws))
+        tools.register(edit_file_tool(ws))
+        # trusted bash so the declared command runs in a real env (deps-free here)
+        tools.register(
+            bash_tool(
+                Sandbox(trusted=True, timeout=60, scratch_dir=a.session_env.scratch_root),
+                workdir=str(ws.root),
+            )
         )
-    )
-    a.tools = tools
+        a.tools = tools
+    except BaseException:
+        a.close()
+        raise
     return a, ws  # caller owns a.close()
 
 

@@ -157,3 +157,60 @@ def test_workspace_agents_bash_tool_reaches_its_own_scratch():
         assert (a.session_env.scratch_root / "probe.txt").read_text().strip() == "PROOF"
     finally:
         a.close()
+
+
+def test_workspace_agents_read_file_tool_also_reaches_its_own_scratch():
+    """The matching half of the same footer the test above proves bash can
+    resolve: ``_build_workspace_agent``'s registry must ALSO pass
+    ``scratch_root=`` into ``default_tools()``, or a footer naming both routes
+    (``scratch://...`` for read_file, ``$CARBON_SCRATCH_DIR/...`` for bash)
+    would have only the bash half actually work. Stands in for a real spill by
+    writing directly under the session's own scratch, then resolves it through
+    the REGISTRY's read_file tool — never the bare function."""
+    from harness.limits import spill_ref
+
+    a, ws = _build_workspace_agent()
+    try:
+        (a.session_env.scratch_root / "offload").mkdir(parents=True)
+        (a.session_env.scratch_root / "offload" / "probe.txt").write_text("SPILL-PROOF")
+        result = a.tools.call("read_file", json.dumps({"path": spill_ref("probe.txt")}))
+        assert result == "SPILL-PROOF"
+    finally:
+        a.close()
+
+
+def test_build_workspace_agent_closes_the_agent_it_just_built_when_setup_raises(monkeypatch):
+    """``_build_workspace_agent`` constructs the Agent (allocating its scratch in
+    ``Agent.__init__``) BEFORE registering tools — the canonical order this task
+    put it in, so the bash Sandbox can read ``a.session_env.scratch_root``. That
+    reorder re-opened a leak window commit 0468747 closed elsewhere (``ui/tui.py``'s
+    ``_build_agent``, ``harness/agent.py``'s ``run_once``/``_run_repl``): if tool
+    registration raises, the Agent already built must still be closed, not leaked
+    until the next process's ``scavenge()``. Same spy-on-close technique as
+    ``test_build_agent_closes_the_agent_it_just_built_when_setup_raises``
+    (tests/test_tui_streaming.py)."""
+    import harness.agent as agent_mod
+    import harness.tools as tools_mod
+
+    closed: list[bool] = []
+    real_close = agent_mod.Agent.close
+
+    def spy_close(self):
+        closed.append(True)
+        return real_close(self)
+
+    monkeypatch.setattr(agent_mod.Agent, "close", spy_close)
+    monkeypatch.setattr(
+        tools_mod,
+        "default_tools",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("tool-building blew up")),
+    )
+
+    try:
+        _build_workspace_agent()
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("expected the tool-building failure to propagate")
+
+    assert closed, "a raise while building tools must close the Agent already built"

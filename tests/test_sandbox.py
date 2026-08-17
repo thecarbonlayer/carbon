@@ -185,3 +185,77 @@ def test_docker_backend_omits_scratch_mount_when_no_scratch_configured(monkeypat
     assert DOCKER_SCRATCH_MOUNT not in " ".join(argv)
     assert not any(str(a).startswith(f"{SCRATCH_ENV_VAR}=") for a in argv)
     assert "65534:65534" in docker_flags
+
+
+def test_every_inline_bash_tool_sandbox_carries_scratch_dir():
+    """A source-level invariant, not a behavioral one: every INLINE
+    ``bash_tool(Sandbox(...))`` construction under ``harness/``, ``tasks/``, and
+    ``ui/`` must pass ``scratch_dir=``, whether or not execution ever reaches it.
+
+    This batch found the same threaded-but-never-passed shape three times: an
+    earlier task's ``read_file`` registry ``scratch_root``, this task's bash
+    ``Sandbox`` (``harness/agent.py``'s ``_coding_tools`` — the batch's headline
+    bug), and — per review of THIS task — four of its own seven wired sites that
+    no behavioral test can reach at all: two because the approval gate denies
+    the ``bash`` call before it ever runs (``tasks/checks.py``'s
+    ``_accept_ch05_approval`` and ``_demo_ch05``), and two more where a real
+    ``uv run accept`` run against a live model is the strongest available
+    evidence but not a standing pytest guard (``_accept_ch08_sandbox``,
+    ``_demo_ch08`` — see the task-5 report). A source check does not care
+    whether the code path executes, which is exactly what closes the gap
+    behavioral mutation testing structurally cannot — mechanically, not by
+    remembering to check by hand the next time this shape recurs.
+
+    Deliberately narrow in scope: an INLINE ``Sandbox(...)`` passed directly as
+    ``bash_tool(``'s first argument (positional or ``sandbox=``), not a
+    ``Sandbox`` built earlier and referenced by a variable. That is the shape
+    every real site in this batch has actually taken (verified against this
+    check: it flags exactly 6 call sites at the commit before this task's
+    fix — every inline site except ``_accept_ch08_sandbox``'s original
+    ``sandbox = Sandbox(); ...; bash_tool(sandbox)``, which a simple inline
+    check structurally cannot see either way) — a dataflow analysis that tracks
+    variables through a whole file is a different, much larger tool than a
+    ~30-line guard should try to be. ``tasks/checks.py``'s one legitimate
+    unwired ``Sandbox`` (``Sandbox(trusted=True).run(_CH12_COMMAND, ...)``,
+    ch-12's independent verifier re-run) is naturally out of scope: it is never
+    passed to ``bash_tool(`` at all.
+    """
+    import ast
+    from pathlib import Path
+
+    repo_root = Path(__file__).resolve().parent.parent
+
+    def callee_name(node: ast.expr) -> str | None:
+        """The bare name a Call's func resolves to — Name('bash_tool') or an
+        Attribute's .attr — whichever form a call site happens to use."""
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Attribute):
+            return node.attr
+        return None
+
+    def missing_scratch_dir_in(path: Path) -> list[str]:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        found = []
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Call) and callee_name(node.func) == "bash_tool"):
+                continue
+            sandbox_arg = (
+                node.args[0]
+                if node.args
+                else next((kw.value for kw in node.keywords if kw.arg == "sandbox"), None)
+            )
+            if not (
+                isinstance(sandbox_arg, ast.Call) and callee_name(sandbox_arg.func) == "Sandbox"
+            ):
+                continue  # not an inline Sandbox(...) — out of scope, see docstring
+            if not any(kw.arg == "scratch_dir" for kw in sandbox_arg.keywords):
+                found.append(f"{path.relative_to(repo_root)}:{node.lineno}")
+        return found
+
+    missing = []
+    for dirname in ("harness", "tasks", "ui"):
+        for path in sorted((repo_root / dirname).rglob("*.py")):
+            missing.extend(missing_scratch_dir_in(path))
+
+    assert not missing, f"bash_tool(Sandbox(...)) missing scratch_dir=: {missing}"

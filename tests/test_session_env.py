@@ -204,20 +204,28 @@ def test_scavenge_does_not_touch_durable_scratch(tmp_path):
     assert (env.scratch_root / "x.txt").read_text() == "keep me"
 
 
-# --- CARBON_SCRATCH_TEST_ROOT: ownership by location, not by diffing ------------
+# --- scratch_parent_dir(): ownership by location, not by diffing ---------------
 # tests/conftest.py's session-scoped `_isolated_scratch_root` fixture relies on
 # this mechanism to fix a P1: the old per-test fixture swept `carbon-scratch-*` by
 # snapshot-diffing the REAL OS temp dir, which cannot tell "this test's own leak"
 # from "a directory a concurrent, unrelated process (a live measurement) created
-# in that same window" — and deleted the latter right along with the former. These
-# two tests pin the mechanism directly, hermetically (a real system temp dir is
-# never touched — both the "real" and the redirected root are tmp_path children).
-def test_scavenge_default_root_follows_the_test_root_override(tmp_path, monkeypatch):
-    """With CARBON_SCRATCH_TEST_ROOT set, scavenge()'s bare default (root=None —
-    exactly how local_session_env() calls it) sweeps the REDIRECTED root: our own
-    stray inside it is removed, and a stray outside it — standing in for a
-    concurrent process's real scratch, sitting in what would be the real OS temp
-    dir — is never even glob-reachable, let alone touched."""
+# in that same window" — and deleted the latter right along with the former. The
+# fix monkeypatches `scratch_parent_dir()` itself, not an env var: an earlier
+# version of this used CARBON_SCRATCH_TEST_ROOT honoured inside
+# harness/session_env.py, which review caught as reachable from a stray line in
+# .env (model/provider.py's Provider.from_env() pulls every .env key into
+# os.environ, ahead of the first Agent in every entrypoint) — a real production
+# surface for a test-only seam to have. A monkeypatched function has none. These
+# tests pin the mechanism directly, hermetically (a real system temp dir is never
+# touched — both the "real" and the redirected root are tmp_path children).
+def test_scavenge_default_root_follows_the_scratch_parent_dir_override(tmp_path, monkeypatch):
+    """With scratch_parent_dir() monkeypatched — the mechanism tests/conftest.py's
+    session fixture relies on — scavenge()'s bare default (root=None — exactly
+    how local_session_env() calls it) sweeps the REDIRECTED root: our own stray
+    inside it is removed, and a stray outside it — standing in for a concurrent
+    process's real scratch, sitting in what would be the real OS temp dir — is
+    never even glob-reachable, let alone touched."""
+    import harness.session_env as session_env_mod
     from harness.session_env import SCRATCH_PREFIX, scavenge
 
     real_system_temp = tmp_path / "real-os-tmp"
@@ -233,10 +241,10 @@ def test_scavenge_default_root_follows_the_test_root_override(tmp_path, monkeypa
     old = time.time() - 100_000
     os.utime(ours, (old, old))
 
-    monkeypatch.setenv("CARBON_SCRATCH_TEST_ROOT", str(test_root))
-    # Nothing below should ever reach for this while the override is set — kept
-    # pointed elsewhere so a fallback to it would show up as a wrong answer, not
-    # a coincidentally-right one.
+    monkeypatch.setattr(session_env_mod, "scratch_parent_dir", lambda: test_root)
+    # Nothing below should ever reach for this while the override is active — kept
+    # pointed elsewhere so a fallback to it would show up as a wrong answer, not a
+    # coincidentally-right one.
     monkeypatch.setattr(tempfile, "gettempdir", lambda: str(real_system_temp))
 
     removed = scavenge(max_age_s=86_400)  # bare default root, no explicit root=
@@ -247,11 +255,12 @@ def test_scavenge_default_root_follows_the_test_root_override(tmp_path, monkeypa
     assert (foreign / "evidence.txt").read_text() == "a concurrent measurement's spill"
 
 
-def test_ephemeral_scratch_honors_the_test_root_override(tmp_path, monkeypatch):
+def test_ephemeral_scratch_honors_the_scratch_parent_dir_override(tmp_path, monkeypatch):
     """The creation half of the same mechanism: a NEW ephemeral scratch lands
-    under CARBON_SCRATCH_TEST_ROOT when it is set, never under the real OS temp
-    dir — so nothing a test builds can ever collide with, or be mistaken for, a
-    concurrent process's own scratch in the first place."""
+    under the monkeypatched scratch_parent_dir() override, never under the real
+    OS temp dir — so nothing a test builds can ever collide with, or be mistaken
+    for, a concurrent process's own scratch in the first place."""
+    import harness.session_env as session_env_mod
     from harness.session_env import local_session_env
 
     real_system_temp = tmp_path / "real-os-tmp"
@@ -259,7 +268,7 @@ def test_ephemeral_scratch_honors_the_test_root_override(tmp_path, monkeypatch):
     test_root = tmp_path / "pytest-owned-scratch"
     test_root.mkdir()
 
-    monkeypatch.setenv("CARBON_SCRATCH_TEST_ROOT", str(test_root))
+    monkeypatch.setattr(session_env_mod, "scratch_parent_dir", lambda: test_root)
     monkeypatch.setattr(tempfile, "gettempdir", lambda: str(real_system_temp))
 
     env = local_session_env(tmp_path)
@@ -273,15 +282,19 @@ def test_ephemeral_scratch_honors_the_test_root_override(tmp_path, monkeypatch):
 def test_this_suites_own_fixture_actually_redirects_a_fresh_agent():
     """Integration check on the fixture itself (conftest.py's session-scoped
     ``_isolated_scratch_root``), not just the mechanism the two tests above pin in
-    isolation: by the time ANY test runs, ``CARBON_SCRATCH_TEST_ROOT`` must already
-    be set, and a perfectly ordinary, freshly-built ``Agent`` — no special wiring
-    of its own — must land under it rather than under the real OS temp dir this
-    process could otherwise share with a concurrent live measurement."""
+    isolation: by the time ANY test runs, ``harness.session_env.scratch_parent_dir``
+    must already be replaced with the fixture's own root, and a perfectly
+    ordinary, freshly-built ``Agent`` — no special wiring of its own — must land
+    under it rather than under the real OS temp dir this process could
+    otherwise share with a concurrent live measurement."""
+    import harness.session_env as session_env_mod
     from harness.agent import Agent
-    from harness.session_env import SCRATCH_TEST_ROOT_ENV
 
-    configured = os.environ.get(SCRATCH_TEST_ROOT_ENV)
-    assert configured, "the session fixture must set this before any test body runs"
+    configured = session_env_mod.scratch_parent_dir()
+    assert configured.name.startswith(f"{session_env_mod.SCRATCH_PREFIX}pytest-session-"), (
+        "the session fixture must have replaced scratch_parent_dir() before any "
+        f"test body runs, got {configured}"
+    )
 
     a = Agent()
     try:
@@ -290,7 +303,7 @@ def test_this_suites_own_fixture_actually_redirects_a_fresh_agent():
         # also technically is (mkdtemp has to put its throwaway root somewhere).
         # Isolation comes from being confined to this ONE uniquely-named
         # subdirectory, not from avoiding the temp area altogether.
-        assert a.session_env.scratch_root.resolve().parent == Path(configured).resolve()
+        assert a.session_env.scratch_root.resolve().parent == configured.resolve()
     finally:
         a.close()
 
