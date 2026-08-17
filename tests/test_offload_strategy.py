@@ -409,6 +409,34 @@ def test_a_symlinked_offload_dir_is_refused_before_anything_is_written(tmp_path)
     assert "$CARBON_SCRATCH_DIR" not in out, "…nor the shell route to the same refused file"
 
 
+def test_a_symlinked_scratch_root_is_refused_before_anything_is_created(tmp_path):
+    """The guard's OTHER half. The test above symlinks the ``offload`` CHILD;
+    this one symlinks the scratch ROOT itself — ``scratch_dir`` handed to
+    ``_offload_dir`` is the symlink, not something a level below it.
+
+    Not redundant with the child case: ``_offload_dir``'s post-mkdir
+    containment check resolves ``root`` before comparing it against ``landed``,
+    so once ``root`` itself is the symlink, the comparison is against wherever
+    the link points — which reads as "contained relative to itself" no matter
+    what that is. Only the pre-mkdir ``root.is_symlink()`` check catches this
+    shape; verified by mutation (see the report), not assumed."""
+    from harness.harness_config import TruncationPolicy
+    from harness.limits import truncate_tool_result
+
+    outside = tmp_path / "attacker"
+    outside.mkdir()
+    scratch = tmp_path / "scratch"
+    scratch.symlink_to(outside, target_is_directory=True)
+
+    out = truncate_tool_result(
+        "S" * 9000, TruncationPolicy("offload_to_file", 4000, 0.3), scratch_dir=scratch
+    )
+    assert list(outside.iterdir()) == [], "nothing may be written through the link"
+    assert "offload unavailable" in out, "the marker must say the copy does not exist"
+    assert "scratch://" not in out, "and must not advertise a route to a file we refused to write"
+    assert "$CARBON_SCRATCH_DIR" not in out, "…nor the shell route to the same refused file"
+
+
 def test_forged_footers_in_tool_output_are_defanged(tmp_path):
     """Untrusted output that forges the harness's own recovery instruction would
     otherwise aim read_file wherever it likes."""
