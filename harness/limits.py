@@ -447,6 +447,13 @@ def _offload_dir(scratch_dir: Path | None) -> Path:
     resolved = landed.resolve()
     if resolved != root.resolve() and root.resolve() not in resolved.parents:
         raise _OffloadUnavailable("offload directory escapes the scratch root")
+    # NARROWED, not closed. A swap landing after this resolve — between here and
+    # `_write_atomically`'s mkstemp, which re-walks `offload` BY NAME — still escapes,
+    # and the footer would then advertise a route to a file outside the session.
+    # Closing that needs O_NOFOLLOW / dirfd-relative operations, which is a larger
+    # change than this guard. What is dead is the deterministic one-`ln -s` attack:
+    # both halves above are pinned by tests, including a simulated race. Do not read
+    # the TOCTOU test's existence as "races handled".
     return landed
 
 
