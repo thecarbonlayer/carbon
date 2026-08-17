@@ -76,7 +76,18 @@ def test_docker_backend_mounts_scratch_read_only_at_a_fixed_path(monkeypatch):
     0600, owned by the invoking user, and a native Linux host's bind mount preserves
     that host uid inside the container rather than remapping it — so the fixed
     unprivileged uid this backend otherwise runs as would get EACCES reading its
-    own session's evidence there."""
+    own session's evidence there.
+
+    The invoking identity is FAKED here (rather than read from this test process's
+    own ``os.getuid()``) on purpose: asserting against the real ambient uid is weak
+    in exactly the case worth knowing about — a root-run test process (a CI image)
+    makes the expected value ``0:0``, which is indistinguishable from what a bug
+    that just hardcoded ``"0:0"`` would ALSO produce. A distinctive, controlled,
+    obviously-non-root pair pins the real contract: this backend uses THE INVOKING
+    IDENTITY, not a coincidence. The root case itself gets its own dedicated test
+    below, faked the same way, since almost no dev machine or ordinary CI actually
+    runs pytest as root — without faking it, that branch would go untested in the
+    overwhelming majority of runs even though it is a real, intended code path."""
     import os
     import subprocess
 
@@ -89,6 +100,8 @@ def test_docker_backend_mounts_scratch_read_only_at_a_fixed_path(monkeypatch):
         return subprocess.CompletedProcess(argv, 0, stdout="ok\n", stderr="")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(os, "getuid", lambda: 4242)
+    monkeypatch.setattr(os, "getgid", lambda: 4343)
 
     # _run_docker takes no path through `_docker_up`'s live probe — called directly,
     # exactly like `run()` calls it once the daemon is confirmed up — so no live
@@ -107,8 +120,41 @@ def test_docker_backend_mounts_scratch_read_only_at_a_fixed_path(monkeypatch):
     assert not any(str(a).startswith(SCRATCH_ENV_VAR) and "/host/" in str(a) for a in argv)
     # With a scratch dir mounted, the container runs as the invoking user — not a
     # wider file mode — so it can read its own 0600 spill on a native Linux host.
-    assert f"{os.getuid()}:{os.getgid()}" in docker_flags
+    assert "4242:4343" in docker_flags
     assert "65534:65534" not in docker_flags
+
+
+def test_docker_backend_scratch_mount_runs_as_root_when_the_harness_does(monkeypatch):
+    """Root-run is the INTENDED behavior here, not a case to guard against: a
+    harness invoked as root (a CI image, Docker-in-Docker) writes root-owned 0600
+    spills, and root is then the only uid that can read them back. An
+    ``os.getuid() != 0`` guard would silently fall back to the fixed unprivileged
+    uid and re-break the very route this task exists to open, for exactly the
+    accounts most likely to actually hit it. Faked rather than relying on this test
+    process's own identity, since almost no dev machine or ordinary CI runs pytest
+    as root — this pins the branch as deliberate rather than leaving it exercised
+    only by accident, on whichever machine happens to run the suite as root."""
+    import os
+    import subprocess
+
+    from harness.sandbox import Sandbox
+
+    captured: dict = {}
+
+    def fake_run(argv, **kwargs):
+        captured["argv"] = argv
+        return subprocess.CompletedProcess(argv, 0, stdout="ok\n", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(os, "getuid", lambda: 0)
+    monkeypatch.setattr(os, "getgid", lambda: 0)
+
+    sb = Sandbox(trusted=False, prefer_docker=True, scratch_dir="/host/session-42/scratch")
+    sb._run_docker("echo ok", workdir=None)
+
+    argv = captured["argv"]
+    docker_flags = argv[: argv.index(sb.image)]
+    assert "0:0" in docker_flags
 
 
 def test_docker_backend_omits_scratch_mount_when_no_scratch_configured(monkeypatch):

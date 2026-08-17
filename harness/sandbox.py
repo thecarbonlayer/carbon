@@ -1,17 +1,26 @@
 """Execution environment (ch-08) — the harness runs code, the model never does.
 
 The model only ever asks; the harness executes, inside a boundary. The sandbox
-prefers hardened Docker (``--network none``, non-root, scoped workdir) and falls
-back to a scoped local subprocess when no Docker daemon is available.
+prefers hardened Docker (``--network none``, an unprivileged uid by default,
+scoped workdir) and falls back to a scoped local subprocess when no Docker daemon
+is available.
 
 "Start closed": no network, a fresh isolated workdir, and a scrubbed environment
 (no inherited credentials), so untrusted code never sees the host's secrets. The
 sandbox is the backstop, not the only defense.
 
 **Contract — read this before trusting it.** The *Docker* backend is a genuine
-containment boundary (network-none, non-root, cap-drop, memory + pid limits,
-read-only rootfs). The *local* fallback is **teaching-grade, not a security
-boundary**: it scrubs the environment and confines the cwd, and (as of the
+containment boundary (network-none, cap-drop, memory + pid limits, read-only
+rootfs). Its uid is an unprivileged fixed one — except when a scratch dir is
+mounted, where the container runs as the invoking user instead, so it can read
+that user's own 0600 spills; see ``_run_docker``. State this plainly rather
+than "non-root" unconditionally: that identity is whatever uid actually invoked
+the harness, which is root when the harness itself runs as root (a CI image,
+Docker-in-Docker) — root-run is the intended behavior there, not a gap, since a
+root-owned spill has no OTHER uid that could read it back, and guarding the
+relaxation away would silently re-break the very route it exists to open for
+exactly the accounts most likely to hit it. The *local* fallback is **teaching-grade,
+not a security boundary**: it scrubs the environment and confines the cwd, and (as of the
 hardening below) puts each command in its own process group so a timeout kills the
 whole tree — but it does *not* isolate the filesystem or cap host memory. Untrusted
 code on the local fallback can still read host files. The size limit that keeps a
@@ -47,11 +56,19 @@ _SCRUBBED_ENV = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LC_ALL": "C"}
 # builds the same name into text the model reads). A fixed mount under Docker — the
 # container path is stable and says nothing about the host — the real path under
 # local execution, where there is no mount namespace to hide behind. Either way the
-# MODEL only ever sees the variable's NAME, `$CARBON_SCRATCH_DIR/offload/<file>`, so
-# no host path reaches a prompt or a stored transcript. Defined here, not in
-# limits.py: this module imports nothing from the chapters above it (see the module
-# docstring), so a sandbox-side constant is what limits.py reaches for, never the
-# reverse — and limits.py does so with a deferred import (see ``shell_ref``), because
+# MODEL only ever sees the variable's NAME, `$CARBON_SCRATCH_DIR/offload/<file>`, in
+# the FOOTER TEXT the harness itself writes — that copy never carries an expanded
+# path. A command run AGAINST the mount can still print one of its own: the shell
+# expands the variable before `cut`/`grep`/etc. ever run, so a stale ref's "no such
+# file" names the real path in THAT command's own stderr. Not scrubbed — a blanket
+# rewrite can't tell "a path leaked into an error" from "a path is legitimately
+# part of file content a command is displaying," and would risk corrupting the
+# latter to fix the former.
+#
+# Defined here, not in limits.py: this module imports nothing from the chapters
+# above it (see the module docstring), so a sandbox-side constant is what limits.py
+# reaches for, never the reverse — and limits.py does so with a deferred import
+# (see ``shell_ref``), because
 # this module imports ``harness.tools``, which imports ``harness.limits`` for
 # ``SCRATCH_SCHEME``; a module-level import back here would close that into a real
 # three-module cycle, order-dependent on which of the three a caller happens to touch
@@ -157,7 +174,9 @@ class Sandbox:
         return self._run_local(command, workdir)
 
     def _run_docker(self, command: str, workdir: str | None) -> SandboxResult:
-        # Hardened: no network, non-root, capabilities dropped, writable only in /work.
+        # Hardened: no network, capabilities dropped, writable only in /work. The uid
+        # is fixed and unprivileged UNLESS a scratch dir is mounted, in which case it
+        # is the invoking user's — see the `user` comment below for why.
         # /work is a throwaway tmpfs unless a workspace is bind-mounted.
         work = ["-v", f"{workdir}:/work"] if workdir else ["--tmpfs", "/work:rw,size=16m"]
         # Read-only on purpose, unlike /work: the spill is evidence to be read, and a

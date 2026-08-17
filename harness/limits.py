@@ -71,8 +71,16 @@ def shell_ref(filename: str) -> str:
     handle wearing a path's clothes. Both consumers get an adapter.
 
     The variable's NAME is baked into this module (below); its value is set by
-    ``harness.sandbox`` on the ``Sandbox`` that actually runs the command, so what
-    lands in the transcript is always the name, never a host path.
+    ``harness.sandbox`` on the ``Sandbox`` that actually runs the command. What
+    THIS function writes, and what the footer below assembles it into, never
+    carries an expanded path — only the name. That is narrower than "never a host
+    path lands in the transcript": a command run AGAINST the mount can still print
+    one of its own, since the shell expands ``$CARBON_SCRATCH_DIR`` before
+    ``cut``/``grep``/etc. ever run, so a stale ref's "no such file" names the real
+    path in THAT command's own stderr. Not scrubbed there either — a blanket
+    rewrite can't tell "a path leaked into an error" from "a path is legitimately
+    part of file content a command is displaying," and would risk corrupting the
+    latter to fix the former.
     """
     # Deferred, not module-level: this module is imported BY harness.sandbox's own
     # dependency chain (sandbox -> tools -> limits, for SCRATCH_SCHEME), so a
