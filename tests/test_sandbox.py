@@ -249,8 +249,17 @@ def test_every_inline_bash_tool_sandbox_carries_scratch_dir():
                 isinstance(sandbox_arg, ast.Call) and callee_name(sandbox_arg.func) == "Sandbox"
             ):
                 continue  # not an inline Sandbox(...) — out of scope, see docstring
-            if not any(kw.arg == "scratch_dir" for kw in sandbox_arg.keywords):
+            kw = next((k for k in sandbox_arg.keywords if k.arg == "scratch_dir"), None)
+            if kw is None:
                 found.append(f"{path.relative_to(repo_root)}:{node.lineno}")
+            elif isinstance(kw.value, ast.Constant) and not kw.value.value:
+                # `scratch_dir=None` (or "") is FUNCTIONALLY identical to omitting it —
+                # Sandbox.__init__ stores `Path(scratch_dir) if scratch_dir else None`.
+                # A guard that accepted a falsy literal would be satisfied by exactly
+                # the shape this batch keeps producing: a parameter that is present and
+                # carries nothing. At the four sites no behavioral test can reach, this
+                # check is the only protection, so it has to read the value too.
+                found.append(f"{path.relative_to(repo_root)}:{node.lineno} (scratch_dir is falsy)")
         return found
 
     missing = []
