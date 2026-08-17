@@ -81,18 +81,30 @@ def test_scavenge_judges_staleness_from_the_newest_write_not_the_roots_own_mtime
     test ages a dir artificially to prove the *removal* half works) — this proves
     the *survival* half, so the root's mtime is left exactly as directory creation
     left it, and only the sleep + later write make it stale by wall-clock time.
+
+    Scoped to a dedicated ``root`` (``scavenge(..., root=...)``), never the real OS
+    temp dir this function sweeps by default: ``max_age_s=1`` is aggressive enough
+    (needed to keep the test fast) that running it against the real temp dir would
+    reap ANY ``carbon-scratch-*`` directory idle for as little as a second —
+    including a genuinely still-running session's, on a machine that also runs
+    long-lived measurement sessions. A reviewer reproduced exactly that: a real
+    60-second-old stray on the machine made a since-removed ``assert removed == 0``
+    fail while the property under test (a live session survives) still held —
+    ``removed`` depends on whatever else happens to be in the swept directory,
+    never on this test's own fixture alone, which is also why that assertion is
+    gone; the two assertions below already fully pin the actual property, the same
+    way the sibling test above uses ``removed >= 1`` for the identical reason.
     """
-    env = local_session_env(tmp_path)
-    try:
-        (env.scratch_root / "offload").mkdir()  # bumps the root's mtime once, now
-        time.sleep(1.2)  # both the root and offload/ itself age past max_age_s=1
-        (env.scratch_root / "offload" / "x.txt").write_text("still alive")  # fresh, one level down
-        removed = scavenge(max_age_s=1)
-        assert removed == 0
-        assert env.scratch_root.exists(), "a live session's newest write must save it from scavenge"
-        assert (env.scratch_root / "offload" / "x.txt").read_text() == "still alive"
-    finally:
-        env.cleanup()
+    sweep_root = tmp_path / "scavenge-root"
+    sweep_root.mkdir()
+    scratch = sweep_root / f"{SCRATCH_PREFIX}mtime-test"
+    scratch.mkdir(mode=0o700)
+    (scratch / "offload").mkdir()  # bumps the root's mtime once, now
+    time.sleep(1.2)  # both the root and offload/ itself age past max_age_s=1
+    (scratch / "offload" / "x.txt").write_text("still alive")  # fresh, one level down
+    scavenge(max_age_s=1, root=sweep_root)
+    assert scratch.exists(), "a live session's newest write must save it from scavenge"
+    assert (scratch / "offload" / "x.txt").read_text() == "still alive"
 
 
 def test_metadata_names_kind_and_storage_policy(tmp_path):

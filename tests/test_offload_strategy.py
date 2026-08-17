@@ -1421,6 +1421,46 @@ def test_orchestrator_run_threads_scratch_root_into_a_caller_supplied_registry(t
     assert expected.startswith("log.txt:1: needle-line-0000")  # sanity: head is where expected
 
 
+def test_orchestrators_scratch_wrap_still_falls_through_for_non_scratch_paths(tmp_path):
+    """``_resolve_scratch_refs``'s wrap (harness/orchestrator.py) must intercept
+    ONLY ``scratch://`` paths. A plausible one-line "simplification" — dropping
+    the ``if path.startswith(SCRATCH_SCHEME): ... else: return orig(...)`` branch
+    and routing every path through the standalone ``read_file(path, ...,
+    scratch_root=scratch_root)`` unconditionally — leaves this call's own `root`
+    argument unset, so a NON-scratch path (a plain workspace-relative one) would
+    resolve against ``Path.cwd()`` (``read_file``'s own default) instead of
+    whatever workspace root the caller's ORIGINAL registry was confined to. That
+    is the exact confinement bug this repo already guards elsewhere (harness/
+    tools.py's own `read_file` tests), reintroduced here through a different
+    door.
+
+    Not caught by the round-trip test above, which only ever drives a
+    ``scratch://`` path through the wrapped registry and never exercises the
+    fall-through at all. Not caught by ``uv run verify`` either — the one caller
+    that would notice, ``tasks/checks.py``'s live ch-10 accept check, needs a
+    live model and isn't part of that gate. This is the offline guard instead,
+    driven directly at the wrap itself rather than through a full scripted
+    Orchestrator conversation, so it stays fast and isolates exactly the
+    mechanism under review.
+    """
+    from harness.orchestrator import _resolve_scratch_refs
+    from harness.tools import default_tools
+
+    root = tmp_path / "ws"
+    root.mkdir()
+    (root / "first.txt").write_text("ALPHA")
+
+    registry = default_tools(str(root))  # no scratch_root — real caller's shape
+    registry.wrap("read_file", _resolve_scratch_refs(tmp_path / "unrelated-scratch"))
+
+    result = registry.call("read_file", json.dumps({"path": "first.txt"}))
+
+    assert result == "ALPHA", (
+        f"a non-scratch path must still resolve against the caller's own root, "
+        f"not the process cwd: got {result!r}"
+    )
+
+
 def test_a_workers_default_tools_are_rooted_at_agents_dir_not_the_process_cwd(tmp_path):
     """A worker given no registry got one rooted at the process's cwd while
     ``agents_dir`` — the tree it was actually handed to read — went unseen; a bare
@@ -1934,3 +1974,140 @@ def test_durable_cleanup_does_not_forget_ours_entries(tmp_path):
 
     assert set(spilled) <= limits_mod._OURS, "a durable cleanup() must not forget its own spills"
     assert env.scratch_root.exists(), "sanity: durable cleanup() must not remove the scratch either"
+
+
+def test_cleanup_survives_ours_changing_size_mid_iteration(tmp_path):
+    """``_OURS`` is a module-global set that ``_write_atomically``/``_spill`` mutate
+    from OTHER threads while one session's ``cleanup()`` is closing — real under
+    ``fan_out(..., session_env=None)`` (the default for both ``fan_out`` and
+    ``fan_out_tool``), where up to 4 sibling workers can still be spilling while
+    one of them closes. A prior version of ``forget_spills`` iterated ``_OURS``
+    directly in a set comprehension, which holds its iterator open across real
+    per-element Python work (``root in p.parents`` — attribute access, hashing)
+    long enough for a concurrent ``_OURS.add()``/``.discard()`` from another
+    thread to land in between and raise ``RuntimeError: Set changed size during
+    iteration`` — reproduced by a reviewer against the real thing.
+
+    Reproduced HERE deterministically, not by hoping a real thread interleaves at
+    the right wall-clock moment (which would make this test flaky and, worse,
+    only sometimes catch a regression) — by planting an ``_OURS`` entry whose
+    ``.parents`` access (the exact expression ``forget_spills``'s comprehension
+    evaluates per element) mutates ``_OURS`` as a side effect. That is precisely
+    what a concurrent sibling's spill looks like to this loop: the set's size
+    changes while something is still iterating it.
+
+    Both halves of ``cleanup()``'s contract must hold even under this race: it
+    must never raise (its own docstring — "runs in ``finally`` blocks, and a
+    cleanup error must not mask the real exception in flight"), and the
+    directory must still be removed. The ordering fix (rmtree before
+    forget_spills) is what makes the second half true even if some FUTURE bug in
+    forget_spills raised again — this test pins the first bug directly, and
+    checks the ordering guarantee as a second, independent line of defense.
+    """
+    import harness.limits as limits_mod
+    from harness.session_env import local_session_env
+
+    env = local_session_env(tmp_path)
+    added: list[Path] = []
+
+    class _TripwirePath:
+        """Stands in for a real spilled ``Path`` inside ``_OURS``: hashable (the
+        set needs that), and its ``.parents`` access — what ``forget_spills``'s
+        ``root in p.parents`` evaluates for every element — mutates ``_OURS`` as
+        a side effect, exactly what a concurrent sibling's spill does to the set
+        this loop is iterating."""
+
+        @property
+        def parents(self):
+            if not added:  # once only, so this can't loop forever
+                extra = tmp_path / "concurrent-sibling-spill.txt"
+                added.append(extra)
+                limits_mod._OURS.add(extra)
+            return ()  # `root in ()` is just False — no other test hook needed
+
+    tripwire = _TripwirePath()
+    limits_mod._OURS.add(tripwire)
+    try:
+        try:
+            env.cleanup()  # must neither raise nor skip the rmtree
+        except RuntimeError as exc:
+            raise AssertionError(
+                f"cleanup() must never raise, even under this race: {exc}"
+            ) from exc
+    finally:
+        limits_mod._OURS.discard(tripwire)
+        for p in added:
+            limits_mod._OURS.discard(p)
+
+    assert added, "setup: the tripwire's .parents must actually have fired"
+    assert not env.scratch_root.exists(), (
+        "a race inside forget_spills must not also skip the rmtree it now follows"
+    )
+
+
+def test_forget_spills_does_not_touch_a_different_sessions_ours_entries(tmp_path):
+    """Scoped to ``scratch_root`` rather than a blanket ``_OURS.clear()``:
+    MULTIPLE INDEPENDENT ephemeral sessions can be alive at once and share this
+    one process-global set — ``fan_out(..., session_env=None)`` (the default)
+    gives each worker its OWN scratch_root, all recorded in the same ``_OURS``.
+    Closing one of them must discard only its OWN entries; a blanket clear would
+    strip a still-running SIBLING's protection too, exposing that sibling's own
+    in-progress spills to ``_prune``'s reclaim logic while its session is still
+    active. Not a durable-vs-ephemeral question (see the sibling test above) —
+    both sessions here are ephemeral; the hazard is two INDEPENDENT live sessions
+    sharing one process-global set.
+    """
+    import harness.limits as limits_mod
+    from harness.session_env import local_session_env
+
+    env_a = local_session_env(tmp_path / "a")
+    env_b = local_session_env(tmp_path / "b")
+    try:
+        truncate_tool_result("a" * 500, _POLICY, scratch_dir=env_a.scratch_root)
+        truncate_tool_result("b" * 500, _POLICY, scratch_dir=env_b.scratch_root)
+        spilled_b = set(_spills(env_b.scratch_root))
+        assert spilled_b, "setup: session B must have actually spilled a file"
+
+        env_a.cleanup()  # closes A only
+
+        assert spilled_b <= limits_mod._OURS, (
+            "closing session A must not discard session B's _OURS entries"
+        )
+    finally:
+        env_b.cleanup()
+
+
+def test_cleanup_removes_the_directory_even_if_forget_spills_raises(tmp_path, monkeypatch):
+    """The REORDERING half of the fix (``forget_spills`` moved after
+    ``shutil.rmtree`` in ``cleanup()``, not before), pinned independently of
+    whatever ``forget_spills``'s own implementation does — the sibling race test
+    above proves the specific bug that used to make it raise is gone, but that
+    test would stay green even if the reorder were reverted (nothing raises
+    anymore either way, so the order of two non-raising calls is unobservable
+    through it). This test isolates the ordering guarantee on its own by forcing
+    a hypothetical raise directly.
+
+    Does not assert `cleanup()` swallows the exception — its docstring's "never
+    raises" promise rests on `forget_spills` itself being incapable of raising in
+    real use (the tuple() snapshot), not on a try/except here catching arbitrary
+    future bugs; that stays true whether this specific hypothetical raise
+    propagates or not. What must hold regardless is the ordering claim: the
+    directory is already gone by the time forget_spills runs at all.
+    """
+    import harness.session_env as session_env_mod
+    from harness.session_env import local_session_env
+
+    env = local_session_env(tmp_path)
+
+    def boom(scratch_root):
+        raise RuntimeError("pretend forget_spills broke, for reasons unrelated to _OURS")
+
+    monkeypatch.setattr(session_env_mod, "forget_spills", boom)
+
+    with pytest.raises(RuntimeError):
+        env.cleanup()
+
+    assert not env.scratch_root.exists(), (
+        "forget_spills must run AFTER shutil.rmtree, so a raise there cannot also "
+        "skip the directory removal it used to precede"
+    )

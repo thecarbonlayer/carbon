@@ -121,12 +121,15 @@ class SessionEnvironment:
         Task 3 fixed. See test_durable_cleanup_does_not_forget_ours_entries."""
         if self.durable:
             return
-        # Bookkeeping half of ending an ephemeral session, alongside the rmtree
-        # below: without this, harness.limits' module-global ``_OURS`` set only
-        # ever grows — one Path per spill, for the rest of the PROCESS's life,
-        # long after the directory it named is gone (Task 4).
-        forget_spills(self.scratch_root)
         shutil.rmtree(self.scratch_root, ignore_errors=True)
+        # AFTER the rmtree, not before: forget_spills is pure in-memory
+        # bookkeeping (harness.limits' module-global ``_OURS`` set only ever
+        # grows without it — one Path per spill, for the rest of the PROCESS's
+        # life, long after the directory it named is gone — Task 4), but this
+        # method's own contract is "never raises," and ordering the directory
+        # removal FIRST means even a bug in forget_spills can no longer also
+        # skip the rmtree it used to sit in front of.
+        forget_spills(self.scratch_root)
 
 
 def _newest_mtime(root: Path) -> float:
@@ -152,7 +155,7 @@ def _newest_mtime(root: Path) -> float:
     return newest
 
 
-def scavenge(max_age_s: float = SCAVENGE_AGE_S) -> int:
+def scavenge(max_age_s: float = SCAVENGE_AGE_S, *, root: str | Path | None = None) -> int:
     """Remove abandoned scratch directories (a crash's leftovers) past their expiry.
 
     Opportunistic by design: it runs when the next session starts, so a machine that
@@ -170,10 +173,21 @@ def scavenge(max_age_s: float = SCAVENGE_AGE_S) -> int:
     is structurally out of reach here: it lives under ``sessions_dir``, never under
     the OS temp dir this glob searches, so no ``max_age_s`` can make this function
     remove it — see ``test_scavenge_does_not_touch_durable_scratch``.
+
+    ``root`` overrides where this sweeps (default: the real OS temp dir,
+    ``tempfile.gettempdir()``) — a seam for tests, not a production knob: every
+    production caller (``local_session_env``) omits it and gets the real sweep,
+    unchanged. A test exercising an aggressive ``max_age_s`` (short enough to run
+    fast) against the REAL temp dir risks reaping a genuinely still-running
+    session's scratch on a shared or long-lived machine — reproduced by a
+    reviewer, a real 60-second-old stray on the machine this suite ran on. A
+    dedicated ``root`` keeps a test's sweep confined to what the test itself
+    created.
     """
     now = time.time()
     removed = 0
-    for p in Path(tempfile.gettempdir()).glob(f"{SCRATCH_PREFIX}*"):
+    sweep_root = Path(root) if root is not None else Path(tempfile.gettempdir())
+    for p in sweep_root.glob(f"{SCRATCH_PREFIX}*"):
         try:
             if p.is_dir() and not p.is_symlink() and now - _newest_mtime(p) > max_age_s:
                 shutil.rmtree(p, ignore_errors=True)

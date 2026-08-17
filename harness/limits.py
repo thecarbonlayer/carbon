@@ -139,14 +139,36 @@ def forget_spills(scratch_root: str | Path) -> None:
     for every spill any session it ever closed ever made — unbounded for the life
     of the process, a slow leak with no cap.
 
-    Scoped to ``scratch_root`` rather than a blanket ``_OURS.clear()``: a SHARED
-    ``session_env`` (a fan-out parent's, borrowed by workers that do not own it —
-    ``Agent._owns_env``) may still be referenced elsewhere even after one holder is
-    done with it, and clearing indiscriminately would let a concurrent ``_prune``
-    elsewhere reclaim a file some other holder's transcript still names. Pure
+    Scoped to ``scratch_root`` rather than a blanket ``_OURS.clear()``: MULTIPLE
+    INDEPENDENT ephemeral sessions can be alive at once and share this one
+    process-global set — ``fan_out(..., session_env=None)`` (the default) gives
+    each worker its OWN scratch_root, all still recorded in the same ``_OURS``.
+    Closing one of them must discard only ITS entries; clearing the whole set
+    would strip a still-running SIBLING's protection too, exposing that
+    sibling's own in-progress spills to ``_prune``'s reclaim logic while its
+    session is still active — see
+    ``test_forget_spills_does_not_touch_a_different_sessions_ours_entries``. (Not
+    a durable-vs-ephemeral question: a durable ``cleanup()`` never reaches this
+    function at all, scoped or not — see the ``durable`` paragraph below.) Pure
     in-memory set arithmetic, no filesystem access — this must never be the thing
     that makes ``cleanup()`` raise (its own contract: "never raises... runs in
     ``finally`` blocks").
+
+    ``tuple(_OURS)`` first, not a comprehension iterating ``_OURS`` directly:
+    this module-global set is mutated from OTHER THREADS while one session
+    closes — sibling ``fan_out`` workers still spilling concurrently call
+    ``_OURS.add()``/``.discard()`` (``_write_atomically``/``_spill`` below) at
+    the same time this reads it. A set comprehension holds its iterator open
+    across real per-element Python work (``root in p.parents`` — attribute
+    access, hashing), long enough for a concurrent mutation to land in between
+    and raise ``RuntimeError: Set changed size during iteration`` (reproduced by
+    a reviewer; reproduced deterministically, not by timing, in
+    ``test_cleanup_survives_ours_changing_size_mid_iteration``).
+    ``tuple(_OURS)`` copies references in a single C-level loop with no Python
+    bytecode executed per element, so — under CPython's GIL — it does not yield
+    control mid-copy the way the comprehension did; this is the same pattern
+    ``list(some_dict)``/``tuple(some_set)`` is idiomatically used for elsewhere
+    to snapshot a GIL-protected container without a dedicated lock.
 
     Callers must gate this on ``durable`` themselves (see ``cleanup()``): a durable
     session's own earlier spills are named by a transcript that outlives this
@@ -157,7 +179,7 @@ def forget_spills(scratch_root: str | Path) -> None:
     try — it always forgets what is asked, unconditionally.
     """
     root = Path(scratch_root)
-    stale = {p for p in _OURS if root in p.parents}
+    stale = {p for p in tuple(_OURS) if root in p.parents}
     _OURS.difference_update(stale)
 
 

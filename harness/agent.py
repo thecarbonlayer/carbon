@@ -917,11 +917,11 @@ def _coding_tools(
         parent makes the changes.
 
         ``scratch_root`` here is the PARENT's session scratch — the only one in scope
-        this early. A worker spawned via delegate/fan_out today still opens its own
-        session (subagents.py does not yet accept ``session_env=``), so a worker's
-        own offload footers are not resolvable through this registry until that
-        lands; what this fixes is the parent's own scratch:// refs staying resolvable
-        for a worker asked to read one back.
+        this early. It is also the RIGHT one now (Task 4): ``delegate_tool``/
+        ``fan_out_tool`` accept ``session_env`` and this caller passes it (below),
+        so a worker spawned via delegate/fan_out SHARES this same scratch rather
+        than opening its own — its own offload footers resolve through this
+        registry, not only the parent's.
         """
         registry = default_tools(root, scratch_root=scratch_root)
         registry.register(search_memory_tool(memory_dir, exclude=exclude_session))
