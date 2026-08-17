@@ -93,6 +93,40 @@ def _dump_turn() -> list[LLMResponse]:
     ]
 
 
+def _indexed_dump_registry() -> ToolRegistry:
+    """Like ``_dump_registry``, but returns DISTINCT content per call, keyed by
+    ``i``. The offload filename is a content hash (``_spill``), so identical
+    content re-lands on the same file — producing N distinct spill files needs N
+    distinct payloads, not N calls to a no-args tool."""
+    reg = ToolRegistry()
+    reg.register(
+        Tool(
+            name="dump",
+            description="Return a large, distinct blob for index i.",
+            parameters={
+                "type": "object",
+                "properties": {"i": {"type": "integer"}},
+                "required": ["i"],
+            },
+            func=lambda i: f"{i}" + "z" * 500,
+            mutates=False,
+        )
+    )
+    return reg
+
+
+def _many_dump_calls(n: int, *, start: int = 0) -> list[dict]:
+    """``n`` tool_calls in ONE assistant turn, each dumping a distinct index —
+    ``Agent._run`` processes every tool_call in a single response within the same
+    outer-loop iteration, so this spills ``n`` distinct files from ONE model call
+    instead of ``n`` separate turns (cheap, and no need for a large tool-step
+    budget)."""
+    return [
+        {"id": f"t{i}", "function": {"name": "dump", "arguments": json.dumps({"i": i})}}
+        for i in range(start, start + n)
+    ]
+
+
 def _write(tmp_path: Path, raw: dict) -> Path:
     p = tmp_path / "harness_config.json"
     p.write_text(json.dumps(raw))
@@ -1449,3 +1483,102 @@ def test_durable_spills_survive_their_own_sessions_reopen(tmp_path):
     truncate_tool_result("reopen" + "z" * 500, _POLICY, scratch_dir=tmp_path, durable=True)
 
     assert len(_spills(tmp_path)) == 101, "every spill from the reopened session must survive"
+
+
+def test_agent_wiring_actually_threads_durable_into_the_door(tmp_path):
+    """The test above calls ``truncate_tool_result(..., durable=True)`` BY HAND — it
+    proves ``limits.py``'s machinery works, not that ``Agent._run()`` actually
+    reaches for it. Deleting ``durable=self.session_env.durable`` at
+    harness/agent.py's ``truncate_tool_result`` call leaves every OTHER test in this
+    suite green, because nothing else drives an offload through the real Agent on a
+    real durable session across a real reopen. Exactly the failure shape
+    ``test_the_agents_registered_read_file_tool_resolves_the_footer_it_wrote`` exists
+    to catch one layer over — "the plumbing works, but no production caller passed
+    the value into it" — one round later, for ``durable`` instead of ``scratch_root``.
+
+    Driven through the real Agent/provider/tool path, not a hand-set kwarg: an Agent
+    opened on a durable session spills ``n`` (> MAX_OFFLOAD_FILES) distinct results
+    in one turn, "reopens" (a second Agent on the SAME session — ``_OURS`` cleared in
+    between to simulate the process boundary an actual restart crosses, same as the
+    test above), then spills ONE more.
+
+    Asserted on the FILE COUNT on disk, deliberately NOT on "do the refs in the
+    reopened agent's context still resolve": compaction trims that in-memory context
+    to roughly the newest 17 refs, and every one of those sits inside the 64
+    survivors even under the mutant this test exists to catch — so that assertion
+    would pass whether the wire is connected or not, and prove nothing.
+    """
+    import harness.limits as limits_mod
+
+    sessions_dir = tmp_path / ".sessions"
+    n = 70  # > MAX_OFFLOAD_FILES=64; one model call spills all of them, so this stays fast
+    policy = TruncationPolicy("offload_to_file", 100, 0.5)
+    registry = _indexed_dump_registry()
+
+    agent1 = Agent(
+        provider=_scripted(
+            [LLMResponse(content="", tool_calls=_many_dump_calls(n)), LLMResponse(content="done")]
+        ),
+        tools=registry,
+        agents_dir=str(tmp_path),
+        session="s1",
+        sessions_dir=str(sessions_dir),
+        tool_output=policy,
+    )
+    agent1.run("dump them all")
+    scratch = agent1.session_env.scratch_root
+    before = set(_spills(scratch))
+    assert len(before) == n, f"setup: expected {n} distinct spills before the reopen"
+    agent1.close()  # durable: a no-op — the scratch, and every file in it, survives
+
+    # "Restart": _OURS is per-process, empty on a fresh one — without clearing it
+    # here this whole test would pass regardless of the wiring, the same trap the
+    # plumbing test above warns about in its own docstring.
+    limits_mod._OURS.clear()
+
+    agent2 = Agent(
+        provider=_scripted(
+            [
+                LLMResponse(content="", tool_calls=_many_dump_calls(1, start=999_999)),
+                LLMResponse(content="done"),
+            ]
+        ),
+        tools=registry,
+        agents_dir=str(tmp_path),
+        session="s1",
+        sessions_dir=str(sessions_dir),
+        tool_output=policy,
+    )
+    agent2.run("one more, after the reopen")
+    agent2.close()
+
+    after = set(_spills(scratch))
+    assert before <= after, "every spill from before the reopen must still be on disk"
+    assert len(after) == n + 1, (
+        f"expected {n + 1} files ({n} from before the reopen, +1 new); got {len(after)} — "
+        "a dropped `durable=` wire reclaims the scratch down to MAX_OFFLOAD_FILES"
+    )
+
+
+def test_durable_prune_still_sweeps_abandoned_part_files_but_spares_txt_strays(tmp_path):
+    """``durable=True`` must skip only the ``*.txt`` reclaim inside ``_prune``, not
+    the whole function. A plausible one-line "simplification" — hoisting
+    ``if durable: return`` to the TOP of ``_prune``, above the sweep loop — would
+    keep every other test in this suite green while silently stranding ``.part``
+    files (a write killed between mkstemp and rename, named by no transcript,
+    durable or not) in a scratch that is never scavenged either: durable scratch
+    lives under ``sessions_dir``, structurally outside ``scavenge()``'s reach
+    (harness/session_env.py). This pins the ordering directly: seed both a dead
+    ``.part`` and an unrelated ``.txt`` stray, spill one file with ``durable=True``,
+    and check each survivor independently.
+    """
+    dead = tmp_path / "offload" / "tmpdead.part"
+    dead.parent.mkdir(parents=True)
+    dead.write_text("half a result")
+    stray = tmp_path / "offload" / "stray-looking.txt"
+    stray.write_text("a pre-existing spill this call knows nothing about")
+
+    truncate_tool_result("z" * 500, _POLICY, scratch_dir=tmp_path, durable=True)
+
+    assert not dead.exists(), ".part temps must still be swept even when durable"
+    assert stray.exists(), "but *.txt reclaim must be skipped when durable"
