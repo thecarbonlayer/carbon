@@ -56,7 +56,15 @@ def read_file(
         # A scratch ref names harness-written runtime state (an offloaded result),
         # resolved strictly inside this session's private scratch — never a
         # workspace fallback, and never anywhere an escape sequence points.
-        if scratch_root is None:
+        #
+        # Falsy, not just ``None``: ``Path("").resolve()`` is the process cwd, and
+        # ``bool(Path(""))`` is True — a Path object is truthy no matter what it
+        # names — so an ``is None`` check here would let a truthy-but-empty
+        # ``scratch_root=""`` resolve a scratch:// ref against the cwd instead of
+        # refusing it. The write side (limits.py's ``_door``/``_offload_dir``)
+        # already guards falsy for the same reason; this is that same fix on the
+        # read side.
+        if not scratch_root:
             return f"error: no scratch storage in this context: {path}"
         base = Path(scratch_root).resolve()
         p = (base / path[len(SCRATCH_SCHEME) :]).resolve()

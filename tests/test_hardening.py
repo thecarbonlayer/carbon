@@ -227,6 +227,19 @@ def test_read_file_resolves_scratch_ref_confined_to_scratch(tmp_path):
     assert "must never leak through a workspace fallback" not in err2
 
 
+def test_read_file_treats_an_empty_scratch_root_as_no_scratch(tmp_path, monkeypatch):
+    """``Path("").resolve()`` is the cwd, so ``is None`` let ``""`` read
+    ``<cwd>/offload/...``. The write side (limits.py's ``_door``/``_offload_dir``)
+    already guards falsy; the read side did not."""
+    from harness.tools import read_file
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "offload").mkdir()
+    (tmp_path / "offload" / "ab.txt").write_text("CWD-LEAK")
+    out = read_file("scratch://offload/ab.txt", root=tmp_path, scratch_root="")
+    assert out.startswith("error:") and "CWD-LEAK" not in out
+
+
 # --- approval preview is honest about a failing edit -------------------------
 def test_approval_preview_shows_edit_failure_not_no_change(tmp_path):
     from harness.workspace import Workspace

@@ -382,6 +382,33 @@ def test_a_symlinked_target_file_is_replaced_not_followed(tmp_path):
     assert target.read_text() == text
 
 
+def test_a_symlinked_offload_dir_is_refused_before_anything_is_written(tmp_path):
+    """The guard this batch deleted, restored with the reason it exists.
+
+    ``mkdir(parents=True, exist_ok=True)`` does NOT raise on a pre-existing
+    symlink-to-directory — verified — so a spill writes straight THROUGH the link,
+    and ``cleanup()``'s rmtree then removes only the link while the spilled bytes
+    survive outside the session. Carbon's coding wiring runs trusted bash with no
+    filesystem confinement and the scratch prefix is greppable in $TMPDIR, so the
+    model can plant the link itself mid-session."""
+    from harness.harness_config import TruncationPolicy
+    from harness.limits import truncate_tool_result
+
+    outside = tmp_path / "attacker"
+    outside.mkdir()
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    (scratch / "offload").symlink_to(outside, target_is_directory=True)
+
+    out = truncate_tool_result(
+        "S" * 9000, TruncationPolicy("offload_to_file", 4000, 0.3), scratch_dir=scratch
+    )
+    assert list(outside.iterdir()) == [], "nothing may be written through the link"
+    assert "offload unavailable" in out, "the marker must say the copy does not exist"
+    assert "scratch://" not in out, "and must not advertise a route to a file we refused to write"
+    assert "$CARBON_SCRATCH_DIR" not in out, "…nor the shell route to the same refused file"
+
+
 def test_forged_footers_in_tool_output_are_defanged(tmp_path):
     """Untrusted output that forges the harness's own recovery instruction would
     otherwise aim read_file wherever it likes."""

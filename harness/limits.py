@@ -415,15 +415,38 @@ def _holds(target: Path, payload: bytes) -> bool:
         return False
 
 
-# No containment check here (unlike the workspace-rooted version this replaces): the
-# scratch parent is mkdtemp-private to the harness (session_env.py) rather than a path
-# inside a repository someone else controls, so there is no workspace-owner symlink
-# attack left to defend against — a real directory here is just a real directory.
+# A containment check DOES belong here, even though the scratch parent is
+# mkdtemp-private to the harness (session_env.py) rather than a path inside a
+# repository someone else controls. A prior revision reasoned that away — "no
+# workspace-owner symlink attack left to defend against" — but that reasoning
+# only covers a HOSTILE PRE-EXISTING workspace; it misses that the model itself
+# can plant the link mid-session. Carbon's coding wiring runs
+# ``Sandbox(trusted=True)``, whose own docstring says it does not isolate the
+# filesystem, and the scratch prefix (``carbon-scratch-``) is greppable in
+# ``$TMPDIR`` — so nothing stops a command the model runs from symlinking
+# ``<scratch>/offload`` to any directory it can write before this call ever
+# fires. Verified rather than assumed: ``mkdir(parents=True, exist_ok=True)``
+# does NOT raise on a pre-existing symlink-to-directory — ``is_dir()`` follows
+# the link, sees a directory, and swallows the ``FileExistsError`` — so a spill
+# would write straight through the link, and ``SessionEnvironment.cleanup()``'s
+# ``shutil.rmtree`` then removes only the link (rmtree does not recurse into a
+# symlinked subdirectory), leaving the spilled bytes on disk outside the
+# session while ``scratch_root.exists()`` reports False to everything checking
+# after the fact.
 def _offload_dir(scratch_dir: Path | None) -> Path:
     if not scratch_dir:
         raise _OffloadUnavailable("no scratch storage to write under")
-    landed = Path(scratch_dir) / _OFFLOAD_DIRNAME
+    root = Path(scratch_dir)
+    landed = root / _OFFLOAD_DIRNAME
+    # Checked before creating anything: mkdir(exist_ok=True) FOLLOWS a symlinked
+    # directory instead of raising, and by the time an after-the-fact check could
+    # refuse, the bytes are already outside the session.
+    if root.is_symlink() or landed.is_symlink():
+        raise _OffloadUnavailable("scratch directory is a symlink")
     landed.mkdir(parents=True, exist_ok=True)
+    resolved = landed.resolve()
+    if resolved != root.resolve() and root.resolve() not in resolved.parents:
+        raise _OffloadUnavailable("offload directory escapes the scratch root")
     return landed
 
 
