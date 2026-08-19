@@ -298,7 +298,14 @@ class Agent:
             # tighter wins, so adding a reserve can only ever compact earlier.
             trigger = min(trigger, self.context_limit - policy.completion_reserve)
         if window > trigger:
-            pre = window
+            # Amendment (2026-08-19, audit finding 3): pre must be commensurable
+            # with post — both `estimate_tokens(self.messages)`, computed
+            # immediately before/after the compaction. Never `window` here: it can
+            # be `_last_tokens`, a provider tokenizer count over the full payload
+            # (including the system prompt), which is a different quantity from
+            # what compaction actually measures. The trigger decision above is
+            # unchanged; only this telemetry number moves.
+            pre = estimate_tokens(self.messages)
             start = time.perf_counter()
             managed, facts = compact(self.messages, model=self.model, provider=self.provider)
             seconds = time.perf_counter() - start
@@ -364,6 +371,16 @@ class Agent:
         reply = self._enforce_run(reply, turn_start, on_delta)
         self._save()  # durable state: persist after every turn
         totals = self.tracer.totals() if self.tracer else {}
+        # Amendment (2026-08-19, audit finding 2): total_tokens is always safe to
+        # publish, but input_tokens/output_tokens are a fabrication whenever any
+        # call this run fell back to booking the total as input — publish the
+        # split only when the tracer saw a real one on every call.
+        usage: dict = {}
+        if self.tracer and totals:
+            usage["total_tokens"] = totals["tokens"]
+            if self.tracer._split_complete:
+                usage["input_tokens"] = totals["input_tokens"]
+                usage["output_tokens"] = totals["output_tokens"]
         result = RunResult(
             text=reply,
             tool_calls=self._collect_tool_calls(turn_start),
@@ -372,15 +389,7 @@ class Agent:
             stop_reason=self._stop_reason,
             totals=totals,
             verified=self._last_verified,
-            usage=(
-                {
-                    "input_tokens": totals["input_tokens"],
-                    "output_tokens": totals["output_tokens"],
-                    "total_tokens": totals["tokens"],
-                }
-                if totals
-                else {}
-            ),
+            usage=usage,
             compactions=self.compaction_count,
         )
         self._emit({"type": "turn_end", "result": result})

@@ -126,11 +126,91 @@ def test_agent_compaction_emits_event_and_span_with_shrinking_tokens():
     assert shrinking, f"no compaction shrank the window: {[s.attributes for s in spans]}"
     attrs = shrinking[-1].attributes
     idx = spans.index(shrinking[-1])
-    # The flat Event's tokens field is the same pre-post delta, not clamped to >= 0.
-    assert compaction_events[idx].tokens == (
-        attrs[events.COMPACTION_PRE_TOKENS] - attrs[events.COMPACTION_POST_TOKENS]
-    )
+    # Amendment (2026-08-19, audit finding 1): the flat Event books tokens=0 for
+    # every compaction — the pre/post delta lives only in the span attributes
+    # above, so totals()["tokens"] never absorbs it.
+    assert compaction_events[idx].tokens == 0
     assert attrs[events.COMPACTION_STRATEGY] == compaction_events[idx].label
+
+
+def test_totals_tokens_stays_pure_llm_spend_through_a_compacting_run():
+    """Audit finding 1: totals()["tokens"] must equal exactly the sum of
+    provider-reported LLM spend, even in a run that triggers compaction — a
+    compaction Event must never inflate (or deflate) the flat token total."""
+
+    def fake_chat(messages, **kwargs):
+        first = messages[0] if messages else {}
+        if first.get("role") == "system" and "summar" in first.get("content", "").lower():
+            return LLMResponse(content="SUMMARY")  # compaction's own call: untraced
+        return LLMResponse(
+            content="ok",
+            usage={"prompt_tokens": 40, "completion_tokens": 10, "total_tokens": 50},
+        )
+
+    tracer = Tracer()
+    with (
+        patch.object(agent_mod, "chat", side_effect=fake_chat),
+        patch.object(compaction, "chat", side_effect=fake_chat),
+    ):
+        a = agent_mod.Agent(context_limit=20, tracer=tracer)
+        for i in range(8):
+            a.send(f"a reasonably long message number {i} with some filler text")
+
+    compaction_events = [e for e in tracer.events if e.kind == "compaction"]
+    assert compaction_events, "no compaction Event was recorded"
+    llm_events = [e for e in tracer.events if e.kind == "llm"]
+    # Every scripted LLM call reports exactly 50 total_tokens — the sum of
+    # llm-event tokens is a known, exact number, unaffected by how many
+    # compactions ran alongside them.
+    assert sum(e.tokens for e in llm_events) == 50 * len(llm_events)
+    assert tracer.totals()["tokens"] == sum(e.tokens for e in llm_events)
+
+
+def test_maybe_compact_pre_tokens_is_the_message_estimate_not_provider_usage():
+    """Audit finding 3: pre (and post) must both be estimate_tokens(self.messages)
+    computed immediately before/after compaction — never `window`, which can be
+    `_last_tokens` (a provider-reported total over the full payload, including
+    the system prompt). Scripts a provider total wildly larger than the real
+    message-list estimate so the two are unmistakably different quantities: if
+    `pre` ever reads `_last_tokens` instead, this test catches it.
+    """
+    from harness.compaction import estimate_tokens
+
+    orig_compact = agent_mod.compact
+    captured: list[tuple[int, bool]] = []
+
+    def spying_compact(messages, **kwargs):
+        pre_estimate = estimate_tokens(messages)
+        out, facts = orig_compact(messages, **kwargs)
+        captured.append((pre_estimate, out is not messages))
+        return out, facts
+
+    def fake_chat(messages, **kwargs):
+        first = messages[0] if messages else {}
+        if first.get("role") == "system" and "summar" in first.get("content", "").lower():
+            return LLMResponse(content="SUMMARY")
+        # A provider-reported total deliberately far larger than the true
+        # message-list estimate for this tiny fixture.
+        return LLMResponse(content="ok", usage={"total_tokens": 999_999})
+
+    tracer = Tracer()
+    with (
+        patch.object(agent_mod, "chat", side_effect=fake_chat),
+        patch.object(agent_mod, "compact", side_effect=spying_compact),
+        patch.object(compaction, "chat", side_effect=fake_chat),
+    ):
+        a = agent_mod.Agent(context_limit=20, tracer=tracer)
+        for i in range(8):
+            a.send(f"a reasonably long message number {i} with some filler text")
+
+    spans = [s for s in tracer.spans if s.operation == "compact"]
+    assert spans, "no compaction span was recorded"
+    real_pres = [pre for pre, real in captured if real]
+    assert len(real_pres) == len(spans)
+    for span, expected_pre in zip(spans, real_pres, strict=True):
+        assert span.attributes[events.COMPACTION_PRE_TOKENS] == expected_pre
+        # The bug this guards against: pre pinned to the scripted provider total.
+        assert span.attributes[events.COMPACTION_PRE_TOKENS] != 999_999
 
 
 def test_agent_without_tracer_still_compacts_the_same_way():

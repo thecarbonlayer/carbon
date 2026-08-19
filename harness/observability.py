@@ -86,6 +86,12 @@ class Tracer:
     # already computed in ``_add_chat_span``, accumulated for ``totals()``.
     _input_tokens: int = 0
     _output_tokens: int = 0
+    # Amendment (2026-08-19, audit finding 2): true only while every chat call so
+    # far reported a REAL provider split (prompt_tokens/completion_tokens). A call
+    # that reports only total_tokens flips this False, so ``Agent.run()`` knows
+    # ``RunResult.usage`` must publish ``total_tokens`` alone rather than a split
+    # that was never actually reported.
+    _split_complete: bool = True
 
     def turn_start(self) -> None:
         """Begin a new user turn; subsequent events nest under it.
@@ -178,9 +184,15 @@ class Tracer:
         in_tokens = int(usage.get("prompt_tokens", 0) or 0)
         out_tokens = int(usage.get("completion_tokens", 0) or 0)
         if not in_tokens and not out_tokens:
+            # No real split reported. The span still books the total as input below
+            # (unchanged span semantics — amendment 2026-08-19 leaves this alone),
+            # but that fabricated split must never reach the accumulators
+            # ``RunResult.usage`` is built from (audit finding 2).
             in_tokens = int(usage.get("total_tokens", 0) or 0)
-        self._input_tokens += in_tokens
-        self._output_tokens += out_tokens
+            self._split_complete = False
+        else:
+            self._input_tokens += in_tokens
+            self._output_tokens += out_tokens
         attrs: dict = {
             events.OPERATION_NAME: events.CHAT,
             events.PROVIDER_NAME: self.provider_name,
@@ -371,20 +383,22 @@ class Tracer:
         management visible: how much was cut, which strategy ran, whether the
         checkpoint had to be truncated.
 
-        ``tokens`` on the flat Event is ``pre_tokens - post_tokens``, recorded
-        honestly rather than clamped — a strategy that grows the window (an
-        oversized checkpoint note, say) shows up as a negative delta instead of
-        a silently dropped fact. The span carries the full breakdown as eight
-        ``carbon.compaction.*`` attributes, a non-standard extension (no OTel
-        GenAI operation covers compaction), the same way ``record_verify``'s
-        ``verify`` operation is ours alone.
+        Amendment (2026-08-19, audit finding 1): the flat Event books ``tokens=0``
+        — the pre/post delta lives ONLY in the span's ``carbon.compaction.*``
+        attributes below, so ``totals()["tokens"]`` (which sums every event's
+        ``tokens`` field) stays exactly the sum of LLM-call spend, never inflated
+        (or deflated) by a compaction pass. The span carries the full breakdown —
+        pre, post, and everything else — as eight ``carbon.compaction.*``
+        attributes, a non-standard extension (no OTel GenAI operation covers
+        compaction), the same way ``record_verify``'s ``verify`` operation is
+        ours alone.
         """
         self._emit(
             Event(
                 "compaction",
                 facts.strategy,
                 seconds,
-                tokens=pre_tokens - post_tokens,
+                tokens=0,
                 status="ok",
                 turn=self._turn,
             )

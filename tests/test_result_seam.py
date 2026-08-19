@@ -86,17 +86,57 @@ def test_runresult_defaults_are_backward_compatible():
 
 # --- usage split -----------------------------------------------------------------
 def test_totals_carry_token_split(scripted_agent):
+    """``scripted_agent``'s provider reports a real split (12 prompt, 4 completion,
+    16 total) — pin totals() to those exact numbers. (Audit finding 1: the prior
+    assertion here was `in + out <= tokens or tokens == in + out`, whose second
+    disjunct is implied by the first — a guard that could never fail.)"""
     result = scripted_agent.run("hello")
     totals = scripted_agent.tracer.totals()
     assert set(totals) >= {"input_tokens", "output_tokens", "tokens"}
-    assert totals["input_tokens"] + totals["output_tokens"] <= totals["tokens"] or (
-        totals["tokens"] == totals["input_tokens"] + totals["output_tokens"]
-    )
+    assert totals["input_tokens"] == 12
+    assert totals["output_tokens"] == 4
+    assert totals["tokens"] == 16
     assert result.usage == {
         "input_tokens": totals["input_tokens"],
         "output_tokens": totals["output_tokens"],
         "total_tokens": totals["tokens"],
     }
+
+
+def test_usage_omits_split_keys_when_a_call_reports_only_total_tokens():
+    """Audit finding 2: when the run's only call reports `total_tokens` alone (no
+    real prompt/completion split), RunResult.usage carries `total_tokens` and
+    nothing else — the pre-existing per-call fallback (booking the total as input
+    for the span) must not leak a fabricated split into the public seam."""
+    provider = _scripted(
+        [LLMResponse(content="PONG", finish_reason="stop", usage={"total_tokens": 16})]
+    )
+    a = Agent(provider=provider, tracer=Tracer(model="fake"))
+    result = a.run("hello")
+    assert result.usage == {"total_tokens": 16}
+    assert "input_tokens" not in result.usage
+    assert "output_tokens" not in result.usage
+    # totals() itself is unchanged in shape — the accumulators just never moved.
+    totals = a.tracer.totals()
+    assert totals["input_tokens"] == 0
+    assert totals["output_tokens"] == 0
+    assert totals["tokens"] == 16
+
+
+def test_split_complete_is_per_run_not_per_call():
+    """One call with a real split and another with total-only still means the
+    run's overall usage has no split — completeness is a run-wide property, not
+    forgiven because *some* call reported a real one."""
+    tracer = Tracer(model="fake")
+    tracer.record_llm({"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}, 0.1)
+    tracer.record_llm({"total_tokens": 8}, 0.1)
+    assert tracer._split_complete is False
+    totals = tracer.totals()
+    # Only the real-split call fed the accumulators; the fallback call's total
+    # never touched input_tokens/output_tokens.
+    assert totals["input_tokens"] == 10
+    assert totals["output_tokens"] == 5
+    assert totals["tokens"] == 23
 
 
 def test_verified_none_without_verification(scripted_agent):
