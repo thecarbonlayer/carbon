@@ -764,18 +764,25 @@ class Agent:
         # compact() correctly report nothing to summarize; here that correctness is a
         # regression, so this caller opts out of the reserve rather than the reserve
         # quietly making an exception for it.
-        # `_facts` is discarded here: this is the overflow-recovery path, not the
-        # steady-state door the Phase 1 §3 telemetry hook is specified for (only
-        # `_maybe_compact` calls `record_compaction` — see contract §3).
-        managed, _facts = compact(
+        # Phase 1 §3 amendment: this second call site records exactly like
+        # `_maybe_compact` does — pre/post are the PREFIX's tokens (the only part
+        # `compact()` touches here; `current_turn` is untouched), so an event-based
+        # compaction count can never disagree with `compaction_count`.
+        pre = estimate_tokens(prefix)
+        start = time.perf_counter()
+        managed, facts = compact(
             prefix, model=self.model, provider=self.provider, recent_token_reserve=0
         )
+        seconds = time.perf_counter() - start
         compacted = managed is not prefix
         if compacted:
+            post = estimate_tokens(managed)
             self.messages = managed + current_turn
             self._active_turn_start = len(managed)
             self.just_compacted = True
             self.compaction_count += 1
+            if self.tracer:
+                self.tracer.record_compaction(facts, pre, post, seconds)
         shrank = self._shrink_turn_tool_results()
         if compacted or shrank:
             self._last_tokens = 0

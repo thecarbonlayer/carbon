@@ -20,6 +20,7 @@ from harness.harness_config import (
     load_config,
 )
 from harness.limits import truncate
+from harness.observability import Tracer
 from harness.tools import Tool, ToolRegistry, read_file, read_file_tool
 from harness.workspace import Workspace
 from model import LLMResponse, Provider
@@ -322,6 +323,48 @@ def test_context_overflow_compacts_active_history_and_retries():
     assert state == {"main_calls": 2, "summary_calls": 1}
     assert agent.compaction_count == 1
     assert agent.retry_count == 1
+
+
+def test_overflow_recovery_records_a_compaction_event_too():
+    """Contract amendment (Phase 1 §3, 2026-08-19): ``_compact_active_history`` —
+    the overflow-recovery path, distinct from the steady-state pre-turn door — calls
+    the SAME ``record_compaction`` hook the same way, so an event-based count of
+    compactions and ``agent.compaction_count`` can never disagree."""
+    state = {"main_calls": 0, "summary_calls": 0}
+
+    def responder(messages, **kwargs):
+        is_summary = bool(
+            messages
+            and messages[0].get("role") == "system"
+            and "context summarizer" in str(messages[0].get("content", ""))
+        )
+        if is_summary:
+            state["summary_calls"] += 1
+            return LLMResponse(content="STRUCTURED CHECKPOINT")
+        state["main_calls"] += 1
+        if state["main_calls"] == 1:
+            raise RuntimeError("maximum context length exceeded")
+        return LLMResponse(content="OVERFLOW-RECOVERED")
+
+    provider = Provider("fake://overflow-telemetry", "fake", responder=responder)
+    tracer = Tracer()
+    agent = Agent(provider=provider, tracer=tracer)
+    agent.messages = [{"role": "user", "content": f"old-{i}"} for i in range(10)]
+    # Same reason as the sibling test above: pin the pre-turn door shut so the only
+    # compaction in play is the overflow-recovery one this test is about.
+    with _pinned(compaction=replace(CONFIG.compaction, trigger_fraction=0.8)):
+        result = agent.run("continue")
+
+    assert result.text == "OVERFLOW-RECOVERED"
+    assert agent.compaction_count == 1
+
+    compaction_events = [e for e in tracer.events if e.kind == "compaction"]
+    assert len(compaction_events) == agent.compaction_count, (
+        f"event count {len(compaction_events)} disagrees with "
+        f"compaction_count {agent.compaction_count}"
+    )
+    spans = [s for s in tracer.spans if s.operation == "compact"]
+    assert len(spans) == agent.compaction_count
 
 
 # --- regressions found reviewing the strategy surface -------------------------
