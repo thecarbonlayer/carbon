@@ -53,7 +53,8 @@ TINY_RESERVE = 5
 
 
 def test_file_ops_reads_tool_calls_not_prose():
-    """A path is tracked because a tool was CALLED with it, not because it was mentioned."""
+    """A path is tracked because a tool was called AND succeeded, not because it
+    was mentioned in prose."""
     messages = [
         {"role": "user", "content": "please edit services/ghost.py"},  # prose only
         _tool_call("read_file", "a.py", "1"),
@@ -63,9 +64,10 @@ def test_file_ops_reads_tool_calls_not_prose():
     ]
     ops = compaction.checkpoint.file_ops(messages)
     assert ops.read == ("a.py",)
-    # Tracked despite the tool FAILING: what the agent was working on is still state.
-    assert ops.modified == ("b.py",)
+    # NOT tracked: the write FAILED, so nothing on disk actually changed.
+    assert ops.modified == ()
     assert "services/ghost.py" not in ops.read + ops.modified
+    assert "b.py" not in ops.read + ops.modified
 
 
 def test_file_ops_survives_malformed_arguments():
@@ -77,9 +79,54 @@ def test_file_ops_survives_malformed_arguments():
                 {"id": "1", "function": {"name": "read_file", "arguments": "{not json"}},
                 {"id": "2", "function": {"name": "read_file", "arguments": '{"path":"ok.py"}'}},
             ],
-        }
+        },
+        {"role": "tool", "tool_call_id": "1", "content": "..."},
+        {"role": "tool", "tool_call_id": "2", "content": "..."},
     ]
     assert checkpoint.file_ops(messages).read == ("ok.py",)
+
+
+def test_file_ops_excludes_a_failed_write_from_ops_and_the_rendered_note():
+    """A denied or failed write must not appear as a modified file, in FileOps or
+    in the rendered checkpoint note — nothing on disk actually changed, so the
+    carried state must not claim otherwise."""
+    messages = [
+        _tool_call("read_file", "kept.py", "0"),
+        {"role": "tool", "tool_call_id": "0", "content": "..."},
+        _tool_call("write_file", "denied.py", "1"),
+        {"role": "tool", "tool_call_id": "1", "content": "error: permission denied"},
+    ]
+    ops = checkpoint.file_ops(messages)
+    assert ops.modified == ()
+    note = checkpoint.render(ops)
+    assert "denied.py" not in note
+    assert "kept.py" in note
+
+
+def test_file_ops_includes_a_successful_write():
+    """The positive case: a write whose result did not error IS tracked, in both
+    FileOps and the rendered note."""
+    messages = [
+        _tool_call("write_file", "ok.py", "1"),
+        {"role": "tool", "tool_call_id": "1", "content": "written"},
+    ]
+    ops = checkpoint.file_ops(messages)
+    assert ops.modified == ("ok.py",)
+    assert "ok.py" in checkpoint.render(ops)
+
+
+def test_file_ops_counts_an_error_then_retry_success_once():
+    """A write that fails and is then retried at the same path, successfully,
+    must appear exactly once — this is state ("this file is now modified"), not
+    a log of every attempt."""
+    messages = [
+        _tool_call("write_file", "retry.py", "1"),
+        {"role": "tool", "tool_call_id": "1", "content": "error: locked"},
+        _tool_call("write_file", "retry.py", "2"),
+        {"role": "tool", "tool_call_id": "2", "content": "written"},
+    ]
+    ops = checkpoint.file_ops(messages)
+    assert ops.modified == ("retry.py",)
 
 
 def test_state_block_round_trips():
