@@ -276,13 +276,14 @@ class CompactionFacts:
     strategy: str
     middle_count: int
     summary_chars: int
-    # Amendment (2026-08-19, Codex finding 3, documentation only): both fields
-    # report what the CHECKPOINT carries, not what actually succeeded — they are
-    # derived from the ASSISTANT's tool-call ARGUMENTS by ``checkpoint.file_ops``,
-    # so a write_file/edit_file/read_file call counts here whether or not that
-    # call actually succeeded (a failed call still tells us what the agent was
-    # working on). Whether the checkpoint itself should count failed operations
-    # is a queued carbon question, out of this phase's scope.
+    # Amendment (2026-08-20): supersedes the Codex finding 3 note this replaced,
+    # which documented these two fields as counting a tool call whether or not it
+    # actually succeeded. That was a decided-wrong behavior, not a permanent
+    # contract: both fields now count only SUCCESSFUL operations —
+    # ``checkpoint.file_ops`` checks each tool call's paired result and drops a
+    # call whose result errored (or has no paired result at all) before either
+    # count sees its path. A denied or failed write no longer inflates
+    # ``files_modified``, and a failed read no longer inflates ``files_read``.
     files_read: int
     files_modified: int
     truncated: bool

@@ -72,14 +72,36 @@ def merge(*ops: FileOps) -> FileOps:
 
 
 def file_ops(messages: list[dict]) -> FileOps:
-    """Extract read/modified paths from the tool calls in ``messages``.
+    """Extract read/modified paths from SUCCESSFUL tool calls in ``messages``.
 
-    Reads the ASSISTANT's tool-call arguments, not the tool results: a result can be
-    an error string, and a call that failed still tells us what the agent was working
-    on. Malformed arguments are skipped rather than raising — a broken tool call is
+    Reads the ASSISTANT's tool-call arguments to learn the path, then checks the
+    paired ``tool`` result — matched by ``tool_call_id``, the same pairing
+    ``Agent._collect_tool_calls`` uses — before counting it: a result whose content
+    starts with "error" (carbon's tool-error convention; see the ``f"error: ..."``
+    returns throughout ``harness/tools.py``) means the operation did not happen, so
+    its path contributes to neither list. A denied write or a failed read tells us
+    what the agent ATTEMPTED, not what the filesystem now looks like, and this
+    module's whole point is to carry forward facts the next turn can rely on — a
+    fact that never became true is not one of them.
+
+    A call with no paired result in ``messages`` — its ``tool`` message fell outside
+    this slice — is treated the same as a failure and does not count. In the one
+    real caller (``compaction.py``, passing a ``middle`` slice) this should never
+    happen: ``_clean_cut`` never splits an assistant's ``tool_calls`` from its
+    results, so a call and its result always land on the same side of every cut.
+    Treating the unreachable case as "failed" rather than "succeeded" keeps the
+    conservative direction consistent regardless — this function must never
+    overstate what happened to the filesystem.
+
+    Malformed arguments are skipped rather than raising — a broken tool call is
     already the tool layer's problem, and losing the whole checkpoint over one is a
     worse outcome than an incomplete file list.
     """
+    results: dict[str, str] = {
+        m.get("tool_call_id", ""): str(m.get("content", ""))
+        for m in messages
+        if m.get("role") == "tool"
+    }
     read: list[str] = []
     modified: list[str] = []
     for m in messages:
@@ -87,6 +109,9 @@ def file_ops(messages: list[dict]) -> FileOps:
             fn = tc.get("function") or {}
             name = fn.get("name")
             if name not in _READ_TOOLS and name not in _MODIFY_TOOLS:
+                continue
+            result = results.get(tc.get("id", ""))
+            if result is None or result.startswith("error"):
                 continue
             try:
                 args = json.loads(fn.get("arguments") or "{}")
