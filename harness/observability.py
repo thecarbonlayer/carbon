@@ -91,6 +91,10 @@ class Tracer:
     # that reports only total_tokens flips this False, so ``Agent.run()`` knows
     # ``RunResult.usage`` must publish ``total_tokens`` alone rather than a split
     # that was never actually reported.
+    # Amendment (2026-08-19, Codex finding 2): "real" means BOTH keys PRESENT,
+    # never by nonzero-ness — a call reporting prompt_tokens without a
+    # completion_tokens key also flips this False, and a genuine
+    # completion_tokens: 0 (present, just zero) keeps it True.
     _split_complete: bool = True
 
     def turn_start(self) -> None:
@@ -181,18 +185,28 @@ class Tracer:
         tool_definitions: list[dict] | None = None,
     ) -> None:
         model = request_model or self.model
+        # Codex finding 2: a split is REAL when BOTH provider usage keys are
+        # PRESENT — presence, never nonzero-ness. The old nonzero check let a
+        # provider that reports prompt_tokens without completion_tokens through as
+        # if it were real, publishing a completion_tokens: 0 the provider never
+        # actually sent; a genuine completion_tokens: 0 alongside a present
+        # prompt_tokens key IS real and must keep the split complete.
+        has_input = "prompt_tokens" in usage
+        has_output = "completion_tokens" in usage
         in_tokens = int(usage.get("prompt_tokens", 0) or 0)
         out_tokens = int(usage.get("completion_tokens", 0) or 0)
-        if not in_tokens and not out_tokens:
-            # No real split reported. The span still books the total as input below
-            # (unchanged span semantics — amendment 2026-08-19 leaves this alone),
-            # but that fabricated split must never reach the accumulators
-            # ``RunResult.usage`` is built from (audit finding 2).
-            in_tokens = int(usage.get("total_tokens", 0) or 0)
-            self._split_complete = False
-        else:
+        if has_input and has_output:
             self._input_tokens += in_tokens
             self._output_tokens += out_tokens
+        else:
+            # No real split reported (neither key, or only one). The span still
+            # books whatever was parsed (0 for an absent key) as input/output below
+            # (unchanged span semantics — amendment 2026-08-19 leaves this alone),
+            # but a partial or fabricated split must never reach the accumulators
+            # ``RunResult.usage`` is built from (audit finding 2).
+            if not has_input and not has_output:
+                in_tokens = int(usage.get("total_tokens", 0) or 0)
+            self._split_complete = False
         attrs: dict = {
             events.OPERATION_NAME: events.CHAT,
             events.PROVIDER_NAME: self.provider_name,

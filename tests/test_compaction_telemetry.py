@@ -49,11 +49,16 @@ def test_compact_returns_facts_matching_the_middle_slice():
     assert facts.strategy == "summarize_middle"
     # middle = messages[head_end:tail_start] — everything but the kept head/tail.
     assert facts.middle_count == len(msgs) - 2 - 2
-    assert facts.summary_chars >= 0
+    # Production computes this as len(summary); pin it to the scripted content's
+    # actual length rather than a bound that can never fail (was `>= 0`).
+    assert facts.summary_chars == len("SUMMARY")
     # No tool calls in this fixture, and `summarize_middle` never truncates.
     assert facts.files_read == 0
     assert facts.files_modified == 0
     assert facts.truncated is False
+    # Codex finding 1: a real summarizer call ran here, so its usage must be
+    # carried (never a phantom None reserved for the no-call paths).
+    assert facts.summarizer_usage is not None
 
 
 def test_compact_facts_count_touched_files_and_flag_truncation():
@@ -78,6 +83,7 @@ def test_compact_facts_count_touched_files_and_flag_truncation():
     assert facts.files_modified == 1
     assert facts.files_read == 1
     assert facts.truncated is True
+    assert facts.summarizer_usage is not None
 
 
 def test_compact_no_op_returns_zeroed_facts():
@@ -88,6 +94,8 @@ def test_compact_no_op_returns_zeroed_facts():
     assert facts.middle_count == 0
     assert facts.summary_chars == 0
     assert facts.truncated is False
+    # No model call happened at all — never a phantom summarizer usage.
+    assert facts.summarizer_usage is None
 
 
 # --- Agent._maybe_compact wires facts through Tracer.record_compaction -------
@@ -136,12 +144,19 @@ def test_agent_compaction_emits_event_and_span_with_shrinking_tokens():
 def test_totals_tokens_stays_pure_llm_spend_through_a_compacting_run():
     """Audit finding 1: totals()["tokens"] must equal exactly the sum of
     provider-reported LLM spend, even in a run that triggers compaction — a
-    compaction Event must never inflate (or deflate) the flat token total."""
+    compaction Event must never inflate (or deflate) the flat token total.
+
+    Codex finding 1 (amended here): the summarizer's own call is ITSELF traced
+    LLM spend now (scripted with its own distinct usage below) — the exact-sum
+    invariant must hold with it included, never doubled, never dropped."""
 
     def fake_chat(messages, **kwargs):
         first = messages[0] if messages else {}
         if first.get("role") == "system" and "summar" in first.get("content", "").lower():
-            return LLMResponse(content="SUMMARY")  # compaction's own call: untraced
+            return LLMResponse(
+                content="SUMMARY",
+                usage={"prompt_tokens": 20, "completion_tokens": 5, "total_tokens": 25},
+            )
         return LLMResponse(
             content="ok",
             usage={"prompt_tokens": 40, "completion_tokens": 10, "total_tokens": 50},
@@ -159,11 +174,17 @@ def test_totals_tokens_stays_pure_llm_spend_through_a_compacting_run():
     compaction_events = [e for e in tracer.events if e.kind == "compaction"]
     assert compaction_events, "no compaction Event was recorded"
     llm_events = [e for e in tracer.events if e.kind == "llm"]
-    # Every scripted LLM call reports exactly 50 total_tokens — the sum of
-    # llm-event tokens is a known, exact number, unaffected by how many
-    # compactions ran alongside them.
-    assert sum(e.tokens for e in llm_events) == 50 * len(llm_events)
-    assert tracer.totals()["tokens"] == sum(e.tokens for e in llm_events)
+    # Every llm Event reports either exactly 50 (a turn call) or exactly 25 (a
+    # summarizer call) total_tokens — the sum is a known, exact number derived
+    # from the two scripted usages, unaffected by how many compactions ran.
+    main_events = [e for e in llm_events if e.tokens == 50]
+    summarizer_events = [e for e in llm_events if e.tokens == 25]
+    assert len(main_events) + len(summarizer_events) == len(llm_events)
+    assert summarizer_events, "the summarizer's call was never traced"
+    expected = 50 * len(main_events) + 25 * len(summarizer_events)
+    assert sum(e.tokens for e in llm_events) == expected
+    assert tracer.totals()["tokens"] == expected
+    assert tracer.totals()["llm_calls"] == len(llm_events)
 
 
 def test_maybe_compact_pre_tokens_is_the_message_estimate_not_provider_usage():
@@ -231,3 +252,57 @@ def test_agent_without_tracer_still_compacts_the_same_way():
             a.send(f"a reasonably long message number {i} with some filler text")
 
     assert any(str(m.get("content", "")).startswith("[summary") for m in a.messages)
+
+
+# --- Codex finding 1: the summarizer's own call is traced, never phantom -----
+
+
+def test_record_compaction_emits_the_summarizer_as_an_llm_event():
+    """When CompactionFacts carries a real summarizer_usage, Agent._record_compaction
+    (the shared seam both compact() call sites route through) feeds it to
+    Tracer.record_llm exactly once, alongside the usual compaction Event/span."""
+    tracer = Tracer()
+    a = agent_mod.Agent(context_limit=20, tracer=tracer)
+    facts = compaction.CompactionFacts(
+        strategy="structured_checkpoint",
+        middle_count=4,
+        summary_chars=7,
+        files_read=0,
+        files_modified=0,
+        truncated=False,
+        summarizer_usage={"prompt_tokens": 11, "completion_tokens": 3, "total_tokens": 14},
+        summarizer_seconds=0.02,
+    )
+    a._record_compaction(facts, pre=200, post=100, seconds=0.05)
+
+    llm_events = [e for e in tracer.events if e.kind == "llm"]
+    assert len(llm_events) == 1
+    assert llm_events[0].tokens == 14
+    compaction_events = [e for e in tracer.events if e.kind == "compaction"]
+    assert len(compaction_events) == 1
+    totals = tracer.totals()
+    assert totals["llm_calls"] == 1
+    assert totals["tokens"] == 14
+
+
+def test_record_compaction_does_not_fabricate_an_llm_event_when_summarizer_was_skipped():
+    """Strategies/paths that never call the summarizer (identity/deterministic
+    no-op compactions, and an incremental strategy's 'nothing new to fold in'
+    carry-forward) carry `summarizer_usage=None` — this must record ONLY the
+    compaction Event/span, never a phantom llm one."""
+    tracer = Tracer()
+    a = agent_mod.Agent(context_limit=20, tracer=tracer)
+    facts = compaction.CompactionFacts(
+        strategy="token_budget_checkpoint",
+        middle_count=0,
+        summary_chars=3,
+        files_read=0,
+        files_modified=0,
+        truncated=False,
+        summarizer_usage=None,
+    )
+    a._record_compaction(facts, pre=100, post=100, seconds=0.01)
+
+    assert [e.kind for e in tracer.events] == ["compaction"]
+    assert tracer.totals()["llm_calls"] == 0
+    assert tracer.totals()["tokens"] == 0

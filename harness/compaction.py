@@ -15,12 +15,13 @@ function to find every place ``token_budgeted`` was checked.
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
 from harness import checkpoint
 from harness.harness_config import CONFIG
-from model import Provider, chat
+from model import LLMResponse, Provider, chat
 
 # re-export; the summarizer's instructions live in the editable surface
 COMPACTION_PROMPT = CONFIG.compaction_prompt
@@ -275,9 +276,25 @@ class CompactionFacts:
     strategy: str
     middle_count: int
     summary_chars: int
+    # Amendment (2026-08-19, Codex finding 3, documentation only): both fields
+    # report what the CHECKPOINT carries, not what actually succeeded — they are
+    # derived from the ASSISTANT's tool-call ARGUMENTS by ``checkpoint.file_ops``,
+    # so a write_file/edit_file/read_file call counts here whether or not that
+    # call actually succeeded (a failed call still tells us what the agent was
+    # working on). Whether the checkpoint itself should count failed operations
+    # is a queued carbon question, out of this phase's scope.
     files_read: int
     files_modified: int
     truncated: bool
+    # Amendment (2026-08-19, Codex finding 1): the summarizer's own model-call
+    # usage, when a summarizer call actually ran this pass — None for every path
+    # that never calls the model (the no-op early returns, and an incremental
+    # strategy's "nothing new to fold in" carry-forward). The caller feeds this
+    # to ``Tracer.record_llm`` exactly once so the summarizer's cost is measured
+    # like any other model call, never fabricated as a phantom event when no
+    # call happened.
+    summarizer_usage: dict | None = None
+    summarizer_seconds: float = 0.0
 
 
 def _no_compaction(strategy: str) -> CompactionFacts:
@@ -380,8 +397,14 @@ def compact(
         # does not, re-summarizing a checkpoint against nothing is the erosion this
         # strategy exists to prevent. Carry the prior text forward verbatim instead.
         summary = _strip_note_prefix(prior_text)
+        summarizer_usage: dict | None = None
+        summarizer_seconds = 0.0
     else:
-        summary = _summarize(
+        # Codex finding 1: time and keep the summarizer's own usage so the caller
+        # can feed it to Tracer.record_llm — this model call must be measured like
+        # any other, not discarded, so a config that compacts more pays its cost.
+        summarize_start = time.perf_counter()
+        summarize_resp = _summarize(
             prompt,
             transcript,
             prior_text if strat.incremental else "",
@@ -389,6 +412,9 @@ def compact(
             provider=provider,
             max_tokens=summary_max_tokens,
         )
+        summarizer_seconds = time.perf_counter() - summarize_start
+        summary = summarize_resp.content
+        summarizer_usage = summarize_resp.usage
 
     summary, truncated = strat.finalize(
         summary,
@@ -410,6 +436,8 @@ def compact(
         files_read=len(ops.read),
         files_modified=len(ops.modified),
         truncated=truncated,
+        summarizer_usage=summarizer_usage,
+        summarizer_seconds=summarizer_seconds,
     )
     return head + [note] + tail, facts
 
@@ -422,13 +450,17 @@ def _summarize(
     model: str | None,
     provider: Provider | None,
     max_tokens: int,
-) -> str:
+) -> LLMResponse:
     """One summarizer call, with the previous checkpoint passed as its own message.
 
     Kept separate from the transcript rather than concatenated into it: the previous
     checkpoint is settled state to carry forward, the transcript is new material to
     fold in, and a model given both in one blob treats the older half as more history
     to compress — which is how facts erode across repeated compactions.
+
+    Returns the full ``LLMResponse`` rather than just ``.content`` — the caller needs
+    ``.usage`` too, to feed ``Tracer.record_llm`` (Codex finding 1) so this call is
+    measured like any other model call instead of discarded.
     """
     conversation = [{"role": "system", "content": prompt}]
     if prior:
@@ -439,7 +471,7 @@ def _summarize(
         model=model,
         provider=provider,  # summarize through the same endpoint the turn uses
         max_tokens=max_tokens,
-    ).content
+    )
 
 
 def _serialize_message(message: dict) -> str:

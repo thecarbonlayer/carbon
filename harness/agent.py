@@ -31,7 +31,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from harness.compaction import compact, estimate_tokens
+from harness.compaction import CompactionFacts, compact, estimate_tokens
 from harness.context import deliver
 from harness.harness_config import CONFIG, RetryPolicy, TruncationPolicy
 from harness.instructions import load_agents_md, test_command
@@ -316,8 +316,32 @@ class Agent:
             self._last_tokens = 0  # recomputed from the next response
             self.just_compacted = True
             self.compaction_count += 1
-            if self.tracer:
-                self.tracer.record_compaction(facts, pre, post, seconds)
+            self._record_compaction(facts, pre, post, seconds)
+
+    def _record_compaction(
+        self, facts: CompactionFacts, pre: int, post: int, seconds: float
+    ) -> None:
+        """Record one compaction pass, plus its summarizer call if one happened.
+
+        Amendment (2026-08-19, Codex finding 1): the summarizer's own model call
+        must reach ``record_llm`` exactly once — the same as any other model
+        call — so ``llm_calls``, ``tokens``, the split accumulators, and cost all
+        include it. ``facts.summarizer_usage`` is ``None`` on every path that
+        never called the model (a no-op compaction, or an incremental strategy's
+        "nothing new to fold in" carry-forward), so no phantom llm event is ever
+        recorded. Both ``compact()`` call sites (``_maybe_compact`` and
+        ``_compact_active_history``) route through here so neither can forget
+        the summarizer half.
+        """
+        if not self.tracer:
+            return
+        if facts.summarizer_usage is not None:
+            self.tracer.record_llm(
+                facts.summarizer_usage,
+                facts.summarizer_seconds,
+                request_model=self.model,
+            )
+        self.tracer.record_compaction(facts, pre, post, seconds)
 
     def _system_text(self) -> str:
         """Instruction layer = system prompt + project AGENTS.md + skills menu."""
@@ -790,8 +814,7 @@ class Agent:
             self._active_turn_start = len(managed)
             self.just_compacted = True
             self.compaction_count += 1
-            if self.tracer:
-                self.tracer.record_compaction(facts, pre, post, seconds)
+            self._record_compaction(facts, pre, post, seconds)
         shrank = self._shrink_turn_tool_results()
         if compacted or shrank:
             self._last_tokens = 0

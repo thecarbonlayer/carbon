@@ -139,6 +139,36 @@ def test_split_complete_is_per_run_not_per_call():
     assert totals["tokens"] == 23
 
 
+def test_split_stays_complete_when_completion_tokens_is_a_genuine_zero():
+    """Codex finding 2: a split is real when BOTH provider usage keys are
+    PRESENT — presence, never nonzero-ness. A provider that reports
+    completion_tokens: 0 (a real, on-purpose zero-output call) is still a REAL
+    split — it must keep _split_complete True and feed the accumulators, not be
+    treated like a missing key."""
+    tracer = Tracer(model="fake")
+    tracer.record_llm({"prompt_tokens": 9, "completion_tokens": 0, "total_tokens": 9}, 0.1)
+    assert tracer._split_complete is True
+    totals = tracer.totals()
+    assert totals["input_tokens"] == 9
+    assert totals["output_tokens"] == 0
+    assert totals["tokens"] == 9
+
+
+def test_split_is_partial_when_completion_tokens_key_is_missing():
+    """Codex finding 2: a provider reporting prompt_tokens WITHOUT a
+    completion_tokens key at all must not be booked as a real split — the old
+    nonzero check let a truthy prompt_tokens alone through, publishing a
+    fabricated completion_tokens: 0 the provider never actually reported."""
+    tracer = Tracer(model="fake")
+    tracer.record_llm({"prompt_tokens": 12, "total_tokens": 12}, 0.1)
+    assert tracer._split_complete is False
+    totals = tracer.totals()
+    # The partial split must never reach the accumulators.
+    assert totals["input_tokens"] == 0
+    assert totals["output_tokens"] == 0
+    assert totals["tokens"] == 12
+
+
 def test_verified_none_without_verification(scripted_agent):
     assert scripted_agent.run("hello").verified is None
 

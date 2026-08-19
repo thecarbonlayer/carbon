@@ -287,7 +287,7 @@ def test_empty_middle_carries_the_checkpoint_forward_without_calling_the_model()
         raise AssertionError("summarizer was called with an empty transcript")
 
     with patch.object(compaction, "chat", side_effect=explode):
-        out, _facts = compaction.compact(
+        out, facts = compaction.compact(
             messages,
             keep_head=2,
             strategy="token_budget_checkpoint",
@@ -297,6 +297,9 @@ def test_empty_middle_carries_the_checkpoint_forward_without_calling_the_model()
     note = next(m["content"] for m in out if str(m.get("content", "")).startswith("[summary"))
     assert "KEEP-ME-7" in note, "the carried-forward checkpoint lost its content"
     assert note.count("[summary of earlier conversation") == 1, "note header was nested"
+    # Codex finding 1: no model call happened here — the facts must say so, so a
+    # caller feeding this to Tracer.record_llm never fabricates a phantom event.
+    assert facts.summarizer_usage is None
 
 
 def test_overflow_recovery_still_compacts_a_short_prefix_under_token_budgeting():
