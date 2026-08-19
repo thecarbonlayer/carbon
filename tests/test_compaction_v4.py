@@ -124,7 +124,7 @@ def test_cut_point_is_token_budgeted_not_message_counted():
     kept = {}
     for big in (False, True):
         with patch.object(compaction, "chat", side_effect=_reply()):
-            out = compaction.compact(
+            out, _facts = compaction.compact(
                 history(big),
                 keep_head=2,
                 strategy="token_budget_checkpoint",
@@ -147,7 +147,7 @@ def test_cut_snaps_back_to_a_turn_boundary():
         {"role": "assistant", "content": "done"},
     ]
     with patch.object(compaction, "chat", side_effect=_reply()):
-        out = compaction.compact(
+        out, _facts = compaction.compact(
             messages,
             keep_head=1,
             strategy="token_budget_checkpoint",
@@ -198,7 +198,7 @@ def test_tracked_files_survive_a_summarizer_that_drops_everything():
         *_filler(8),
     ]
     with patch.object(compaction, "chat", side_effect=_reply("nothing")):
-        out = compaction.compact(
+        out, _facts = compaction.compact(
             messages,
             keep_head=2,
             strategy="token_budget_checkpoint",
@@ -220,7 +220,7 @@ def test_file_state_accumulates_across_repeated_compactions():
         *_filler(8),
     ]
     with patch.object(compaction, "chat", side_effect=_reply("first")):
-        once = compaction.compact(
+        once, _facts = compaction.compact(
             first, keep_head=2, strategy="token_budget_checkpoint", recent_token_reserve=50
         )
     # A second round whose own middle touches a DIFFERENT file.
@@ -230,7 +230,7 @@ def test_file_state_accumulates_across_repeated_compactions():
         *_filler(8, start=100),
     ]
     with patch.object(compaction, "chat", side_effect=_reply("second")):
-        twice = compaction.compact(
+        twice, _facts = compaction.compact(
             second, keep_head=2, strategy="token_budget_checkpoint", recent_token_reserve=50
         )
     note = next(m["content"] for m in twice if str(m.get("content", "")).startswith("[summary"))
@@ -249,7 +249,7 @@ def test_oversized_checkpoint_is_bounded_but_keeps_its_state_block():
         *_filler(8),
     ]
     with patch.object(compaction, "chat", side_effect=_reply("B" * 40_000)):
-        out = compaction.compact(
+        out, _facts = compaction.compact(
             messages,
             keep_head=2,
             strategy="token_budget_checkpoint",
@@ -287,7 +287,7 @@ def test_empty_middle_carries_the_checkpoint_forward_without_calling_the_model()
         raise AssertionError("summarizer was called with an empty transcript")
 
     with patch.object(compaction, "chat", side_effect=explode):
-        out = compaction.compact(
+        out, _facts = compaction.compact(
             messages,
             keep_head=2,
             strategy="token_budget_checkpoint",

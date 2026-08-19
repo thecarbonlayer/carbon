@@ -28,6 +28,7 @@ from copy import deepcopy
 from dataclasses import asdict, dataclass, field, fields
 
 from harness import events
+from harness.compaction import CompactionFacts
 from harness.events import NullExporter, Span, SpanExporter
 from harness.limits import MAX_ITEM_CHARS, clamp, recut
 from model.pricing import cost_from_usage
@@ -40,7 +41,7 @@ _CAPTURE_TAIL_FRACTION = 0.5
 
 @dataclass
 class Event:
-    kind: str  # "llm" | "tool" | "verify"
+    kind: str  # "llm" | "tool" | "verify" | "plan" | "compaction"
     label: str
     seconds: float
     tokens: int = 0
@@ -355,6 +356,58 @@ class Tracer:
                 operation=events.PLAN,
                 attributes={events.OPERATION_NAME: events.PLAN},
                 status=status,
+                duration_s=seconds,
+            )
+        )
+
+    def record_compaction(
+        self,
+        facts: CompactionFacts,
+        pre_tokens: int,
+        post_tokens: int,
+        seconds: float,
+    ) -> None:
+        """Record one compaction pass (Phase 1 §3) — makes context-window
+        management visible: how much was cut, which strategy ran, whether the
+        checkpoint had to be truncated.
+
+        ``tokens`` on the flat Event is ``pre_tokens - post_tokens``, recorded
+        honestly rather than clamped — a strategy that grows the window (an
+        oversized checkpoint note, say) shows up as a negative delta instead of
+        a silently dropped fact. The span carries the full breakdown as eight
+        ``carbon.compaction.*`` attributes, a non-standard extension (no OTel
+        GenAI operation covers compaction), the same way ``record_verify``'s
+        ``verify`` operation is ours alone.
+        """
+        self._emit(
+            Event(
+                "compaction",
+                facts.strategy,
+                seconds,
+                tokens=pre_tokens - post_tokens,
+                status="ok",
+                turn=self._turn,
+            )
+        )
+        self.spans.append(
+            Span(
+                span_id=self._next_span_id(),
+                parent_id=self._turn_span_id,
+                name=f"compact {facts.strategy}",
+                kind=events.INTERNAL,
+                operation=events.COMPACT,
+                attributes={
+                    events.OPERATION_NAME: events.COMPACT,
+                    events.COMPACTION_STRATEGY: facts.strategy,
+                    events.COMPACTION_PRE_TOKENS: pre_tokens,
+                    events.COMPACTION_POST_TOKENS: post_tokens,
+                    events.COMPACTION_SUMMARY_CHARS: facts.summary_chars,
+                    events.COMPACTION_MIDDLE_COUNT: facts.middle_count,
+                    events.COMPACTION_FILES_READ: facts.files_read,
+                    events.COMPACTION_FILES_MODIFIED: facts.files_modified,
+                    events.COMPACTION_TRUNCATED: facts.truncated,
+                },
+                status="ok",
                 duration_s=seconds,
             )
         )

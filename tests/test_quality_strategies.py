@@ -211,7 +211,7 @@ def test_structured_compaction_serializes_tool_names_arguments_and_prior_summary
         return LLMResponse(content="CHECKPOINT")
 
     with patch.object(compaction, "chat", side_effect=summarize):
-        out = compaction.compact(
+        out, _facts = compaction.compact(
             messages,
             keep_head=1,
             keep_tail=2,
@@ -244,9 +244,10 @@ def test_unbounded_scalars_have_a_quality_floor():
     validator now says both, and it is the door — a test restating a door's rule adds
     no coverage and goes stale on the day the door moves.
 
-    What remains is the part nothing else says. ``max_tokens`` is validated only as a
-    positive integer, so 1 loads cleanly and truncates every reply the agent writes.
-    That is a knob the loop may edit with no floor under it anywhere else.
+    What remains is the part nothing else says. ``max_tokens`` is loader-bounded to
+    256..200_000 (``_INT_BOUNDS`` — telemetry slice 2), which is a technical floor, not
+    a quality one: 256 loads cleanly and still truncates every reply worth writing.
+    This is the floor beneath THAT floor, and nothing but this test asserts it.
     """
     assert CONFIG.max_tokens >= 4096
 

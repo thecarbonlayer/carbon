@@ -184,8 +184,8 @@ def _incremental_prompt(base: str) -> str:
 # --- post-processing, one per strategy family ---------------------------------------
 
 
-def _identity_finalize(summary: str, **_kwargs: object) -> str:
-    return summary
+def _identity_finalize(summary: str, **_kwargs: object) -> tuple[str, bool]:
+    return summary, False
 
 
 def _stateful_finalize(
@@ -195,7 +195,7 @@ def _stateful_finalize(
     middle: list[dict],
     policy: object,
     summary_max_tokens: int,
-) -> str:
+) -> tuple[str, bool]:
     """Bound an oversized checkpoint, then attach the deterministic state block.
 
     The checkpoint is state, not prose, so it gets a hard ceiling of its own: an
@@ -205,16 +205,20 @@ def _stateful_finalize(
 
     The state block is attached AFTER bounding, so the state that must not be
     paraphrased also cannot be truncated away by the fallback.
+
+    Returns the finalized text alongside whether the truncation fallback fired —
+    the caller folds that into ``CompactionFacts.truncated`` (Phase 1 §3).
     """
     from harness.harness_config import TruncationPolicy
     from harness.limits import truncate
 
     budget = summary_max_tokens * 4  # chars, matching the ~4-chars-per-token estimator
-    if len(summary) > budget:
+    truncated = len(summary) > budget
+    if truncated:
         fallback = getattr(policy, "checkpoint_fallback", "head_tail")
         summary = truncate(summary, TruncationPolicy(fallback, budget, 0.5))
     state = checkpoint.render(checkpoint.merge(prior_ops, checkpoint.file_ops(middle)))
-    return f"{summary}\n\n{state}" if state else summary
+    return (f"{summary}\n\n{state}" if state else summary), truncated
 
 
 # --- the registry --------------------------------------------------------------------
@@ -229,7 +233,7 @@ class _Strategy:
 
     cut: Callable[[list[dict], int, int, int], int]
     prompt: Callable[[str], str]
-    finalize: Callable[..., str]
+    finalize: Callable[..., tuple[str, bool]]
     # Whether the previous checkpoint is pulled out of the transcript and passed to
     # the summarizer as its own message, carried forward verbatim when there is
     # nothing new to fold in, and bounded/re-attached after summarizing. False for
@@ -257,6 +261,42 @@ _STRATEGIES: dict[str, _Strategy] = {
 }
 
 
+@dataclass(frozen=True)
+class CompactionFacts:
+    """What actually happened during one compaction pass (Phase 1 §3).
+
+    The telemetry half of ``compact()``'s return value: pre/post token counts and
+    elapsed seconds live with the caller (it already has ``window`` and a clock), so
+    this carries only what ``compact()`` itself knows — the strategy that ran, the
+    shape of what was cut, and whether the checkpoint had to be truncated. Consumed
+    by ``Tracer.record_compaction`` to build an Event and a span.
+    """
+
+    strategy: str
+    middle_count: int
+    summary_chars: int
+    files_read: int
+    files_modified: int
+    truncated: bool
+
+
+def _no_compaction(strategy: str) -> CompactionFacts:
+    """Facts for a call that found nothing safe to compact.
+
+    Both early returns in ``compact()`` hand the messages list back unchanged — the
+    caller detects that with an identity check exactly as before this pair existed —
+    so every count here is honestly zero rather than left over from a prior pass.
+    """
+    return CompactionFacts(
+        strategy=strategy,
+        middle_count=0,
+        summary_chars=0,
+        files_read=0,
+        files_modified=0,
+        truncated=False,
+    )
+
+
 def compact(
     messages: list[dict],
     *,
@@ -267,13 +307,18 @@ def compact(
     recent_token_reserve: int | None = None,
     model: str | None = None,
     provider: Provider | None = None,
-) -> list[dict]:
+) -> tuple[list[dict], CompactionFacts]:
     """Summarize the middle of ``messages`` into a single note; keep head + tail.
 
     Head/tail boundaries are snapped to whole-turn cuts so compaction never
     orphans a tool result from its assistant ``tool_calls`` (which the API rejects
     with a 400). If snapping leaves nothing safe to summarize, the history is
     returned unchanged — better a large window this turn than a corrupt one.
+
+    Returns the (possibly unchanged) message list paired with a ``CompactionFacts``
+    describing what happened. A caller still checks ``result is messages`` for the
+    no-op case exactly as before this pair was added; the facts on that path are
+    all zero rather than meaningful.
     """
     policy = CONFIG.compaction
     keep_head = policy.keep_head if keep_head is None else keep_head
@@ -293,7 +338,7 @@ def compact(
     # compact a short-but-enormous history — exactly the case the budget exists for.
     floor = keep_head + 1 if budgeted else keep_head + keep_tail
     if len(messages) <= floor:
-        return messages
+        return messages, _no_compaction(strategy)
 
     head_end = keep_head
     while not _clean_cut(messages, head_end):
@@ -304,7 +349,7 @@ def compact(
         tail_start -= 1
 
     if head_end >= tail_start:  # snapping erased the middle — nothing safe to compact
-        return messages
+        return messages, _no_compaction(strategy)
 
     head = messages[:head_end]
     tail = messages[tail_start:]
@@ -345,7 +390,7 @@ def compact(
             max_tokens=summary_max_tokens,
         )
 
-    summary = strat.finalize(
+    summary, truncated = strat.finalize(
         summary,
         prior_ops=prior_ops,
         middle=middle,
@@ -357,7 +402,16 @@ def compact(
         "role": "system",
         "content": f"{_NOTE_PREFIX}; strategy={strategy}]\n{summary}",
     }
-    return head + [note] + tail
+    ops = checkpoint.file_ops(middle)
+    facts = CompactionFacts(
+        strategy=strategy,
+        middle_count=len(middle),
+        summary_chars=len(summary),
+        files_read=len(ops.read),
+        files_modified=len(ops.modified),
+        truncated=truncated,
+    )
+    return head + [note] + tail, facts
 
 
 def _summarize(

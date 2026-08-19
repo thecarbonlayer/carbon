@@ -298,13 +298,19 @@ class Agent:
             # tighter wins, so adding a reserve can only ever compact earlier.
             trigger = min(trigger, self.context_limit - policy.completion_reserve)
         if window > trigger:
-            managed = compact(self.messages, model=self.model, provider=self.provider)
+            pre = window
+            start = time.perf_counter()
+            managed, facts = compact(self.messages, model=self.model, provider=self.provider)
+            seconds = time.perf_counter() - start
             if managed is self.messages:
                 return
             self.messages = managed
+            post = estimate_tokens(self.messages)
             self._last_tokens = 0  # recomputed from the next response
             self.just_compacted = True
             self.compaction_count += 1
+            if self.tracer:
+                self.tracer.record_compaction(facts, pre, post, seconds)
 
     def _system_text(self) -> str:
         """Instruction layer = system prompt + project AGENTS.md + skills menu."""
@@ -758,7 +764,12 @@ class Agent:
         # compact() correctly report nothing to summarize; here that correctness is a
         # regression, so this caller opts out of the reserve rather than the reserve
         # quietly making an exception for it.
-        managed = compact(prefix, model=self.model, provider=self.provider, recent_token_reserve=0)
+        # `_facts` is discarded here: this is the overflow-recovery path, not the
+        # steady-state door the Phase 1 §3 telemetry hook is specified for (only
+        # `_maybe_compact` calls `record_compaction` — see contract §3).
+        managed, _facts = compact(
+            prefix, model=self.model, provider=self.provider, recent_token_reserve=0
+        )
         compacted = managed is not prefix
         if compacted:
             self.messages = managed + current_turn
