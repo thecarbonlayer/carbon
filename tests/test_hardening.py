@@ -60,7 +60,7 @@ def test_compact_does_not_orphan_tool_calls_on_head_split():
     msgs = _tool_session()
     assert _roles_valid(msgs)  # input is well-formed
     with patch.object(compaction, "chat", return_value=LLMResponse(content="SUMMARY")):
-        out = compact(msgs, keep_head=2, keep_tail=4)
+        out, _facts = compact(msgs, keep_head=2, keep_tail=4)
     assert _roles_valid(out), out
 
 
@@ -69,7 +69,7 @@ def test_compact_does_not_orphan_tool_result_on_tail_split():
     # about to be summarized away.
     msgs = _tool_session()
     with patch.object(compaction, "chat", return_value=LLMResponse(content="SUMMARY")):
-        out = compact(msgs, keep_head=1, keep_tail=2)
+        out, _facts = compact(msgs, keep_head=1, keep_tail=2)
     assert _roles_valid(out), out
 
 
@@ -83,7 +83,7 @@ def test_compact_leaves_plain_history_boundaries_unchanged():
     # No tool calls → snapping is a no-op, original head/tail semantics hold.
     msgs = [{"role": "user", "content": f"m{i}"} for i in range(10)]
     with patch.object(compaction, "chat", return_value=LLMResponse(content="SUMMARY")):
-        out = compact(msgs, keep_head=2, keep_tail=2)
+        out, _facts = compact(msgs, keep_head=2, keep_tail=2)
     assert out[0] == msgs[0] and out[1] == msgs[1]
     assert out[-1] == msgs[-1] and out[-2] == msgs[-2]
 

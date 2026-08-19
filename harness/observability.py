@@ -28,6 +28,7 @@ from copy import deepcopy
 from dataclasses import asdict, dataclass, field, fields
 
 from harness import events
+from harness.compaction import CompactionFacts
 from harness.events import NullExporter, Span, SpanExporter
 from harness.limits import MAX_ITEM_CHARS, clamp, recut
 from model.pricing import cost_from_usage
@@ -40,7 +41,7 @@ _CAPTURE_TAIL_FRACTION = 0.5
 
 @dataclass
 class Event:
-    kind: str  # "llm" | "tool" | "verify"
+    kind: str  # "llm" | "tool" | "verify" | "plan" | "compaction"
     label: str
     seconds: float
     tokens: int = 0
@@ -81,6 +82,20 @@ class Tracer:
     _span_seq: int = 0
     _turn_span_id: str | None = None  # current invoke_agent parent
     _turn_tool_defs_emitted: bool = False  # tool defs are captured once per turn
+    # Phase 1 telemetry slice 1 (contract §2): the per-call input/output split
+    # already computed in ``_add_chat_span``, accumulated for ``totals()``.
+    _input_tokens: int = 0
+    _output_tokens: int = 0
+    # Amendment (2026-08-19, audit finding 2): true only while every chat call so
+    # far reported a REAL provider split (prompt_tokens/completion_tokens). A call
+    # that reports only total_tokens flips this False, so ``Agent.run()`` knows
+    # ``RunResult.usage`` must publish ``total_tokens`` alone rather than a split
+    # that was never actually reported.
+    # Amendment (2026-08-19, Codex finding 2): "real" means BOTH keys PRESENT,
+    # never by nonzero-ness — a call reporting prompt_tokens without a
+    # completion_tokens key also flips this False, and a genuine
+    # completion_tokens: 0 (present, just zero) keeps it True.
+    _split_complete: bool = True
 
     def turn_start(self) -> None:
         """Begin a new user turn; subsequent events nest under it.
@@ -170,10 +185,28 @@ class Tracer:
         tool_definitions: list[dict] | None = None,
     ) -> None:
         model = request_model or self.model
+        # Codex finding 2: a split is REAL when BOTH provider usage keys are
+        # PRESENT — presence, never nonzero-ness. The old nonzero check let a
+        # provider that reports prompt_tokens without completion_tokens through as
+        # if it were real, publishing a completion_tokens: 0 the provider never
+        # actually sent; a genuine completion_tokens: 0 alongside a present
+        # prompt_tokens key IS real and must keep the split complete.
+        has_input = "prompt_tokens" in usage
+        has_output = "completion_tokens" in usage
         in_tokens = int(usage.get("prompt_tokens", 0) or 0)
         out_tokens = int(usage.get("completion_tokens", 0) or 0)
-        if not in_tokens and not out_tokens:
-            in_tokens = int(usage.get("total_tokens", 0) or 0)
+        if has_input and has_output:
+            self._input_tokens += in_tokens
+            self._output_tokens += out_tokens
+        else:
+            # No real split reported (neither key, or only one). The span still
+            # books whatever was parsed (0 for an absent key) as input/output below
+            # (unchanged span semantics — amendment 2026-08-19 leaves this alone),
+            # but a partial or fabricated split must never reach the accumulators
+            # ``RunResult.usage`` is built from (audit finding 2).
+            if not has_input and not has_output:
+                in_tokens = int(usage.get("total_tokens", 0) or 0)
+            self._split_complete = False
         attrs: dict = {
             events.OPERATION_NAME: events.CHAT,
             events.PROVIDER_NAME: self.provider_name,
@@ -353,6 +386,60 @@ class Tracer:
             )
         )
 
+    def record_compaction(
+        self,
+        facts: CompactionFacts,
+        pre_tokens: int,
+        post_tokens: int,
+        seconds: float,
+    ) -> None:
+        """Record one compaction pass (Phase 1 §3) — makes context-window
+        management visible: how much was cut, which strategy ran, whether the
+        checkpoint had to be truncated.
+
+        Amendment (2026-08-19, audit finding 1): the flat Event books ``tokens=0``
+        — the pre/post delta lives ONLY in the span's ``carbon.compaction.*``
+        attributes below, so ``totals()["tokens"]`` (which sums every event's
+        ``tokens`` field) stays exactly the sum of LLM-call spend, never inflated
+        (or deflated) by a compaction pass. The span carries the full breakdown —
+        pre, post, and everything else — as eight ``carbon.compaction.*``
+        attributes, a non-standard extension (no OTel GenAI operation covers
+        compaction), the same way ``record_verify``'s ``verify`` operation is
+        ours alone.
+        """
+        self._emit(
+            Event(
+                "compaction",
+                facts.strategy,
+                seconds,
+                tokens=0,
+                status="ok",
+                turn=self._turn,
+            )
+        )
+        self.spans.append(
+            Span(
+                span_id=self._next_span_id(),
+                parent_id=self._turn_span_id,
+                name=f"compact {facts.strategy}",
+                kind=events.INTERNAL,
+                operation=events.COMPACT,
+                attributes={
+                    events.OPERATION_NAME: events.COMPACT,
+                    events.COMPACTION_STRATEGY: facts.strategy,
+                    events.COMPACTION_PRE_TOKENS: pre_tokens,
+                    events.COMPACTION_POST_TOKENS: post_tokens,
+                    events.COMPACTION_SUMMARY_CHARS: facts.summary_chars,
+                    events.COMPACTION_MIDDLE_COUNT: facts.middle_count,
+                    events.COMPACTION_FILES_READ: facts.files_read,
+                    events.COMPACTION_FILES_MODIFIED: facts.files_modified,
+                    events.COMPACTION_TRUNCATED: facts.truncated,
+                },
+                status="ok",
+                duration_s=seconds,
+            )
+        )
+
     def get_spans(self) -> list[Span]:
         """Return the full OTel span list, with invoke_agent durations assembled.
 
@@ -387,6 +474,8 @@ class Tracer:
             "llm_calls": sum(e.kind == "llm" for e in self.events),
             "tool_calls": sum(e.kind == "tool" for e in self.events),
             "tokens": sum(e.tokens for e in self.events),
+            "input_tokens": self._input_tokens,
+            "output_tokens": self._output_tokens,
             "cost": round(sum(e.cost for e in self.events), 6),
             "seconds": round(sum(e.seconds for e in self.events), 3),
         }

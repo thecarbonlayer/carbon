@@ -31,7 +31,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from harness.compaction import compact, estimate_tokens
+from harness.compaction import CompactionFacts, compact, estimate_tokens
 from harness.context import deliver
 from harness.harness_config import CONFIG, RetryPolicy, TruncationPolicy
 from harness.instructions import load_agents_md, test_command
@@ -190,6 +190,10 @@ class Agent:
         self._turn_model_calls = 0
         self._turn_approvals = 0
         self._stop_reason = "stop"
+        # Phase 1 telemetry slice 1 (contract §1): the run-verification verdict
+        # _enforce_run acts on, made public via RunResult.verified. Reset at the
+        # top of every run() call; None means no verification was requested.
+        self._last_verified: bool | None = None
         self.retry_count = 0
         self.context_limit = context_limit
         # v0.3: per-instance override of the module-global tool-step budget
@@ -294,13 +298,50 @@ class Agent:
             # tighter wins, so adding a reserve can only ever compact earlier.
             trigger = min(trigger, self.context_limit - policy.completion_reserve)
         if window > trigger:
-            managed = compact(self.messages, model=self.model, provider=self.provider)
+            # Amendment (2026-08-19, audit finding 3): pre must be commensurable
+            # with post — both `estimate_tokens(self.messages)`, computed
+            # immediately before/after the compaction. Never `window` here: it can
+            # be `_last_tokens`, a provider tokenizer count over the full payload
+            # (including the system prompt), which is a different quantity from
+            # what compaction actually measures. The trigger decision above is
+            # unchanged; only this telemetry number moves.
+            pre = estimate_tokens(self.messages)
+            start = time.perf_counter()
+            managed, facts = compact(self.messages, model=self.model, provider=self.provider)
+            seconds = time.perf_counter() - start
             if managed is self.messages:
                 return
             self.messages = managed
+            post = estimate_tokens(self.messages)
             self._last_tokens = 0  # recomputed from the next response
             self.just_compacted = True
             self.compaction_count += 1
+            self._record_compaction(facts, pre, post, seconds)
+
+    def _record_compaction(
+        self, facts: CompactionFacts, pre: int, post: int, seconds: float
+    ) -> None:
+        """Record one compaction pass, plus its summarizer call if one happened.
+
+        Amendment (2026-08-19, Codex finding 1): the summarizer's own model call
+        must reach ``record_llm`` exactly once — the same as any other model
+        call — so ``llm_calls``, ``tokens``, the split accumulators, and cost all
+        include it. ``facts.summarizer_usage`` is ``None`` on every path that
+        never called the model (a no-op compaction, or an incremental strategy's
+        "nothing new to fold in" carry-forward), so no phantom llm event is ever
+        recorded. Both ``compact()`` call sites (``_maybe_compact`` and
+        ``_compact_active_history``) route through here so neither can forget
+        the summarizer half.
+        """
+        if not self.tracer:
+            return
+        if facts.summarizer_usage is not None:
+            self.tracer.record_llm(
+                facts.summarizer_usage,
+                facts.summarizer_seconds,
+                request_model=self.model,
+            )
+        self.tracer.record_compaction(facts, pre, post, seconds)
 
     def _system_text(self) -> str:
         """Instruction layer = system prompt + project AGENTS.md + skills menu."""
@@ -334,6 +375,7 @@ class Agent:
         self._turn_model_calls = 0
         self._turn_approvals = 0
         self._stop_reason = "stop"
+        self._last_verified = None
         if self.tracer:
             self.tracer.turn_start()  # ch-13: nest this turn's steps under one span
         # Compact BEFORE this turn's messages are appended, so ``turn_start`` (an
@@ -352,13 +394,27 @@ class Agent:
         # gate "done" on a real test run (re-prompt runs stream too)
         reply = self._enforce_run(reply, turn_start, on_delta)
         self._save()  # durable state: persist after every turn
+        totals = self.tracer.totals() if self.tracer else {}
+        # Amendment (2026-08-19, audit finding 2): total_tokens is always safe to
+        # publish, but input_tokens/output_tokens are a fabrication whenever any
+        # call this run fell back to booking the total as input — publish the
+        # split only when the tracer saw a real one on every call.
+        usage: dict = {}
+        if self.tracer and totals:
+            usage["total_tokens"] = totals["tokens"]
+            if self.tracer._split_complete:
+                usage["input_tokens"] = totals["input_tokens"]
+                usage["output_tokens"] = totals["output_tokens"]
         result = RunResult(
             text=reply,
             tool_calls=self._collect_tool_calls(turn_start),
             turns=self._turn_model_calls,
             approvals=self._turn_approvals,
             stop_reason=self._stop_reason,
-            totals=self.tracer.totals() if self.tracer else {},
+            totals=totals,
+            verified=self._last_verified,
+            usage=usage,
+            compactions=self.compaction_count,
         )
         self._emit({"type": "turn_end", "result": result})
         return result
@@ -431,6 +487,7 @@ class Agent:
             return reply
         for _ in range(self.verify_attempts):
             if self._record_pass(command, turn_start):
+                self._last_verified = True
                 return reply
             self.messages.append(
                 {
@@ -446,7 +503,9 @@ class Agent:
             turn_start = self._active_turn_start
         # The last re-prompt's run hasn't been checked yet — check it, then fail closed.
         if self._record_pass(command, turn_start):
+            self._last_verified = True
             return reply
+        self._last_verified = False
         return (
             f"{reply}\n\n[unverified: this turn changed code but no passing `{command}` "
             f"run was observed after the change (tried {self.verify_attempts}×). "
@@ -738,13 +797,24 @@ class Agent:
         # compact() correctly report nothing to summarize; here that correctness is a
         # regression, so this caller opts out of the reserve rather than the reserve
         # quietly making an exception for it.
-        managed = compact(prefix, model=self.model, provider=self.provider, recent_token_reserve=0)
+        # Phase 1 §3 amendment: this second call site records exactly like
+        # `_maybe_compact` does — pre/post are the PREFIX's tokens (the only part
+        # `compact()` touches here; `current_turn` is untouched), so an event-based
+        # compaction count can never disagree with `compaction_count`.
+        pre = estimate_tokens(prefix)
+        start = time.perf_counter()
+        managed, facts = compact(
+            prefix, model=self.model, provider=self.provider, recent_token_reserve=0
+        )
+        seconds = time.perf_counter() - start
         compacted = managed is not prefix
         if compacted:
+            post = estimate_tokens(managed)
             self.messages = managed + current_turn
             self._active_turn_start = len(managed)
             self.just_compacted = True
             self.compaction_count += 1
+            self._record_compaction(facts, pre, post, seconds)
         shrank = self._shrink_turn_tool_results()
         if compacted or shrank:
             self._last_tokens = 0

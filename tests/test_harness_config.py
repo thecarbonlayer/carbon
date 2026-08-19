@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pytest
 
+from harness import harness_config
 from harness.harness_config import (
     CONFIG,
     CONFIG_PATH,
@@ -22,6 +23,7 @@ from harness.harness_config import (
     HarnessConfig,
     RetryPolicy,
     TruncationPolicy,
+    config_schema,
     load_config,
     surface_manifest,
 )
@@ -210,3 +212,56 @@ def test_tui_approval_tools_read_the_config():
     import ui.tui as tui
 
     assert tui.APPROVAL_TOOLS == CONFIG.approval_tools
+
+
+# --- telemetry slice 2: single-source int bounds (Phase 1 §4) ----------------
+
+
+def test_compaction_optional_keys_published_with_contract_bounds():
+    """The three ``token_budget_checkpoint`` knobs are on the published surface with
+    exactly the bounds/enum the frozen contract (§4) specifies."""
+    params = {f["name"]: f for f in config_schema()}["compaction"]["parameters"]
+    assert params["recent_token_reserve"] == {"type": "int", "min": 0, "max": 100_000}
+    assert params["completion_reserve"] == {"type": "int", "min": 0, "max": 100_000}
+    assert params["checkpoint_fallback"] == {
+        "type": "str",
+        "enum": ["head_tail", "keep_head"],
+    }
+
+
+def test_every_int_bounds_field_publishes_what_the_loader_enforces(tmp_path):
+    """``_INT_BOUNDS`` is the single source for both the loader and the published
+    schema — read both sides from that same table rather than pinning numbers here,
+    so this test cannot silently pass while the two drift apart.
+
+    Covers both shapes: the six top-level ``HarnessConfig`` fields (published on
+    their own schema item) and retry's two nested fields (published inside the
+    ``retry`` item's ``parameters``).
+    """
+    schema = {f["name"]: f for f in config_schema()}
+    retry_params = schema["retry"]["parameters"]
+    for key, (low, high) in harness_config._INT_BOUNDS.items():
+        published = (
+            (schema[key]["min"], schema[key]["max"])
+            if key in schema
+            else (
+                retry_params[key]["min"],
+                retry_params[key]["max"],
+            )
+        )
+        assert published == (low, high), f"{key}: published {published} != enforced ({low}, {high})"
+
+
+def test_int_above_its_published_max_is_rejected_naming_the_field(tmp_path):
+    """A value above ``_INT_BOUNDS``'s max is rejected, and the message names the
+    field — for every bounded field that actually has a ceiling."""
+    for key, (_low, high) in harness_config._INT_BOUNDS.items():
+        if high is None:  # unbounded above (max_item_chars) — nothing to violate
+            continue
+        raw = _valid_raw()
+        if key in raw:
+            raw[key] = high + 1
+        else:
+            raw["retry"][key] = high + 1
+        with pytest.raises(ValueError, match=key):
+            load_config(_write(tmp_path, raw))
