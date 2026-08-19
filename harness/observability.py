@@ -81,6 +81,10 @@ class Tracer:
     _span_seq: int = 0
     _turn_span_id: str | None = None  # current invoke_agent parent
     _turn_tool_defs_emitted: bool = False  # tool defs are captured once per turn
+    # Phase 1 telemetry slice 1 (contract §2): the per-call input/output split
+    # already computed in ``_add_chat_span``, accumulated for ``totals()``.
+    _input_tokens: int = 0
+    _output_tokens: int = 0
 
     def turn_start(self) -> None:
         """Begin a new user turn; subsequent events nest under it.
@@ -174,6 +178,8 @@ class Tracer:
         out_tokens = int(usage.get("completion_tokens", 0) or 0)
         if not in_tokens and not out_tokens:
             in_tokens = int(usage.get("total_tokens", 0) or 0)
+        self._input_tokens += in_tokens
+        self._output_tokens += out_tokens
         attrs: dict = {
             events.OPERATION_NAME: events.CHAT,
             events.PROVIDER_NAME: self.provider_name,
@@ -387,6 +393,8 @@ class Tracer:
             "llm_calls": sum(e.kind == "llm" for e in self.events),
             "tool_calls": sum(e.kind == "tool" for e in self.events),
             "tokens": sum(e.tokens for e in self.events),
+            "input_tokens": self._input_tokens,
+            "output_tokens": self._output_tokens,
             "cost": round(sum(e.cost for e in self.events), 6),
             "seconds": round(sum(e.seconds for e in self.events), 3),
         }

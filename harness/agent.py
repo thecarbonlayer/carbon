@@ -190,6 +190,10 @@ class Agent:
         self._turn_model_calls = 0
         self._turn_approvals = 0
         self._stop_reason = "stop"
+        # Phase 1 telemetry slice 1 (contract §1): the run-verification verdict
+        # _enforce_run acts on, made public via RunResult.verified. Reset at the
+        # top of every run() call; None means no verification was requested.
+        self._last_verified: bool | None = None
         self.retry_count = 0
         self.context_limit = context_limit
         # v0.3: per-instance override of the module-global tool-step budget
@@ -334,6 +338,7 @@ class Agent:
         self._turn_model_calls = 0
         self._turn_approvals = 0
         self._stop_reason = "stop"
+        self._last_verified = None
         if self.tracer:
             self.tracer.turn_start()  # ch-13: nest this turn's steps under one span
         # Compact BEFORE this turn's messages are appended, so ``turn_start`` (an
@@ -352,13 +357,25 @@ class Agent:
         # gate "done" on a real test run (re-prompt runs stream too)
         reply = self._enforce_run(reply, turn_start, on_delta)
         self._save()  # durable state: persist after every turn
+        totals = self.tracer.totals() if self.tracer else {}
         result = RunResult(
             text=reply,
             tool_calls=self._collect_tool_calls(turn_start),
             turns=self._turn_model_calls,
             approvals=self._turn_approvals,
             stop_reason=self._stop_reason,
-            totals=self.tracer.totals() if self.tracer else {},
+            totals=totals,
+            verified=self._last_verified,
+            usage=(
+                {
+                    "input_tokens": totals["input_tokens"],
+                    "output_tokens": totals["output_tokens"],
+                    "total_tokens": totals["tokens"],
+                }
+                if totals
+                else {}
+            ),
+            compactions=self.compaction_count,
         )
         self._emit({"type": "turn_end", "result": result})
         return result
@@ -431,6 +448,7 @@ class Agent:
             return reply
         for _ in range(self.verify_attempts):
             if self._record_pass(command, turn_start):
+                self._last_verified = True
                 return reply
             self.messages.append(
                 {
@@ -446,7 +464,9 @@ class Agent:
             turn_start = self._active_turn_start
         # The last re-prompt's run hasn't been checked yet — check it, then fail closed.
         if self._record_pass(command, turn_start):
+            self._last_verified = True
             return reply
+        self._last_verified = False
         return (
             f"{reply}\n\n[unverified: this turn changed code but no passing `{command}` "
             f"run was observed after the change (tried {self.verify_attempts}×). "
