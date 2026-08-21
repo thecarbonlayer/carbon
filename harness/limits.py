@@ -9,8 +9,8 @@ every strategy-shaped config knob uses the same shape, so an external improver
 (or a person) reads one pattern once, not one pattern per knob plus a note that
 this one is "simple enough" to skip it. The two inline strategies decide which
 bytes to *lose*; ``offload_to_file`` refuses to lose any — the complete result
-goes to a workspace file and the inline excerpt carries the path, so what the
-door cut stays one ``read_file`` away instead of gone.
+goes to a file in the session's private scratch and the inline excerpt carries a
+virtual ref, so what the door cut stays one ``read_file`` away instead of gone.
 
 This is the ONE door: an item passes it exactly once, and no other layer applies a
 policy to the same text — not the sandbox, not the overflow shrink. That is what
@@ -44,16 +44,68 @@ from harness.harness_config import CONFIG, TruncationPolicy
 
 MAX_ITEM_CHARS = CONFIG.max_item_chars  # re-export; the value lives in the editable surface
 
-# Where offloaded results live, relative to the agent's workspace root. Inside the
-# workspace on purpose: the model's own read_file resolves relative paths against
-# that root, so the marker's path works verbatim. The files share the workspace's
-# lifecycle (a throwaway worktree, a benchmark container) and are never meant to
-# be committed.
-OFFLOAD_SUBDIR = Path(".carbon") / "offload"
+SCRATCH_SCHEME = "scratch://"
+# Spills live under the SESSION's private scratch (harness/session_env.py), never the
+# workspace: the workspace is the user's durable repo and the sync/commit unit, and a
+# complete tool-output copy inside it inherits both audiences. The transcript carries
+# only the virtual ref below; read_file resolves it. Bounded disk: MAX_OFFLOAD_FILES.
+_OFFLOAD_DIRNAME = "offload"
+
+
+def spill_ref(filename: str) -> str:
+    """The ONE place a spill's location becomes transcript text. Virtual on purpose:
+    no absolute host path enters the transcript (machine-private, and unstable the
+    moment execution moves into a container or remote session), and a forged ref can
+    only ever name a file inside this session's own scratch inventory."""
+    return f"{SCRATCH_SCHEME}{_OFFLOAD_DIRNAME}/{filename}"
+
+
+def shell_ref(filename: str) -> str:
+    """The bash route to the same artifact, as an UNEXPANDED variable reference.
+
+    `scratch://` is carbon's internal identifier and only `read_file` resolves it.
+    Iteration 5 measured what that costs: every one of the model's 32 attempts to
+    reach a spill went through bash — grep, ls, a python one-liner — and every one
+    failed, after which it fabricated the answer by re-deriving it. An identifier
+    that looks like a path but is only honoured by a single tool is a private API
+    handle wearing a path's clothes. Both consumers get an adapter.
+
+    The variable's NAME is baked into this module (below); its value is set by
+    ``harness.sandbox`` on the ``Sandbox`` that actually runs the command. What
+    THIS function writes, and what the footer below assembles it into, never
+    carries an expanded path — only the name. That is narrower than "never a host
+    path lands in the transcript": a command run AGAINST the mount can still print
+    one of its own, since the shell expands ``$CARBON_SCRATCH_DIR`` before
+    ``cut``/``grep``/etc. ever run, so a stale ref's "no such file" names the real
+    path in THAT command's own stderr. Not scrubbed there either — a blanket
+    rewrite can't tell "a path leaked into an error" from "a path is legitimately
+    part of file content a command is displaying," and would risk corrupting the
+    latter to fix the former.
+    """
+    # Deferred, not module-level: this module is imported BY harness.sandbox's own
+    # dependency chain (sandbox -> tools -> limits, for SCRATCH_SCHEME), so a
+    # module-level `from harness.sandbox import ...` here would close that into a
+    # real three-module cycle. It would even resolve under some import orders — but
+    # not the one where something imports harness.tools first, since tools.py pauses
+    # on its own `from harness.limits import SCRATCH_SCHEME` line before its `Tool`
+    # class is defined, and this module would then be asking the still-loading tools
+    # module for it. Deferred to call time, every module involved has already
+    # finished loading, regardless of which of the three a caller touches first.
+    from harness.sandbox import SCRATCH_ENV_VAR
+
+    return f"${SCRATCH_ENV_VAR}/{_OFFLOAD_DIRNAME}/{filename}"
+
+
 # Bounded disk. The filename is a content hash, so nothing ever overwrites anything;
-# a long session on a persistent workspace would spill one file per over-budget
-# result forever. Keep the newest N — the older a spill is, the less likely anything
-# is still following its footer.
+# a long session still spills one file per over-budget result until session close.
+# Keep the newest N — the older a spill is, the less likely anything is still
+# following its footer.
+#
+# EPHEMERAL sessions only. A DURABLE session (harness/session_env.py, Task 3) grows
+# unbounded by this constant across a reopen instead — it is bounded by the SESSION's
+# own lifetime (harness.memory.delete_session / delete_session_scratch), not by this
+# count, because its footers are read by a transcript that outlives any one process.
+# See ``_prune``'s ``durable`` parameter.
 MAX_OFFLOAD_FILES = 64
 _PART_SUFFIX = ".part"  # a spill mid-write; only ever named between mkstemp and rename
 
@@ -61,9 +113,74 @@ _PART_SUFFIX = ".part"  # a spill mid-write; only ever named between mkstemp and
 # and the temp files it is still writing. ``_prune`` skips them — a footer whose file
 # was reclaimed underneath it is worse than a directory a little over its bound, since
 # the model then follows a live-looking route to "no such file" with nothing telling it
-# the copy ever existed. A session that spills more than MAX_OFFLOAD_FILES times
-# therefore exceeds the bound until the process exits; that is the intended trade.
+# the copy ever existed. An EPHEMERAL session that spills more than MAX_OFFLOAD_FILES
+# times therefore exceeds the bound until the process exits; that is the intended trade.
+#
+# Per-PROCESS is exactly what makes that reasoning WRONG for a DURABLE session: this
+# set starts empty again on every reopen, so a durable session's own earlier spills —
+# real, still named by its persisted transcript, just written by a now-dead process —
+# are indistinguishable from "a previous run's strays" by membership in this set alone.
+# ``_prune``'s ``durable`` parameter is what tells the two apart instead of relying on
+# ``_OURS``, which structurally cannot: see test_durable_spills_survive_their_own_
+# sessions_reopen (tests/test_offload_strategy.py), which reproduces the reviewer's
+# measured "100 spills, reopen, spill one more, lose 37" without it.
 _OURS: set[Path] = set()
+
+
+def forget_spills(scratch_root: str | Path) -> None:
+    """Discard every ``_OURS`` entry that lives under ``scratch_root`` — the
+    bookkeeping half of ending a session, called from an ephemeral
+    ``SessionEnvironment.cleanup()`` (harness/session_env.py) alongside the
+    ``shutil.rmtree`` that removes the directory those entries name.
+
+    Without this, ``_OURS`` only ever grows: it records a Path per spill and never
+    lost one, so a long-lived process (the TUI cycling through ``/new`` sessions, a
+    benchmark fanning out one worker after another) accumulates a permanent entry
+    for every spill any session it ever closed ever made — unbounded for the life
+    of the process, a slow leak with no cap.
+
+    Scoped to ``scratch_root`` rather than a blanket ``_OURS.clear()``: MULTIPLE
+    INDEPENDENT ephemeral sessions can be alive at once and share this one
+    process-global set — ``fan_out(..., session_env=None)`` (the default) gives
+    each worker its OWN scratch_root, all still recorded in the same ``_OURS``.
+    Closing one of them must discard only ITS entries; clearing the whole set
+    would strip a still-running SIBLING's protection too, exposing that
+    sibling's own in-progress spills to ``_prune``'s reclaim logic while its
+    session is still active — see
+    ``test_forget_spills_does_not_touch_a_different_sessions_ours_entries``. (Not
+    a durable-vs-ephemeral question: a durable ``cleanup()`` never reaches this
+    function at all, scoped or not — see the ``durable`` paragraph below.) Pure
+    in-memory set arithmetic, no filesystem access — this must never be the thing
+    that makes ``cleanup()`` raise (its own contract: "never raises... runs in
+    ``finally`` blocks").
+
+    ``tuple(_OURS)`` first, not a comprehension iterating ``_OURS`` directly:
+    this module-global set is mutated from OTHER THREADS while one session
+    closes — sibling ``fan_out`` workers still spilling concurrently call
+    ``_OURS.add()``/``.discard()`` (``_write_atomically``/``_spill`` below) at
+    the same time this reads it. A set comprehension holds its iterator open
+    across real per-element Python work (``root in p.parents`` — attribute
+    access, hashing), long enough for a concurrent mutation to land in between
+    and raise ``RuntimeError: Set changed size during iteration`` (reproduced by
+    a reviewer; reproduced deterministically, not by timing, in
+    ``test_cleanup_survives_ours_changing_size_mid_iteration``).
+    ``tuple(_OURS)`` copies references in a single C-level loop with no Python
+    bytecode executed per element, so — under CPython's GIL — it does not yield
+    control mid-copy the way the comprehension did; this is the same pattern
+    ``list(some_dict)``/``tuple(some_set)`` is idiomatically used for elsewhere
+    to snapshot a GIL-protected container without a dedicated lock.
+
+    Callers must gate this on ``durable`` themselves (see ``cleanup()``): a durable
+    session's own earlier spills are named by a transcript that outlives this
+    process (Task 3 — see ``_prune``'s ``durable`` parameter above), so forgetting
+    them here on an ordinary close would reintroduce exactly the bug Task 3 fixed,
+    on the very next reopen's ``_prune``. This function has no way to tell a
+    durable scratch_root from an ephemeral one by the path alone, so it does not
+    try — it always forgets what is asked, unconditionally.
+    """
+    root = Path(scratch_root)
+    stale = {p for p in tuple(_OURS) if root in p.parents}
+    _OURS.difference_update(stale)
 
 
 def clamp(text: str, max_chars: int = MAX_ITEM_CHARS) -> str:
@@ -101,13 +218,23 @@ def _cut_head_tail(text: str, content_budget: int, tail_fraction: float, marker:
 
 
 def _keep_head(
-    text: _Text, content_budget: int, _tail_fraction: float, marker: str, _root: Path | None
+    text: _Text,
+    content_budget: int,
+    _tail_fraction: float,
+    marker: str,
+    _scratch: Path | None,
+    _durable: bool,
 ) -> str:
     return text.shown[:content_budget] + marker
 
 
 def _head_tail(
-    text: _Text, content_budget: int, tail_fraction: float, marker: str, _root: Path | None
+    text: _Text,
+    content_budget: int,
+    tail_fraction: float,
+    marker: str,
+    _scratch: Path | None,
+    _durable: bool,
 ) -> str:
     return _cut_head_tail(text.shown, content_budget, tail_fraction, marker)
 
@@ -135,49 +262,97 @@ _LOOKALIKE_RE = re.compile(r"\[(?=Showing \d+ of \d+ chars\. (?:Full output|Outp
 # about the command even while every count is true of the file. Planting one buys an
 # attacker a more cautious footer and nothing else.
 _UPSTREAM_CUT = "…[truncated "
-# The widest footer this module can write, over every route and every claim, with
-# counts up to ten digits (a 10 GB result — this process could not hold one). Measured
-# at 384 today. Two consumers size themselves from it: the overflow shrink's tail floor
-# (agent.py) and the accept gate's door-control allowance (tasks/checks.py). A footer
-# that outgrew it would silently cost a pointer in the first and read as a door-control
-# regression in the second, so test_offload_strategy measures this writer against this
-# number rather than anyone re-deriving it by eye.
-MAX_FOOTER_CHARS = 450
+# The widest footer this module can write, over the single-line case, the paging
+# case, and every claim, with counts up to ten digits (a 10 GB result — this process
+# could not hold one) and a filename at its fixed 20-char width (16 hex + ".txt").
+#
+# Re-measured at 389 (up from the prior revision's correctly-measured 343): adding
+# the shell route flips which branch is widest — the PAGING case is now it, not the
+# single-line one, because "or search it in a shell, e.g. grep -n '<what you need>'
+# "$CARBON_SCRATCH_DIR/…"" outruns the single-line "or slice it in a shell, e.g.
+# head -c <n> "$CARBON_SCRATCH_DIR/…"" by more than the paging call's own
+# ", start_line=1, end_line=<n>" gave up.
+#
+# Pinned exactly at the measured value, no added headroom — a deliberate choice,
+# not the default. The prior revision's 450-vs-343 gap was ALSO deliberate (a
+# margin chosen on purpose, not a number that had gone stale — re-checked against
+# that revision's own writer and both of its claims held), so this is not "fixing
+# drift"; it is trading that margin away on purpose. Slack is invisible: a future
+# wording change that grows the footer by less than an unused margin passes
+# silently, and only the change that finally crosses the old ceiling shows up as a
+# failure — pinned to whoever last touched this file, not whoever actually grew it.
+# Pinning exactly means every wording change re-measures, immediately, correctly
+# attributed to itself.
+#
+# Two consumers size themselves from it: the overflow shrink's tail floor
+# (agent.py) and the accept gate's door-control allowance (tasks/checks.py). A
+# footer that outgrew it would silently cost a pointer in the first and read as a
+# door-control regression in the second, so test_offload_strategy measures this
+# writer against this number directly rather than anyone re-deriving it by eye.
+MAX_FOOTER_CHARS = 389
 
 
-def _route(line_count: int, rel: Path) -> str:
-    """The two ways back into the spill, in the units the tools actually take.
+def _route(line_count: int, ref: str, shell: str) -> str:
+    """The way back into a spill, for each of the two tools that can actually reach
+    for one.
 
-    Both are offered because they answer different questions: paging reads the file in
-    order, searching jumps to the one line that matters. The search route needs its
-    ``pattern`` spelled out — the harness's scratch directory is kept out of an
-    undirected walk (tools.py), so a bare query would report no matches on the very
-    file this footer is pointing at.
+    Two routes, not one. The old second route (``search_text``, with its own
+    ``pattern`` spelled out) depended on a real workspace path a walk could reach; a
+    virtual ``scratch://`` ref has none, so it fell away and, for one revision,
+    ``read_file`` was what was left — the only call offered, because it is the only
+    tool that resolves the ref. That measured badly: iteration 5's transcripts
+    showed 32 of 32 attempts to recover a spill went through bash (``grep``,
+    ``ls -F``, a python one-liner), none of which can resolve ``scratch://``, and
+    every one failed — task E4 (recover a truncated artifact) scored 0/10. The
+    model reached for the tool it actually had, which this footer did not name. The
+    shell route names it: ``shell_ref`` builds the same file's path as an
+    UNEXPANDED ``$CARBON_SCRATCH_DIR`` reference, so quoting it here is never a
+    host path, only ever the variable's name (harness/sandbox.py sets the value on
+    the ``Sandbox`` that runs the command, not on this text).
 
-    No range is computed for the page. A suggested first page used to be sized against
-    this door so its result could not come back over budget, but read_file's result
-    carries a continuation hint, and a hint downgrades the strategy away from offload
-    (see ``_door``) — so an over-budget page returns an excerpt plus "ask for a
-    smaller range", never another spill. That mechanism prevents the circle for every
-    page the model asks for; a computed first page only ever saved the first round trip.
+    No range is computed for the read_file page. A suggested first page used to be
+    sized against this door so its result could not come back over budget, but
+    read_file's result carries a continuation hint, and a hint downgrades the
+    strategy away from offload (see ``_door``) — so an over-budget page returns an
+    excerpt plus "ask for a smaller range", never another spill. That mechanism
+    prevents the circle for every page the model asks for; a computed first page
+    only ever saved the first round trip.
 
-    The shell slice is offered, never promised: a subagent's registry is read-only
-    tools with no bash in it, and naming a tool the reader may not have should read as
-    "not for you" rather than as a dead end.
+    A single line is a different problem, not a smaller one: read_file pages by
+    LINE, so there is no line boundary inside one line for it to page to — a
+    start_line/end_line range would just be a route to "no such range", and that
+    half of the old wording still holds. What no longer holds is the conclusion
+    drawn from it: a shell slices by BYTE, so ``head -c``/``cut``/``dd`` can reach
+    the middle of one long line even though read_file structurally cannot. That is
+    the single-line gap iteration 5 named, closed the same way as the multi-line
+    case — by naming a tool that can actually do it, rather than naming no call at
+    all.
+
+    The byte count is a placeholder (``<n>``), same as ``end_line=<n>`` above it,
+    never a literal figure. An earlier revision wrote ``cut -c1-4000`` — a number
+    with no relationship to THIS call's actual budget, so a small `tool_output`
+    policy could suggest a slice bigger than the door it would re-enter through,
+    spilling a second file to recover from the first. The door has no continuation
+    hint of its own to fall back on here the way a re-submitted read_file page
+    does (see the paragraph above) — the safe number depends on the budget in
+    force *when the model runs the command*, which this footer, written now,
+    cannot see ahead of. Naming no number is the honest version of the same
+    choice already made for the read_file page above.
     """
     if line_count <= 1:
         return (
-            f"one long line, so line paging cannot reach into it; a shell can slice it, "
-            f"e.g. sed -n '1p' {rel} | cut -c1-4000"
+            f"one long line: read_file(path='{ref}') returns it whole, or slice it in "
+            f'a shell, e.g. head -c <n> "{shell}"'
         )
     return (
-        f"read_file(path='{rel}', start_line=1, end_line=<n>) to page it, "
-        f"or search_text(query='<what you need>', pattern='{rel}') to jump to a line"
+        f"read_file(path='{ref}', start_line=1, end_line=<n>) to page it, "
+        f"or search it in a shell, e.g. grep -n '<what you need>' \"{shell}\""
     )
 
 
-def _footer(rel: Path, *, shown: int, total: int, lines: int, cut_upstream: bool) -> str:
-    """Name the complete copy and hand the model the exact next call to make.
+def _footer(ref: str, shell: str, *, shown: int, total: int, lines: int, cut_upstream: bool) -> str:
+    """Name the complete copy and hand the model the exact next call to make — one
+    for each tool that can reach it (``read_file`` via ``ref``, a shell via ``shell``).
 
     Counts, not text: every number here describes the file on disk, and the widest
     footer this can produce is pinned by ``MAX_FOOTER_CHARS``, which a test measures
@@ -197,7 +372,7 @@ def _footer(rel: Path, *, shown: int, total: int, lines: int, cut_upstream: bool
     )
     return (
         f"\n[Showing {shown} of {total} chars. {claim} ({lines} lines): "
-        f"{rel} — {_route(lines, rel)}]"
+        f"{ref} — {_route(lines, ref, shell)}]"
     )
 
 
@@ -230,39 +405,7 @@ class _OffloadUnavailable(Exception):
     """No complete copy could be written; the caller degrades to an inline excerpt."""
 
 
-# A line that already covers the spills; anything else is somebody's own file.
-_IGNORE_COVERAGE = frozenset({"*", "**", "offload", "offload/", "/offload", "/offload/"})
-
-
-def _mark_ignored(carbon_dir: Path) -> None:
-    """Keep spilled output out of the user's history.
-
-    The agent works inside a real repository, and ``.carbon`` is the harness's own
-    scratch directory in it — without this, one ``git add -A`` after a long session
-    commits the agent's own truncated tool results. An existing ``.gitignore`` is never
-    clobbered (it may be the user's, or another tool's), but one that does not actually
-    cover the spills — say a project-local ``extensions/`` line and nothing else — is
-    appended to, because "a file exists" was never the property worth checking.
-    """
-    marker = carbon_dir / ".gitignore"
-    if marker.is_symlink():
-        # Never write through a link we did not create: a dangling one makes this
-        # create its target, which is somewhere outside .carbon by definition.
-        return
-    try:
-        existing = marker.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        marker.write_text("*\n", encoding="utf-8")
-        return
-    except (OSError, UnicodeError):
-        return
-    if any(line.strip() in _IGNORE_COVERAGE for line in existing.splitlines()):
-        return
-    with marker.open("a", encoding="utf-8") as handle:
-        handle.write(("" if existing.endswith("\n") or not existing else "\n") + "offload/\n")
-
-
-def _prune(offload_dir: Path) -> None:
+def _prune(offload_dir: Path, *, durable: bool = False) -> None:
     """Keep the newest ``MAX_OFFLOAD_FILES`` spills, drop older strays and dead temps.
 
     Never anything in ``_OURS``: this session's transcript names those files, so
@@ -271,6 +414,17 @@ def _prune(offload_dir: Path) -> None:
     unconditionally — a write killed between mkstemp and rename, whose name no reader
     was ever given — and they have to go through here, or a process killed mid-write
     leaks past the disk bound the ``*.txt`` sweep is enforcing.
+
+    ``durable=True`` skips the ``*.txt`` reclaim entirely (the abandoned-``.part``
+    sweep above still runs either way — nothing, durable or not, ever names one of
+    those). ``_OURS`` is a module-level, per-PROCESS set: empty again on every
+    reopen, so it cannot tell "a previous PROCESS's strays" (safe to reclaim) apart
+    from "a previous RUN of this same durable SESSION's real spills, still named by
+    its persisted transcript" (must not be reclaimed) — the two look identical by
+    membership in ``_OURS`` alone. ``durable`` is the caller's answer to that
+    question instead: a durable scratch is bounded by the session's own lifetime
+    (``harness.memory.delete_session`` / ``delete_session_scratch``), not by this
+    count. See test_durable_spills_survive_their_own_sessions_reopen.
     """
     strays: list[Path] = []
     ours = 0
@@ -283,6 +437,8 @@ def _prune(offload_dir: Path) -> None:
                 path.unlink()
         elif path.suffix == ".txt":
             strays.append(path)
+    if durable:
+        return
     keep = max(0, MAX_OFFLOAD_FILES - ours)
     strays.sort(key=lambda p: p.stat().st_mtime)
     for stale in strays[: max(0, len(strays) - keep)]:
@@ -294,17 +450,26 @@ def _write_atomically(target: Path, payload: bytes) -> None:
     """Write via a private temp file and ``os.replace``.
 
     ``rename`` REPLACES whatever holds the target name instead of following it, which
-    matters because the name is a deterministic hash: a workspace the agent does not
-    own can pre-place it as a symlink to any file on the host, and a plain write would
-    dutifully overwrite that file. The rename is also atomic, so the model reading the
-    path on its very next turn never sees a half-written file.
+    matters because the name is a deterministic hash: anything that can write into
+    the scratch directory can pre-place it as a symlink to any file on the host, and
+    a plain write would dutifully overwrite that file. The rename is also atomic, so
+    the model reading the path on its very next turn never sees a half-written file.
 
     The mode is mkstemp's own 0600. An earlier pass widened it to 0644 for a sandboxed
     shell running as another uid — but the shell the coding wiring actually builds is
     ``Sandbox(trusted=True)``, the same uid, and the chmod overrode the user's umask to
     publish the *complete* tool output (a printenv, a token-bearing log) to every
-    account on the host. Respect the umask; the one route that needs a wider mode
-    doesn't exist here.
+    account on the host. Respect the umask.
+
+    A route that needs a different uid to read this file DOES exist now — ch-08's
+    Docker backend, reading its own session's scratch through a bind mount on a
+    native Linux host, where the mount preserves the host's uid instead of remapping
+    it the way Docker Desktop's macOS backend does. The fix there is still not a
+    wider mode: ``harness/sandbox.py`` runs that one container AS the invoking uid
+    (``--user {uid}:{gid}``, only when a scratch dir is actually mounted) instead of
+    its usual fixed unprivileged one, so the SAME 0600 file that already excludes
+    every other account on the host is exactly what that container needs too. The
+    mode stays put; only the container's borrowed identity moves.
     """
     fd, tmp = tempfile.mkstemp(dir=target.parent, suffix=_PART_SUFFIX)
     part = Path(tmp)
@@ -328,10 +493,10 @@ def _write_atomically(target: Path, payload: bytes) -> None:
 def _holds(target: Path, payload: bytes) -> bool:
     """Does a REGULAR file at ``target`` already hold exactly ``payload``?
 
-    The name is a content hash, but a hash is a claim about content that the
-    *workspace's owner* can make too: a repository can pre-place
-    ``.carbon/offload/<known hash>.txt`` with content of its choosing, and skipping the
-    write on "a file is already there" would have the footer label that content "Full
+    The name is a content hash, but a hash is a claim about content that anything
+    able to write into the scratch directory can make too: it can pre-place
+    ``<known hash>.txt`` with content of its choosing, and skipping the write on "a
+    file is already there" would have the footer label that content "Full
     output". So verify rather than assume — one read of a file we would otherwise be
     rewriting anyway. A symlink, a directory, or a fifo at the name is not our copy
     either, whatever it contains.
@@ -344,42 +509,61 @@ def _holds(target: Path, payload: bytes) -> bool:
         return False
 
 
-def _offload_dir(workspace_root: Path) -> Path:
-    """The resolved offload directory, created only once we know where it lands.
-
-    Containment is checked BEFORE anything is created. ``.carbon`` may itself be a
-    symlink the workspace's owner planted, and by the time an after-the-fact check can
-    refuse, ``mkdir(parents=True)`` has already made a directory outside the workspace —
-    the data was safe, the side effect was not. A symlinked ``.carbon`` or ``offload``
-    is refused outright, pointing in or out: the harness's own scratch directory is a
-    real directory here or it is nothing. ``resolve()`` on a path that does not exist
-    yet still follows the links in the part that does, which is exactly the question.
-    """
-    root = Path(workspace_root).resolve()
-    carbon = Path(workspace_root) / OFFLOAD_SUBDIR.parts[0]
-    offload = Path(workspace_root) / OFFLOAD_SUBDIR
-    if carbon.is_symlink() or offload.is_symlink():
-        raise _OffloadUnavailable("offload directory is a symlink")
-    landed = offload.resolve()
-    if landed != root and root not in landed.parents:
-        raise _OffloadUnavailable("offload directory escapes the workspace")
-    offload.mkdir(parents=True, exist_ok=True)
-    with suppress(OSError):  # housekeeping must never cost us the copy
-        _mark_ignored(carbon)
+# A containment check DOES belong here, even though the scratch parent is
+# mkdtemp-private to the harness (session_env.py) rather than a path inside a
+# repository someone else controls. A prior revision reasoned that away — "no
+# workspace-owner symlink attack left to defend against" — but that reasoning
+# only covers a HOSTILE PRE-EXISTING workspace; it misses that the model itself
+# can plant the link mid-session. Carbon's coding wiring runs
+# ``Sandbox(trusted=True)``, whose own docstring says it does not isolate the
+# filesystem, and the scratch prefix (``carbon-scratch-``) is greppable in
+# ``$TMPDIR`` — so nothing stops a command the model runs from symlinking
+# ``<scratch>/offload`` to any directory it can write before this call ever
+# fires. Verified rather than assumed: ``mkdir(parents=True, exist_ok=True)``
+# does NOT raise on a pre-existing symlink-to-directory — ``is_dir()`` follows
+# the link, sees a directory, and swallows the ``FileExistsError`` — so a spill
+# would write straight through the link, and ``SessionEnvironment.cleanup()``'s
+# ``shutil.rmtree`` then removes only the link (rmtree does not recurse into a
+# symlinked subdirectory), leaving the spilled bytes on disk outside the
+# session while ``scratch_root.exists()`` reports False to everything checking
+# after the fact.
+def _offload_dir(scratch_dir: Path | None) -> Path:
+    if not scratch_dir:
+        raise _OffloadUnavailable("no scratch storage to write under")
+    root = Path(scratch_dir)
+    landed = root / _OFFLOAD_DIRNAME
+    # Checked before creating anything: mkdir(exist_ok=True) FOLLOWS a symlinked
+    # directory instead of raising, and by the time an after-the-fact check could
+    # refuse, the bytes are already outside the session.
+    if root.is_symlink() or landed.is_symlink():
+        raise _OffloadUnavailable("scratch directory is a symlink")
+    landed.mkdir(parents=True, exist_ok=True)
+    resolved = landed.resolve()
+    if resolved != root.resolve() and root.resolve() not in resolved.parents:
+        raise _OffloadUnavailable("offload directory escapes the scratch root")
+    # NARROWED, not closed. A swap landing after this resolve — between here and
+    # `_write_atomically`'s mkstemp, which re-walks `offload` BY NAME — still escapes,
+    # and the footer would then advertise a route to a file outside the session.
+    # Closing that needs O_NOFOLLOW / dirfd-relative operations, which is a larger
+    # change than this guard. What is dead is the deterministic one-`ln -s` attack:
+    # both halves above are pinned by tests, including a simulated race. Do not read
+    # the TOCTOU test's existence as "races handled".
     return landed
 
 
-def _spill(text: str, workspace_root: Path | None) -> Path:
-    """Write the complete text under the workspace; return its workspace-relative path.
+def _spill(text: str, scratch_dir: Path | None, *, durable: bool = False) -> str:
+    """Write the complete text under the session scratch; return its VIRTUAL ref.
 
     The filename is a content hash — deterministic per call, so a retried or repeated
-    identical result re-lands on the same file instead of littering the workspace. The
+    identical result re-lands on the same file instead of littering scratch. The
     encoding is explicit here and on ``read_file``'s side, so the round trip does not
     depend on the host's locale.
+
+    ``durable`` is forwarded to ``_prune`` unchanged — see its docstring for why the
+    per-process ``_OURS`` set cannot make this call on its own for a session whose
+    transcript (and therefore whose live footers) can outlive this process.
     """
-    if workspace_root is None:
-        raise _OffloadUnavailable("no workspace to write under")
-    landed = _offload_dir(Path(workspace_root))
+    landed = _offload_dir(scratch_dir)
     payload = text.encode("utf-8")
     target = landed / f"{hashlib.sha256(payload).hexdigest()[:16]}.txt"
     if not _holds(target, payload):
@@ -388,8 +572,8 @@ def _spill(text: str, workspace_root: Path | None) -> Path:
     # file: from here on pruning must leave it alone.
     _OURS.add(target)
     with suppress(OSError):  # housekeeping must never cost us the copy we just wrote
-        _prune(landed)
-    return OFFLOAD_SUBDIR / target.name
+        _prune(landed, durable=durable)
+    return spill_ref(target.name)
 
 
 def _note(marker: str, note: str) -> str:
@@ -405,25 +589,35 @@ def _why(exc: Exception) -> str:
 
 
 def _offload_to_file(
-    text: _Text, content_budget: int, tail_fraction: float, marker: str, workspace_root: Path | None
+    text: _Text,
+    content_budget: int,
+    tail_fraction: float,
+    marker: str,
+    scratch_dir: Path | None,
+    durable: bool,
 ) -> str:
-    """Recoverable truncation: write the COMPLETE text to a workspace file, keep the
-    ``head_tail`` excerpt inline, and append a footer naming the file.
+    """Recoverable truncation: write the COMPLETE text to a session scratch file, keep
+    the ``head_tail`` excerpt inline, and append a footer naming the file.
 
-    The footer's path is RELATIVE to the workspace root: that is the path the model's
-    own ``read_file`` resolves, and an absolute host path in a transcript would leak
-    machine-private detail into anything that records it.
+    The footer names a VIRTUAL ``scratch://`` ref, never a host path: that is what the
+    model's own ``read_file`` resolves, and an absolute host path in a transcript would
+    leak machine-private detail into anything that records it — and go stale the moment
+    execution moves into a container or remote session.
 
     Best-effort by construction. This runs mid-turn, after the assistant's tool_calls
     are already in the transcript, so raising would abandon the turn with an unanswered
     tool call and an unsaved session — strictly worse than the inline excerpt every
     other strategy would have produced. A failed write degrades to exactly that, and
     the marker says so instead of pretending a file exists.
+
+    ``durable`` is forwarded to ``_spill`` unchanged — see ``_prune`` for why a
+    durable session's own earlier spills must never be pruned on the strength of
+    this process's (empty, on a reopen) ``_OURS`` set alone.
     """
     try:
         # The tool's bytes, not the model's copy of them: this file is re-read, diffed,
         # applied and checksummed, and a relabeled line inside it is silent corruption.
-        rel = _spill(text.complete, workspace_root)
+        ref = _spill(text.complete, scratch_dir, durable=durable)
     except (_OffloadUnavailable, OSError, UnicodeError) as exc:
         note = _note(marker, _why(exc))
         return _cut_head_tail(text.shown, content_budget, tail_fraction, note)
@@ -433,8 +627,14 @@ def _offload_to_file(
     # so it cannot push the excerpt past the budget); every other count describes the
     # file, which is what the model is being sent to read.
     complete = text.complete
+    # Same file, same filename — `ref` is `spill_ref(target.name)` (the ONE place a
+    # spill's name becomes a virtual ref; see `_spill`), and `Path(...).name` recovers
+    # that filename back out of it rather than plumbing a second copy through the
+    # return value just for this call.
+    shell = shell_ref(Path(ref).name)
     return excerpt + _footer(
-        rel,
+        ref,
+        shell,
         shown=head_chars + tail_chars,
         total=len(complete),
         lines=len(complete.splitlines()),
@@ -449,7 +649,10 @@ class _TruncationStrategy:
     # places it, rather than the caller gluing one fixed shape onto every strategy's
     # output. offload_to_file also appends its own footer AFTER the excerpt: only
     # the strategy knows the path it wrote, so only it can name the recovery route.
-    apply: Callable[[_Text, int, float, str, Path | None], str]
+    # Trailing bool: ``durable`` (Task 3 follow-up) — ignored by the two inline
+    # strategies (nothing prunable about text that never touches disk), consumed
+    # only by offload_to_file, which is the only one that can reach ``_prune``.
+    apply: Callable[[_Text, int, float, str, Path | None, bool], str]
     # Does the strategy leave a recovery route of its own? The caller's
     # continuation_hint is then dropped rather than competing with it (see truncate).
     routes_recovery: bool = False
@@ -496,7 +699,8 @@ def truncate(
     *,
     budget: int | None = None,
     continuation_hint: str | None = None,
-    workspace_root: str | Path | None = None,
+    scratch_dir: str | Path | None = None,
+    durable: bool = False,
 ) -> str:
     """Apply one vetted truncation strategy to text the harness or the user chose.
 
@@ -504,13 +708,20 @@ def truncate(
     content a later ``apply_patch``/``edit_file`` may have to match character for
     character. So it is cut and never rewritten. Tool output goes through
     ``truncate_tool_result`` instead.
+
+    ``durable`` mirrors ``scratch_dir``: it is meaningless unless this call reaches
+    ``offload_to_file`` (today, no caller of THIS entrance passes a ``scratch_dir``,
+    so it never does — see ``truncate_tool_result`` for the one that matters), and is
+    accepted here anyway so the two entrances share one signature rather than one of
+    them silently defaulting to "always prunable" the day a caller changes that.
     """
     return _door(
         _Text(text, text),
         policy,
         budget=budget,
         continuation_hint=continuation_hint,
-        workspace_root=workspace_root,
+        scratch_dir=scratch_dir,
+        durable=durable,
     )
 
 
@@ -520,7 +731,8 @@ def truncate_tool_result(
     *,
     budget: int | None = None,
     continuation_hint: str | None = None,
-    workspace_root: str | Path | None = None,
+    scratch_dir: str | Path | None = None,
+    durable: bool = False,
 ) -> str:
     """The same door for TOOL OUTPUT — the untrusted domain, defanged on the way in.
 
@@ -533,13 +745,18 @@ def truncate_tool_result(
     Every result comes through here, including under-budget ones and whatever strategy
     is selected: the guard that used to sit inside one strategy's over-budget path was
     inert in three of four realistic cases and never fired under the shipped default.
+
+    ``durable`` is the caller's ``session_env.durable`` (agent.py passes it straight
+    through): whether a spill this call makes must survive being pruned by a LATER,
+    different process reopening the same session. See ``_prune``.
     """
     return _door(
         _Text(_defang(text), text),
         policy,
         budget=budget,
         continuation_hint=continuation_hint,
-        workspace_root=workspace_root,
+        scratch_dir=scratch_dir,
+        durable=durable,
     )
 
 
@@ -549,17 +766,21 @@ def _door(
     *,
     budget: int | None = None,
     continuation_hint: str | None = None,
-    workspace_root: str | Path | None = None,
+    scratch_dir: str | Path | None = None,
+    durable: bool = False,
 ) -> str:
     """The door itself, shared by both trust domains.
 
     ``budget`` lets a tool declare a smaller result limit without changing the
     selected strategy. The marker is deliberately actionable: losing bytes is
     unavoidable, losing the fact that bytes were lost is not — and under
-    ``offload_to_file`` the bytes are not even lost, only moved to a file under
-    ``workspace_root`` that the marker's footer names. The inline strategies ignore
-    ``workspace_root``; offload degrades to an inline excerpt without one rather than
-    guessing a directory (the process cwd is not the agent's workspace).
+    ``offload_to_file`` the bytes are not even lost, only moved to a file in the
+    session's private scratch that the marker's footer names. The inline strategies
+    ignore ``scratch_dir`` (and ``durable``); offload degrades to an inline excerpt
+    without a ``scratch_dir`` rather than guessing a directory (the process cwd is
+    not the session's scratch). ``durable`` only matters to offload too — it is
+    whether the file just written must survive being pruned by a LATER process that
+    reopens this same session (harness/session_env.py; see ``_prune``).
 
     This is the one door: every result the model sees comes through here exactly once,
     which is what lets the rules below be this short.
@@ -591,5 +812,9 @@ def _door(
     # Counted on the copy being cut, so the number describes what the model lost here —
     # under offload the footer's own totals then describe the file, which is bigger news.
     marker = f"\n…[truncated {len(text.shown) - max_chars} chars using {name}.{hint}]"
-    root = Path(workspace_root) if workspace_root is not None else None
-    return strat.apply(text, max_chars, policy.tail_fraction, marker, root)
+    # Falsy, not just ``None``: ``Path("")`` normalizes to ``.``, and a truthy-but-empty
+    # scratch_dir wrapped there before this check would spill into the process's own
+    # cwd instead of degrading — the empty string has to be caught here, before it is
+    # ever wrapped in a Path, because a Path object is truthy no matter what it names.
+    scratch = Path(scratch_dir) if scratch_dir else None
+    return strat.apply(text, max_chars, policy.tail_fraction, marker, scratch, durable)

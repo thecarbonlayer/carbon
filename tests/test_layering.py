@@ -83,6 +83,7 @@ _SEAM: dict[str, str] = {
     "policy": "foundation",
     "result": "foundation",
     "skills": "foundation",
+    "session_env": "foundation",
     "tools": "tool execution",
     "checkpoint": "context management",
     "verification": "verification",

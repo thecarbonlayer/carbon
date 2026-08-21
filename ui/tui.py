@@ -209,21 +209,14 @@ class AgentTUI(App):
         # of the worktree — the detached-worktree mismatch. Read from the same tree we
         # write to, and hand workers the same binding. Trusted bash: the agent works
         # on your real project, so your test command runs for real, approval-gated.
-        tools = agent_mod._coding_tools(
-            self.workspace,
-            exclude_session=session,  # recall across *other* sessions
-            provider=self.provider,
-            model=self.provider.model,
-            sessions_dir=self.sessions_dir,
-        )
-        if self.extensions:
-            from harness.extensions import load_extensions
-
-            load_extensions(tools, *agent_mod._extension_dirs(self.workspace.root))
+        #
+        # Agent before tools: with no session_env supplied it creates and owns one,
+        # and that is where _coding_tools' scratch_root has to come from — the
+        # registry's read_file tool must resolve the same scratch the door spills
+        # into. Tools are built and bound after.
         tracer = Tracer(model=self.provider.model)
-        return agent_mod.Agent(
+        agent = agent_mod.Agent(
             system=agent_mod.DEFAULT_SYSTEM,
-            tools=tools,
             skills=load_skills("skills"),
             session=session,
             sessions_dir=self.sessions_dir,
@@ -233,8 +226,33 @@ class AgentTUI(App):
             approve=self._approve,
             approval_required=APPROVAL_TOOLS,
             agents_dir=str(self.workspace.root),  # AGENTS.md lives where the agent works
-            workspace_root=str(self.workspace.root),  # …and so does anything it spills
+            workspace_root=str(self.workspace.root),  # …and so does read_file/write_file
         )
+        # The try opens HERE, immediately after the Agent (and the session_env it
+        # just created and owns) exist — the same shape harness/agent.py's
+        # _run_repl already establishes. _coding_tools, and (with --extensions)
+        # load_extensions below — which runs arbitrary user code from
+        # .carbon/extensions/ — can both raise, and a raise here used to propagate
+        # straight out of _build_agent with agent.close() never called, leaking
+        # the scratch this Agent already allocated in __init__.
+        try:
+            tools = agent_mod._coding_tools(
+                self.workspace,
+                exclude_session=session,  # recall across *other* sessions
+                provider=self.provider,
+                model=self.provider.model,
+                sessions_dir=self.sessions_dir,
+                session_env=agent.session_env,
+            )
+            if self.extensions:
+                from harness.extensions import load_extensions
+
+                load_extensions(tools, *agent_mod._extension_dirs(self.workspace.root))
+            agent.tools = tools
+        except BaseException:
+            agent.close()
+            raise
+        return agent
 
     # --- layout -------------------------------------------------------------
     def compose(self) -> ComposeResult:
@@ -258,6 +276,14 @@ class AgentTUI(App):
         self._render_history()
         self._rebuild_trace()
         self.query_one("#prompt", Input).focus()
+
+    def on_unmount(self) -> None:
+        """App exit (ctrl+q's ``quit`` binding, an unhandled error, the process
+        tearing the run loop down) — end the current agent's scratch lifecycle the
+        same way ``_open_session`` already does on a session switch. ``close()`` is
+        idempotent, and a no-op only for an Agent constructed with session_env=
+        supplied, so this is safe regardless of how ``self.agent`` was constructed."""
+        self.agent.close()
 
     # --- rendering ----------------------------------------------------------
     def _refresh_header(self) -> None:
@@ -485,14 +511,19 @@ class AgentTUI(App):
 
     def _open_session(self, session: str) -> None:
         """Point the UI at ``session`` (already on disk or brand-new) and re-render."""
+        previous = self.agent
         self.agent = self._build_agent(session)
+        previous.close()  # end the outgoing session's scratch lifecycle, if it owned one
         self._render_history()
         self._rebuild_trace()
         self._refresh_header()
         self.query_one("#prompt", Input).focus()
 
     def _reset_session(self) -> None:
-        """Clear the current session's history + trace, keeping the same name."""
+        """Clear the current session's history, trace, and scratch (all three —
+        ``memory.delete_session`` removes the scratch too, since Task 3's durable
+        sessions), keeping the same name. ``_open_session`` below then reopens that
+        name fresh, which recreates an empty scratch for it."""
         session = self.agent.session or "cli"
         delete_session(session, self.sessions_dir)
         self._open_session(session)

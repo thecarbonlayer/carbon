@@ -157,15 +157,30 @@ _SCHEMA: dict[str, type] = {
     "max_tokens": int,
 }
 _SET_FIELDS = {"approval_tools", "code_extensions"}
-# integer knobs that are counts/budgets — zero or negative would wedge the loop
-_POSITIVE_INT_FIELDS = {
-    "max_tool_steps",
-    "default_context_limit",
-    "verify_attempts",
-    "max_item_chars",
-    "memory_search_limit",
-    "max_tokens",
+
+# Single-source int bounds: consulted by BOTH `_check_field` (top-level HarnessConfig
+# fields) and `_retry_policy` (retry's nested fields), and published verbatim by
+# `config_schema()` — a bound changed here changes what the loader enforces and what
+# an external editor is told in the same edit, which is the whole point of collecting
+# them in one table instead of the hand-written literals this replaces (retry's
+# `max_attempts`/`base_delay_ms` used to be checked directly against 1/5/0/10_000 in
+# `_retry_policy`, duplicating what `config_schema()` published about them). `None` as
+# the high bound means no ceiling.
+_INT_BOUNDS: dict[str, tuple[int, int | None]] = {
+    "max_tool_steps": (1, 200),
+    "default_context_limit": (256, 1_000_000),
+    "verify_attempts": (1, 10),
+    "max_tokens": (256, 200_000),
+    "memory_search_limit": (1, 100),
+    "max_item_chars": (1, None),
+    "max_attempts": (1, 5),
+    "base_delay_ms": (0, 10_000),
 }
+# Top-level HarnessConfig fields that must be positive ints — derived from the bounds
+# table rather than hand-picked a second time, so a field can't be bounded in one place
+# and "positive" in another. Retry's nested fields (max_attempts, base_delay_ms) are
+# naturally excluded: they aren't top-level `_SCHEMA` keys.
+_POSITIVE_INT_FIELDS = frozenset(k for k in _INT_BOUNDS if k in _SCHEMA)
 
 _TRUNCATION_STRATEGIES = frozenset({"keep_head", "head_tail"})
 # tool_output's menu additionally offers offload_to_file: the complete result goes
@@ -182,6 +197,11 @@ _COMPACTION_STRATEGIES = frozenset(
 _COMPACTION_OPTIONAL = frozenset(
     {"recent_token_reserve", "completion_reserve", "checkpoint_fallback"}
 )
+# Bounds for the two reserve knobs above — not part of `_INT_BOUNDS` because that table
+# is keyed by top-level `_SCHEMA` field names and retry's nested fields; these two live
+# one level deeper, inside the `compaction` object, validated by `_compaction_policy`
+# and published in `config_schema()["compaction"]["parameters"]` from this same pair.
+_COMPACTION_RESERVE_BOUNDS: tuple[int, int] = (0, 100_000)
 _RETRY_STRATEGIES = frozenset({"fail_fast", "backoff"})
 
 # These are correctness and trust properties, not optimization choices. They
@@ -239,6 +259,26 @@ def _short(value: object) -> str:
     return r if len(r) <= 80 else f"{r[:80]}…"
 
 
+def _bound_message(label: str, value: object, low: int, high: int | None) -> str:
+    """The out-of-range error for one int-bounded field, phrased from the bound
+    itself rather than hand-written per field — so a field with the same shape of
+    bound (``low >= 1``, or a hard ceiling) reads the same way everywhere.
+
+    ``label`` is the caller's already-formatted field reference (``repr(key)`` for a
+    top-level field, ``f"{name!r}.{key}"`` for one nested a level down, e.g. inside
+    ``retry`` or ``compaction``).
+    """
+    if low >= 1 and high is None:
+        bound = "a positive integer"
+    elif low >= 1:
+        bound = f"a positive integer from {low} to {high}"
+    elif high is None:
+        bound = f"an integer >= {low}"
+    else:
+        bound = f"an integer from {low} to {high}"
+    return f"harness config: field {label} must be {bound}, got {_short(value)}"
+
+
 def _check_field(key: str, value: object, expected: type) -> None:
     """Reject a malformed value loudly. ``bool`` is a subclass of ``int`` in
     Python, so integer knobs must explicitly refuse booleans (and vice versa —
@@ -265,10 +305,10 @@ def _check_field(key: str, value: object, expected: type) -> None:
             f"harness config: field {key!r} must be {expected.__name__}"
             f"{' of str' if expected is list else ''}, got {_short(value)}"
         )
-    if key in _POSITIVE_INT_FIELDS and isinstance(value, int) and value <= 0:
-        raise ValueError(
-            f"harness config: field {key!r} must be a positive integer, got {_short(value)}"
-        )
+    if key in _INT_BOUNDS and isinstance(value, int):
+        low, high = _INT_BOUNDS[key]
+        if value < low or (high is not None and value > high):
+            raise ValueError(_bound_message(repr(key), value, low, high))
     if key == "attach_pattern" and isinstance(value, str):
         try:
             compiled = re.compile(value)
@@ -351,14 +391,13 @@ def _compaction_policy(value: dict) -> CompactionPolicy:
         if not isinstance(item, int) or isinstance(item, bool) or item <= 0:
             raise ValueError(f"harness config: field {name!r}.{key} must be a positive integer")
     # Reserves may be 0 — that is how they are switched off — so they are validated as
-    # non-negative, unlike the required fields above.
+    # bounded rather than strictly positive, unlike the required fields above.
+    low, high = _COMPACTION_RESERVE_BOUNDS
     for key in ("recent_token_reserve", "completion_reserve"):
         if key in value:
             item = value[key]
-            if not isinstance(item, int) or isinstance(item, bool) or item < 0:
-                raise ValueError(
-                    f"harness config: field {name!r}.{key} must be a non-negative integer"
-                )
+            if not isinstance(item, int) or isinstance(item, bool) or item < low or item > high:
+                raise ValueError(_bound_message(f"{name!r}.{key}", item, low, high))
     fallback = value.get("checkpoint_fallback", "head_tail")
     if fallback not in _TRUNCATION_STRATEGIES:
         raise ValueError(
@@ -403,17 +442,17 @@ def _retry_policy(value: dict) -> RetryPolicy:
             f"harness config: field {name!r} strategy must be one of "
             f"{sorted(_RETRY_STRATEGIES)}, got {_short(strategy)}"
         )
-    attempts = value["max_attempts"]
-    if not isinstance(attempts, int) or isinstance(attempts, bool) or not 1 <= attempts <= 5:
-        raise ValueError(
-            f"harness config: field {name!r}.max_attempts must be an integer from 1 to 5"
-        )
-    delay = value["base_delay_ms"]
-    if not isinstance(delay, int) or isinstance(delay, bool) or not 0 <= delay <= 10_000:
-        raise ValueError(
-            f"harness config: field {name!r}.base_delay_ms must be an integer from 0 to 10000"
-        )
-    return RetryPolicy(strategy, attempts, delay)
+    for key in ("max_attempts", "base_delay_ms"):
+        item = value[key]
+        low, high = _INT_BOUNDS[key]
+        if (
+            not isinstance(item, int)
+            or isinstance(item, bool)
+            or item < low
+            or (high is not None and item > high)
+        ):
+            raise ValueError(_bound_message(f"{name!r}.{key}", item, low, high))
+    return RetryPolicy(strategy, value["max_attempts"], value["base_delay_ms"])
 
 
 def config_schema() -> list[dict]:
@@ -434,6 +473,8 @@ def config_schema() -> list[dict]:
             "positive_int": name in _POSITIVE_INT_FIELDS,
             "editable": name not in _NON_EDITABLE_FIELDS,
         }
+        if name in _INT_BOUNDS:
+            item["min"], item["max"] = _INT_BOUNDS[name]
         if name == "max_item_chars":
             item["deprecated"] = (
                 "Compatibility re-export only; use file_injection.budget or "
@@ -453,17 +494,21 @@ def config_schema() -> list[dict]:
             }
         elif name == "compaction":
             item["strategies"] = sorted(_COMPACTION_STRATEGIES)
+            reserve_min, reserve_max = _COMPACTION_RESERVE_BOUNDS
             item["parameters"] = {
                 "keep_head": {"type": "int", "positive": True},
                 "keep_tail": {"type": "int", "positive": True},
                 "trigger_fraction": {"type": "float", "exclusive_min": 0, "exclusive_max": 1},
                 "summary_max_tokens": {"type": "int", "positive": True},
+                "recent_token_reserve": {"type": "int", "min": reserve_min, "max": reserve_max},
+                "completion_reserve": {"type": "int", "min": reserve_min, "max": reserve_max},
+                "checkpoint_fallback": {"type": "str", "enum": sorted(_TRUNCATION_STRATEGIES)},
             }
         elif name == "retry":
             item["strategies"] = sorted(_RETRY_STRATEGIES)
             item["parameters"] = {
-                "max_attempts": {"type": "int", "min": 1, "max": 5},
-                "base_delay_ms": {"type": "int", "min": 0, "max": 10_000},
+                key: {"type": "int", "min": _INT_BOUNDS[key][0], "max": _INT_BOUNDS[key][1]}
+                for key in ("max_attempts", "base_delay_ms")
             }
         out.append(item)
     return out

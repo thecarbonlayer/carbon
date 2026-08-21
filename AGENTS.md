@@ -11,6 +11,15 @@ The course is a **15-chapter spine** (`ch-00` … `ch-14`), each chapter introdu
 mature form, demonstrated against a real model (Gemma via LM Studio) and proven with two gates. Each
 chapter is its own commit, tagged, building cumulatively on the last.
 
+## Branch contract
+
+`self-improvement` is the integration base: the external evaluation suite
+(refinery) is built against it and pins it machine-readably on its side
+(`carbon-base.json`). carbon `main` + refinery `main` is NOT currently an
+operable pair. Promotion of `self-improvement` into `main` is prepared and
+human-gated; until it lands, anything refinery must see lands on
+`self-improvement`.
+
 ## Working in this repo
 
 - **Two-gate rule.** `verify` is the floor, `accept` is the truth. Ship a change only when both are

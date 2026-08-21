@@ -60,7 +60,7 @@ def test_compact_does_not_orphan_tool_calls_on_head_split():
     msgs = _tool_session()
     assert _roles_valid(msgs)  # input is well-formed
     with patch.object(compaction, "chat", return_value=LLMResponse(content="SUMMARY")):
-        out = compact(msgs, keep_head=2, keep_tail=4)
+        out, _facts = compact(msgs, keep_head=2, keep_tail=4)
     assert _roles_valid(out), out
 
 
@@ -69,7 +69,7 @@ def test_compact_does_not_orphan_tool_result_on_tail_split():
     # about to be summarized away.
     msgs = _tool_session()
     with patch.object(compaction, "chat", return_value=LLMResponse(content="SUMMARY")):
-        out = compact(msgs, keep_head=1, keep_tail=2)
+        out, _facts = compact(msgs, keep_head=1, keep_tail=2)
     assert _roles_valid(out), out
 
 
@@ -83,7 +83,7 @@ def test_compact_leaves_plain_history_boundaries_unchanged():
     # No tool calls → snapping is a no-op, original head/tail semantics hold.
     msgs = [{"role": "user", "content": f"m{i}"} for i in range(10)]
     with patch.object(compaction, "chat", return_value=LLMResponse(content="SUMMARY")):
-        out = compact(msgs, keep_head=2, keep_tail=2)
+        out, _facts = compact(msgs, keep_head=2, keep_tail=2)
     assert out[0] == msgs[0] and out[1] == msgs[1]
     assert out[-1] == msgs[-1] and out[-2] == msgs[-2]
 
@@ -200,6 +200,44 @@ def test_read_file_tool_binds_root(tmp_path):
     (tmp_path / "note.txt").write_text("hello")
     tool = read_file_tool(str(tmp_path))
     assert tool.func(path="note.txt") == "hello"
+
+
+def test_read_file_resolves_scratch_ref_confined_to_scratch(tmp_path):
+    from harness.tools import read_file
+
+    scratch = tmp_path / "scratch"
+    (scratch / "offload").mkdir(parents=True)
+    (scratch / "offload" / "ab12.txt").write_text("the complete bytes")
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    body = read_file("scratch://offload/ab12.txt", root=ws, scratch_root=scratch)
+    assert "the complete bytes" in body
+    # escape attempts stay inside scratch — a real file sits at the climb target so a
+    # broken containment check would return its content, not just any old error.
+    (ws / "anything").write_text("must never leak through a scratch:// relative climb")
+    err = read_file("scratch://../ws/anything", root=ws, scratch_root=scratch)
+    assert "path outside scratch storage" in err
+    assert "must never leak through a scratch:// relative climb" not in err
+    # no scratch configured -> a clear error, not a workspace fallback — a real file
+    # sits at the fallback location too, so a silent fallback would return content.
+    (ws / "offload").mkdir()
+    (ws / "offload" / "ab12.txt").write_text("must never leak through a workspace fallback")
+    err2 = read_file("scratch://offload/ab12.txt", root=ws, scratch_root=None)
+    assert "no scratch storage in this context" in err2
+    assert "must never leak through a workspace fallback" not in err2
+
+
+def test_read_file_treats_an_empty_scratch_root_as_no_scratch(tmp_path, monkeypatch):
+    """``Path("").resolve()`` is the cwd, so ``is None`` let ``""`` read
+    ``<cwd>/offload/...``. The write side (limits.py's ``_door``/``_offload_dir``)
+    already guards falsy; the read side did not."""
+    from harness.tools import read_file
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "offload").mkdir()
+    (tmp_path / "offload" / "ab.txt").write_text("CWD-LEAK")
+    out = read_file("scratch://offload/ab.txt", root=tmp_path, scratch_root="")
+    assert out.startswith("error:") and "CWD-LEAK" not in out
 
 
 # --- approval preview is honest about a failing edit -------------------------

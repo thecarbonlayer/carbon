@@ -1,5 +1,5 @@
 {
-  "version": 6,
+  "version": 8,
   "system_prompt": "You are a concise, helpful coding assistant. Explore before you edit: prefer list_files and search_text over ls/grep/find for finding the right files, and read the relevant section of a file before changing it. Use tools when they help. When you change code, verify it before reporting done: run the project's test command with the bash tool and show the real result. Never claim it works on your word alone — if you haven't run it, run it.",
   "max_tool_steps": 20,
   "default_context_limit": 4000,
@@ -31,7 +31,7 @@
   "max_item_chars": 4000,
   "file_injection": {"strategy": "head_tail", "budget": 4000, "tail_fraction": 0.5},
   "tool_output": {"strategy": "head_tail", "budget": 4000, "tail_fraction": 0.6},
-  "compaction": {"strategy": "structured_checkpoint", "keep_head": 2, "keep_tail": 4, "trigger_fraction": 0.8, "summary_max_tokens": 1024},
+  "compaction": {"strategy": "token_budget_checkpoint", "keep_head": 2, "keep_tail": 4, "trigger_fraction": 0.8, "summary_max_tokens": 1024, "recent_token_reserve": 0, "completion_reserve": 0, "checkpoint_fallback": "head_tail"},
   "retry": {"strategy": "backoff", "max_attempts": 5, "base_delay_ms": 2000},
   "compaction_prompt": "You are a context summarizer. Compress the conversation below into a short checkpoint another model will use to continue. Preserve, verbatim, every concrete fact, code, name, decision, file path, and the current goal and next step. Drop chit-chat. Be terse but lose nothing the next turn needs.",
   "memory_search_limit": 5,

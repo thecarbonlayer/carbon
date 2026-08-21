@@ -48,7 +48,6 @@ def test_delegated_workers_cannot_mutate_the_workspace():
     could delegate the write it just refused.
     """
     root = Path(tempfile.mkdtemp())
-    tools = _coding_tools(Workspace(root=root), exclude_session=None)
 
     seen: list[str] = []
 
@@ -63,7 +62,14 @@ def test_delegated_workers_cannot_mutate_the_workspace():
             return _tool_call("delegate", task="write a file")
         return LLMResponse(content="parent done")
 
-    Agent(provider=_calls(script), tools=tools).run("delegate a write")
+    # Agent before tools: _coding_tools' scratch_root has to come from a
+    # SessionEnvironment that already exists (Task 4), and the Agent creates one
+    # in __init__ when none is supplied.
+    agent = Agent(provider=_calls(script))
+    agent.tools = _coding_tools(
+        Workspace(root=root), exclude_session=None, session_env=agent.session_env
+    )
+    agent.run("delegate a write")
 
     assert not (root / "pwned.txt").exists()
 
@@ -107,12 +113,161 @@ def test_delegates_inherit_the_parent_provider():
         return LLMResponse(content="parent done")
 
     provider = _calls(script)
-    tools = _coding_tools(
-        Workspace(root=root), exclude_session=None, provider=provider, model="injected-model"
+    agent = Agent(provider=provider)
+    agent.tools = _coding_tools(
+        Workspace(root=root),
+        exclude_session=None,
+        provider=provider,
+        model="injected-model",
+        session_env=agent.session_env,
     )
-    Agent(provider=provider, tools=tools).run("delegate")
+    agent.run("delegate")
 
     assert workers_saw, "delegate fell back to the environment provider"
+
+
+def _needle_workspace() -> tuple[Path, str]:
+    """A workspace with enough NEEDLE hits that ``search_text`` overflows the
+    small offload budget the two tests below use — shared setup, not a shared
+    assertion: each test still drives its OWN model call and its OWN registry."""
+    root = Path(tempfile.mkdtemp())
+    lines = [f"needle-line-{i:04d}: NEEDLE marker text here" for i in range(150)]
+    (root / "log.txt").write_text("\n".join(lines))
+    return root, "NEEDLE"
+
+
+def test_coding_tools_threads_session_env_into_delegate():
+    """``delegate_tool`` accepting ``session_env`` (Task 4) is necessary but not
+    sufficient — something has to actually PASS it, and that something is
+    ``_coding_tools`` (harness/agent.py), the one production caller the tool goes
+    through. Driven through a real ``Agent`` + its REAL registry, not the bare
+    factory called directly by hand (the way test_offload_strategy.py's
+    ``test_delegate_tool_forwards_session_env_...`` proves the factory itself) —
+    a regression that drops ``session_env=session_env`` from JUST the
+    ``delegate_tool(...)`` registration call, leaving ``fan_out_tool``'s and both
+    factories' own plumbing intact, would pass every other test in this suite.
+
+    Proven the same way the factory-level test proves it: the WORKER offloads its
+    own oversized result, then reads it back through its own registered
+    ``read_file``. Reviewer-caught gap: an earlier version of this test drove
+    "delegate" only but was named (and, more importantly, reasoned about in the
+    self-review) as if it covered "fan_out" too — it never called that tool, so a
+    regression dropping ONLY the ``fan_out_tool`` registration's ``session_env=``
+    left the whole suite, this test included, green. See the sibling test below
+    for that half, kept deliberately separate so each registration is
+    independently provable by mutating just its own line.
+    """
+    import re
+
+    from harness.harness_config import TruncationPolicy
+    from harness.limits import SCRATCH_SCHEME
+
+    root, query = _needle_workspace()
+
+    worker_calls = {"n": 0}
+    captured: dict = {}
+
+    def script(messages, **kwargs):
+        if any("focused worker" in str(m.get("content", "")) for m in messages):
+            worker_calls["n"] += 1
+            if worker_calls["n"] == 1:
+                return _tool_call("search_text", query=query)
+            if worker_calls["n"] == 2:
+                footer = str(messages[-1]["content"])
+                refs = set(
+                    re.findall(re.escape(SCRATCH_SCHEME) + r"offload/[0-9a-f]{16}\.txt", footer)
+                )
+                assert len(refs) == 1, f"footer should name exactly one file: {refs}"
+                return _tool_call("read_file", path=refs.pop())
+            # worker_calls["n"] == 3: the read_file readback is now the last message.
+            captured["readback"] = str(messages[-1]["content"])
+            return LLMResponse(content="worker done")
+        if not captured.get("delegated"):
+            captured["delegated"] = True
+            return _tool_call("delegate", task="search then read back")
+        return LLMResponse(content="parent done")
+
+    provider = _calls(script)
+    agent = Agent(provider=provider)
+    agent.tools = _coding_tools(
+        Workspace(root=root),
+        exclude_session=None,
+        provider=provider,  # the worker must run on THIS script, not the env default
+        session_env=agent.session_env,
+        tool_output=TruncationPolicy("offload_to_file", 300, 0.5),
+    )
+    agent.run("delegate: search then read back")
+
+    assert "readback" in captured, (
+        "setup: the scripted worker turn must have reached its final call"
+    )
+    readback = captured["readback"]
+    assert not readback.startswith("error:"), readback
+    assert "needle-line-0000: NEEDLE marker text here" in readback  # the file's head
+    assert "more than 100 hits; narrow it" in readback  # the file's tail
+
+
+def test_coding_tools_threads_session_env_into_fan_out():
+    """The ``fan_out_tool`` half of the test above — kept as a SEPARATE test
+    rather than folded into one parametrized case, specifically so that mutating
+    only the ``fan_out_tool(...)`` registration's ``session_env=`` in
+    ``_coding_tools`` (agent.py) fails ONLY this test, and mutating only
+    ``delegate_tool(...)``'s fails only the sibling above — a reviewer's own
+    reproduction showed the combined test could not tell the two apart, since it
+    only ever drove "delegate."
+
+    A single task in the list keeps ``ThreadPoolExecutor(max_workers=min(4, 1))``
+    effectively sequential — fan_out's OWN concurrency and order-preservation are
+    a different, already-covered concern (tests/episodes/test_ch11.py's
+    ``test_fan_out_preserves_order``); this is about the wiring, not the fan-out.
+    """
+    import re
+
+    from harness.harness_config import TruncationPolicy
+    from harness.limits import SCRATCH_SCHEME
+
+    root, query = _needle_workspace()
+
+    worker_calls = {"n": 0}
+    captured: dict = {}
+
+    def script(messages, **kwargs):
+        if any("focused worker" in str(m.get("content", "")) for m in messages):
+            worker_calls["n"] += 1
+            if worker_calls["n"] == 1:
+                return _tool_call("search_text", query=query)
+            if worker_calls["n"] == 2:
+                footer = str(messages[-1]["content"])
+                refs = set(
+                    re.findall(re.escape(SCRATCH_SCHEME) + r"offload/[0-9a-f]{16}\.txt", footer)
+                )
+                assert len(refs) == 1, f"footer should name exactly one file: {refs}"
+                return _tool_call("read_file", path=refs.pop())
+            captured["readback"] = str(messages[-1]["content"])
+            return LLMResponse(content="worker done")
+        if not captured.get("fanned_out"):
+            captured["fanned_out"] = True
+            return _tool_call("fan_out", tasks=["search then read back"])
+        return LLMResponse(content="parent done")
+
+    provider = _calls(script)
+    agent = Agent(provider=provider)
+    agent.tools = _coding_tools(
+        Workspace(root=root),
+        exclude_session=None,
+        provider=provider,
+        session_env=agent.session_env,
+        tool_output=TruncationPolicy("offload_to_file", 300, 0.5),
+    )
+    agent.run("fan out: search then read back")
+
+    assert "readback" in captured, (
+        "setup: the scripted worker turn must have reached its final call"
+    )
+    readback = captured["readback"]
+    assert not readback.startswith("error:"), readback
+    assert "needle-line-0000: NEEDLE marker text here" in readback
+    assert "more than 100 hits; narrow it" in readback
 
 
 def test_tui_builds_its_belt_from_the_shared_builder():
@@ -258,7 +413,6 @@ def test_read_only_workers_can_still_explore_the_repository():
     (root / "pkg" / "mod.py").write_text("def target():\n    return 1\n")
     (root / ".env").write_text("LLM_API_KEY=secret")
 
-    tools = _coding_tools(Workspace(root=root), exclude_session=None)
     worker_names: list[str] = []
 
     def script(messages, **kwargs):
@@ -269,7 +423,11 @@ def test_read_only_workers_can_still_explore_the_repository():
             return _tool_call("delegate", task="explore")
         return LLMResponse(content="done")
 
-    Agent(provider=_calls(script), tools=tools).run("go")
+    agent = Agent(provider=_calls(script))
+    agent.tools = _coding_tools(
+        Workspace(root=root), exclude_session=None, session_env=agent.session_env
+    )
+    agent.run("go")
 
     from harness.tools import list_files, search_text
 
