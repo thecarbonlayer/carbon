@@ -458,6 +458,103 @@ def test_summarizer_retries_inside_overflow_recovery_too():
     assert agent.retry_count == 2
 
 
+def test_transient_classifier_matches_status_codes_not_substrings():
+    """Status codes must match as standalone numbers, not substrings.
+
+    "requested 15020 tokens" contains "502", so substring matching classified a
+    context-overflow message as a transient gateway fault and spent the whole
+    retry budget on a payload that can never fit (2026-08-21 review probe). The
+    other side of the line must hold too: a genuine gateway fault still matches.
+    """
+    assert not Agent._transient_error(
+        RuntimeError("maximum context length exceeded: requested 15020 tokens")
+    )
+    assert not Agent._transient_error(RuntimeError("cache entry 4290 evicted"))
+    assert Agent._transient_error(RuntimeError("502 Bad Gateway"))
+    assert Agent._transient_error(RuntimeError("HTTP 429"))
+    assert Agent._transient_error(RuntimeError("status_code=503"))
+
+
+def test_summarizer_overflow_is_never_retried():
+    """The summarizer's payload is fixed when it is built, so an overflow there
+    will overflow again identically — it must raise immediately instead of
+    spending the retry budget, even when the message also carries a transient
+    marker. (The main loop is different: its payload is rebuilt from compacted
+    history, so overflow recovery can actually change what is re-sent.)"""
+    state = {"summary_calls": 0, "main_calls": 0}
+
+    def responder(messages, **kwargs):
+        if _summary_or_main(state, messages) == "summary_calls":
+            raise RuntimeError("maximum context length exceeded; temporarily unavailable")
+        return LLMResponse(content="UNREACHED")  # pragma: no cover - must never run
+
+    provider = Provider("fake://summarizer-overflow", "fake", responder=responder)
+    agent = Agent(provider=provider)
+    agent.messages = [{"role": "user", "content": f"old-{i}"} for i in range(10)]
+    with (
+        _pinned(
+            retry=RetryPolicy("backoff", 3, 0),
+            compaction=replace(CONFIG.compaction, trigger_fraction=0.001),
+        ),
+        patch("harness.agent.time.sleep"),
+        pytest.raises(RuntimeError, match="context length"),
+    ):
+        agent.run("continue")
+
+    assert state == {"summary_calls": 1, "main_calls": 0}
+    assert agent.retry_count == 0
+
+
+def test_genuine_gateway_fault_still_retries():
+    """Pin the other side of the word-boundary line end to end: a bare
+    "502 Bad Gateway" (no other transient marker in the text) still buys a
+    retry on the main path."""
+    state = {"calls": 0}
+
+    def responder(messages, **kwargs):
+        state["calls"] += 1
+        if state["calls"] == 1:
+            raise RuntimeError("502 Bad Gateway")
+        return LLMResponse(content="RECOVERED")
+
+    provider = Provider("fake://gateway", "fake", responder=responder)
+    with _pinned(retry=RetryPolicy("backoff", 3, 0)), patch("harness.agent.time.sleep"):
+        result = Agent(provider=provider).run("go")
+
+    assert result.text == "RECOVERED"
+    assert state["calls"] == 2
+
+
+def test_payload_construction_faults_escape_the_retry_loop():
+    """Building the request is not making it. A fault in the payload builder
+    (here: the AGENTS.md read raising) is a local defect, not a model fault —
+    it must escape immediately, never be retried as transient. The
+    pre-extraction loop kept ``_payload()`` before the ``try``, and the
+    extracted loop must draw exactly that boundary."""
+    responder_calls = {"n": 0}
+
+    def responder(messages, **kwargs):  # pragma: no cover - must never run
+        responder_calls["n"] += 1
+        return LLMResponse(content="UNREACHED")
+
+    provider = Provider("fake://payload-fault", "fake", responder=responder)
+    agent = Agent(provider=provider)
+    with (
+        _pinned(retry=RetryPolicy("backoff", 3, 0)),
+        patch("harness.agent.time.sleep"),
+        patch(
+            "harness.agent.load_agents_md",
+            side_effect=TimeoutError("timed out reading AGENTS.md"),
+        ) as loader,
+        pytest.raises(TimeoutError, match="AGENTS.md"),
+    ):
+        agent.run("go")
+
+    assert loader.call_count == 1  # raised straight out, not retried
+    assert responder_calls["n"] == 0
+    assert agent.retry_count == 0
+
+
 # --- regressions found reviewing the strategy surface -------------------------
 def test_edit_preserves_file_mode_and_leaves_no_temp_file(tmp_path):
     """The atomic rename must not strip an executable bit off a script."""
