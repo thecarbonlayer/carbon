@@ -463,6 +463,137 @@ def test_provider_from_env_defaults_reasoning_effort_to_none(monkeypatch, tmp_pa
     assert p.reasoning_effort is None
 
 
+def test_provider_pin_reaches_the_http_payload_as_a_routing_object(monkeypatch):
+    """OpenRouter's provider-routing control is a nested `provider` object —
+    `order` pins the serving provider, `allow_fallbacks: false` stops a silent
+    reroute when it is down, `quantizations` pins the serving precision.
+    Confirmed against OpenRouter's own docs, same as the reasoning control."""
+    captured: dict = {}
+
+    class _Resp:
+        def raise_for_status(self) -> None: ...
+
+        def json(self) -> dict:
+            return {
+                "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+                "usage": {},
+            }
+
+    def fake_post(url, json, headers, timeout):  # noqa: A002 — mirrors httpx.post kwarg
+        captured.update(json)
+        return _Resp()
+
+    monkeypatch.setattr(oc.httpx, "post", fake_post)
+    oc.complete_openai(
+        Provider("http://x/v1", "m", "k", provider_order="deepinfra", quantization="fp8"),
+        [{"role": "user", "content": "hi"}],
+    )
+    assert captured["provider"] == {
+        "order": ["deepinfra"],
+        "allow_fallbacks": False,
+        "quantizations": ["fp8"],
+    }
+
+
+def test_provider_pin_omitted_from_payload_when_not_set(monkeypatch):
+    """Unpinned is the local default: LM Studio and Ollama don't know the field,
+    and a request must be byte-identical to what an unpinned harness sends."""
+    captured: dict = {}
+
+    class _Resp:
+        def raise_for_status(self) -> None: ...
+
+        def json(self) -> dict:
+            return {
+                "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+                "usage": {},
+            }
+
+    def fake_post(url, json, headers, timeout):  # noqa: A002 — mirrors httpx.post kwarg
+        captured.update(json)
+        return _Resp()
+
+    monkeypatch.setattr(oc.httpx, "post", fake_post)
+    oc.complete_openai(Provider("http://x/v1", "m", "k"), [{"role": "user", "content": "hi"}])
+    assert "provider" not in captured
+
+
+def test_provider_order_alone_pins_without_a_quantizations_key(monkeypatch):
+    """Each pin maps to its own wire field. A half-set pin sends exactly what was
+    set — never a fabricated `quantizations` — and still disables fallbacks."""
+    captured: dict = {}
+
+    class _Resp:
+        def raise_for_status(self) -> None: ...
+
+        def json(self) -> dict:
+            return {
+                "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+                "usage": {},
+            }
+
+    def fake_post(url, json, headers, timeout):  # noqa: A002 — mirrors httpx.post kwarg
+        captured.update(json)
+        return _Resp()
+
+    monkeypatch.setattr(oc.httpx, "post", fake_post)
+    oc.complete_openai(
+        Provider("http://x/v1", "m", "k", provider_order="deepinfra"),
+        [{"role": "user", "content": "hi"}],
+    )
+    assert captured["provider"] == {"order": ["deepinfra"], "allow_fallbacks": False}
+
+
+def test_quantization_alone_filters_without_an_order_key(monkeypatch):
+    captured: dict = {}
+
+    class _Resp:
+        def raise_for_status(self) -> None: ...
+
+        def json(self) -> dict:
+            return {
+                "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+                "usage": {},
+            }
+
+    def fake_post(url, json, headers, timeout):  # noqa: A002 — mirrors httpx.post kwarg
+        captured.update(json)
+        return _Resp()
+
+    monkeypatch.setattr(oc.httpx, "post", fake_post)
+    oc.complete_openai(
+        Provider("http://x/v1", "m", "k", quantization="fp8"),
+        [{"role": "user", "content": "hi"}],
+    )
+    assert captured["provider"] == {"allow_fallbacks": False, "quantizations": ["fp8"]}
+
+
+def test_provider_from_env_reads_the_pin_vars(monkeypatch, tmp_path):
+    monkeypatch.setenv("LLM_BASE_URL", "http://x/v1")
+    monkeypatch.setenv("LLM_MODEL", "m")
+    monkeypatch.setenv("LLM_API_KEY", "k")
+    monkeypatch.setenv("LLM_PROVIDER_ORDER", "deepinfra")
+    monkeypatch.setenv("LLM_QUANTIZATION", "fp8")
+    from model.provider import Provider as ProviderCls
+
+    p = ProviderCls.from_env(root=tmp_path)
+    assert p.provider_order == "deepinfra"
+    assert p.quantization == "fp8"
+
+
+def test_provider_from_env_defaults_pin_to_none(monkeypatch, tmp_path):
+    monkeypatch.setenv("LLM_BASE_URL", "http://x/v1")
+    monkeypatch.setenv("LLM_MODEL", "m")
+    monkeypatch.setenv("LLM_API_KEY", "k")
+    monkeypatch.delenv("LLM_PROVIDER_ORDER", raising=False)
+    monkeypatch.delenv("LLM_QUANTIZATION", raising=False)
+    from model.provider import Provider as ProviderCls
+
+    p = ProviderCls.from_env(root=tmp_path)
+    assert p.provider_order is None
+    assert p.quantization is None
+
+
 # --- T1.7 curated façade ------------------------------------------------------
 def test_carbon_facade_exports_the_surface():
     import carbon
