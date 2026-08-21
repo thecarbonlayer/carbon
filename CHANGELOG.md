@@ -144,6 +144,16 @@ One entry per release; commits stay fine-grained under a `feat(surface)` or
   model is being measured, not of an individual call. Forwarded as
   OpenRouter's own wire format (`{"reasoning": {"effort": ...}}`) only when
   set; every other provider's requests are unaffected.
+- `LLM_PROVIDER_ORDER` / `LLM_QUANTIZATION`: pin the serving base behind a
+  multi-provider router (OpenRouter). `LLM_PROVIDER_ORDER` names exactly one
+  upstream provider, `LLM_QUANTIZATION` one serving precision. Provider-level,
+  like `LLM_REASONING_EFFORT` — which serving base answers is a property of
+  the model being measured, not of one request. Forwarded as OpenRouter's own
+  provider-routing object (`{"provider": {"order": [...], "allow_fallbacks":
+  false, "quantizations": [...]}}`), each field only when its pin is set, and
+  fallbacks disabled whenever any pin is — a pin that can silently reroute is
+  not a pin. Unset means nothing new is sent: local endpoints (LM Studio,
+  Ollama) see byte-identical requests.
 
 ### Changed
 
