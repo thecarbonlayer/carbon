@@ -367,6 +367,97 @@ def test_overflow_recovery_records_a_compaction_event_too():
     assert len(spans) == agent.compaction_count
 
 
+def _summary_or_main(state: dict, messages: list[dict]) -> str:
+    """Classify one fake-provider call and count it. The summarizer's system
+    prompt is the compaction prompt; the main loop's is the agent's."""
+    is_summary = bool(
+        messages
+        and messages[0].get("role") == "system"
+        and "context summarizer" in str(messages[0].get("content", ""))
+    )
+    kind = "summary_calls" if is_summary else "main_calls"
+    state[kind] += 1
+    return kind
+
+
+def test_summarizer_transient_failure_retries_like_any_other_model_call():
+    """The compaction summarizer is a model call like any other, so a transient
+    provider failure there is retried under the same policy — not allowed to
+    crash the turn.
+
+    It used to call ``chat()`` directly, bypassing the retry path — the one
+    unretried model call in a turn. Three of the six serving faults in the
+    2026-08 evaluation campaign hit exactly this call and crashed their
+    attempts outright while every other call site would have retried.
+    """
+    state = {"summary_calls": 0, "main_calls": 0}
+
+    def responder(messages, **kwargs):
+        if _summary_or_main(state, messages) == "summary_calls":
+            if state["summary_calls"] == 1:
+                raise RuntimeError("503 temporarily unavailable")
+            return LLMResponse(content="STRUCTURED CHECKPOINT")
+        return LLMResponse(content="DONE")
+
+    provider = Provider("fake://summarizer-retry", "fake", responder=responder)
+    agent = Agent(provider=provider)
+    agent.messages = [{"role": "user", "content": f"old-{i}"} for i in range(10)]
+    # trigger_fraction 0.001 opens the PRE-TURN door, so the summarizer under
+    # test runs from the steady-state site (`_maybe_compact`); the overflow
+    # -recovery site gets its own sibling test below — the two are wired
+    # separately, so one passing says nothing about the other.
+    with (
+        _pinned(
+            retry=RetryPolicy("backoff", 3, 0),
+            compaction=replace(CONFIG.compaction, trigger_fraction=0.001),
+        ),
+        patch("harness.agent.time.sleep"),
+    ):
+        result = agent.run("continue")
+
+    assert result.text == "DONE"
+    assert state == {"summary_calls": 2, "main_calls": 1}
+    assert agent.compaction_count == 1
+    assert agent.retry_count == 1
+
+
+def test_summarizer_retries_inside_overflow_recovery_too():
+    """Same contract at the second ``compact()`` call site
+    (``_compact_active_history``): a transient summarizer failure during
+    overflow recovery is retried rather than turning a recoverable overflow
+    into a crashed turn."""
+    state = {"summary_calls": 0, "main_calls": 0}
+
+    def responder(messages, **kwargs):
+        if _summary_or_main(state, messages) == "summary_calls":
+            if state["summary_calls"] == 1:
+                raise RuntimeError("503 temporarily unavailable")
+            return LLMResponse(content="STRUCTURED CHECKPOINT")
+        if state["main_calls"] == 1:
+            raise RuntimeError("maximum context length exceeded")
+        return LLMResponse(content="OVERFLOW-RECOVERED")
+
+    provider = Provider("fake://overflow-summarizer-retry", "fake", responder=responder)
+    agent = Agent(provider=provider)
+    agent.messages = [{"role": "user", "content": f"old-{i}"} for i in range(10)]
+    # Pin the pre-turn door shut (same reason as the overflow tests above): the
+    # only compaction in play must be the overflow-recovery one.
+    with (
+        _pinned(
+            retry=RetryPolicy("backoff", 3, 0),
+            compaction=replace(CONFIG.compaction, trigger_fraction=0.8),
+        ),
+        patch("harness.agent.time.sleep"),
+    ):
+        result = agent.run("continue")
+
+    assert result.text == "OVERFLOW-RECOVERED"
+    assert state == {"summary_calls": 2, "main_calls": 2}
+    assert agent.compaction_count == 1
+    # one summarizer retry, plus the overflow recovery itself
+    assert agent.retry_count == 2
+
+
 # --- regressions found reviewing the strategy surface -------------------------
 def test_edit_preserves_file_mode_and_leaves_no_temp_file(tmp_path):
     """The atomic rename must not strip an executable bit off a script."""

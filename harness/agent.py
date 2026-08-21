@@ -30,6 +30,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TypeVar
 
 from harness.compaction import CompactionFacts, compact, estimate_tokens
 from harness.context import deliver
@@ -50,6 +51,8 @@ from model import LLMResponse, OnDelta, Provider, chat
 DEFAULT_SYSTEM = CONFIG.system_prompt
 MAX_TOOL_STEPS = CONFIG.max_tool_steps
 DEFAULT_CONTEXT_LIMIT = CONFIG.default_context_limit  # ~tokens; compact above this
+
+_T = TypeVar("_T")  # what one retried model call returns (see Agent._retrying)
 APPROVAL_TOOLS = CONFIG.approval_tools  # tools the gate guards
 # a write/edit of one of these arms the test gate (a code change to verify)
 CODE_EXTENSIONS = CONFIG.code_extensions
@@ -307,7 +310,12 @@ class Agent:
             # unchanged; only this telemetry number moves.
             pre = estimate_tokens(self.messages)
             start = time.perf_counter()
-            managed, facts = compact(self.messages, model=self.model, provider=self.provider)
+            managed, facts = compact(
+                self.messages,
+                model=self.model,
+                provider=self.provider,
+                with_retry=self._summarizer_retry,
+            )
             seconds = time.perf_counter() - start
             if managed is self.messages:
                 return
@@ -804,7 +812,11 @@ class Agent:
         pre = estimate_tokens(prefix)
         start = time.perf_counter()
         managed, facts = compact(
-            prefix, model=self.model, provider=self.provider, recent_token_reserve=0
+            prefix,
+            model=self.model,
+            provider=self.provider,
+            recent_token_reserve=0,
+            with_retry=self._summarizer_retry,
         )
         seconds = time.perf_counter() - start
         compacted = managed is not prefix
@@ -871,36 +883,35 @@ class Agent:
                 shrank = True
         return shrank
 
-    def _model_call_with_recovery(
-        self, specs: list[dict] | None, on_delta: OnDelta | None
-    ) -> tuple[LLMResponse, list[dict], float]:
-        """Call the model with one forced overflow recovery and bounded retries."""
+    def _retrying(self, call: Callable[[], _T], *, recover_overflow: bool) -> _T:
+        """Run one model call under the retry policy — THE retry path.
+
+        Every model call a turn makes routes through here: the main loop's (via
+        ``_model_call_with_recovery``) and the compaction summarizer's (via
+        ``_summarizer_retry``). The summarizer used to call ``chat()`` directly,
+        which made it the one unretried model call in a turn — a transient
+        serving fault that any other call would have absorbed crashed the whole
+        turn there (2026-08-21: three of six serving faults in an evaluation
+        campaign hit exactly that call).
+
+        ``recover_overflow`` gates the one-shot compact-and-retry recovery.
+        Only the main loop's call can use it: its payload is rebuilt from
+        ``self.messages`` on every try, so compacting the history changes what
+        is re-sent. A summarizer call's payload is fixed when it is built —
+        compacting the agent's history cannot shrink it, and recovering there
+        would recurse into compaction from inside compaction.
+        """
         policy = CONFIG.retry
         attempt = 0
         overflow_recovered = False
         while True:
             attempt += 1
-            payload = self._payload()
-            t0 = time.perf_counter()
             try:
-                response = chat(
-                    payload,
-                    model=self.model,
-                    tools=specs,
-                    temperature=self.temperature,
-                    max_tokens=self.max_tokens,
-                    response_format=self.response_format,
-                    provider=self.provider,
-                    on_delta=on_delta,
-                )
-                # Count completed calls only. `turns` is evidence the improvement
-                # loop reads; a flaky endpoint must not read as a chattier agent.
-                # Recovery attempts are their own signal — see `retry_count`.
-                self._turn_model_calls += 1
-                return response, payload, t0
+                return call()
             except Exception as exc:
                 if (
-                    not overflow_recovered
+                    recover_overflow
+                    and not overflow_recovered
                     and self._context_overflow(exc)
                     and self._compact_active_history()
                 ):
@@ -918,6 +929,41 @@ class Agent:
                 self.retry_count += 1
                 if delay:
                     time.sleep(delay)
+
+    def _summarizer_retry(self, call: Callable[[], LLMResponse]) -> LLMResponse:
+        """The compaction summarizer's route through the retry policy — passed
+        to ``compact()`` as ``with_retry`` by both call sites, so the
+        summarizer's model call is retried like every other model call. No
+        overflow recovery on this route; ``_retrying`` says why."""
+        return self._retrying(call, recover_overflow=False)
+
+    def _model_call_with_recovery(
+        self, specs: list[dict] | None, on_delta: OnDelta | None
+    ) -> tuple[LLMResponse, list[dict], float]:
+        """Call the model with one forced overflow recovery and bounded retries."""
+
+        def attempt() -> tuple[LLMResponse, list[dict], float]:
+            # Rebuilt per try: overflow recovery compacts ``self.messages``, and
+            # the payload the retry sends must be the compacted one.
+            payload = self._payload()
+            t0 = time.perf_counter()
+            response = chat(
+                payload,
+                model=self.model,
+                tools=specs,
+                temperature=self.temperature,
+                max_tokens=self.max_tokens,
+                response_format=self.response_format,
+                provider=self.provider,
+                on_delta=on_delta,
+            )
+            # Count completed calls only. `turns` is evidence the improvement
+            # loop reads; a flaky endpoint must not read as a chattier agent.
+            # Recovery attempts are their own signal — see `retry_count`.
+            self._turn_model_calls += 1
+            return response, payload, t0
+
+        return self._retrying(attempt, recover_overflow=True)
 
 
 # --- non-interactive print mode ---------------------------------------------
