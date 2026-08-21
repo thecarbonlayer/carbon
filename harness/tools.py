@@ -17,10 +17,12 @@ session's own private scratch — never a workspace fallback).
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
+from harness.harness_config import ToolExposurePolicy
 from harness.limits import SCRATCH_SCHEME  # the prefix a resolvable offload ref carries
 
 
@@ -189,6 +191,57 @@ class ToolRegistry:
 
     def __len__(self) -> int:
         return len(self._tools)
+
+
+def _exposure_tokens(text: str) -> frozenset[str]:
+    """Lowercased word tokens for query_match's overlap score. A set, not a bag:
+    the score asks "how much of the ask's vocabulary does this tool speak", and a
+    description that repeats one matching word must not outrank one that matches
+    two different words once each."""
+    return frozenset(re.findall(r"[a-z0-9]+", text.lower()))
+
+
+def exposed_specs(
+    registry: ToolRegistry, policy: ToolExposurePolicy | None, query: str = ""
+) -> list[dict]:
+    """The tool specs offered to the model under one vetted exposure strategy.
+
+    Seam 3 of the strategy surface (Select): ``ToolRegistry.specs()`` decides what
+    COULD be offered; this decides what IS. ``all`` (or no policy) returns
+    ``registry.specs()`` through the same code path as ever — byte-identical, so
+    landing the seam changes nothing until an editor turns the knob.
+
+    ``allowlist`` offers the named subset in the ALLOWLIST's order (what the editor
+    lists is what is sent, in that order); names absent from the registry are
+    skipped, because the config file cannot know a consumer's registry at load
+    time. ``query_match`` ranks every tool by token overlap between ``query`` and
+    the tool's name + description, then offers the top ``k`` in rank order — a
+    stable sort, so zero-information ties fall back to registration order, and a
+    zero-score tool can still be offered when ``k`` exceeds the number of scoring
+    tools: the strategy ranks, it does not filter.
+
+    Deterministic by construction — same registry, policy, and query always
+    produce the same list — because an exposure decision a replay cannot
+    reproduce would put a serving confound inside every measurement.
+    """
+    if policy is None or policy.strategy == "all":
+        return registry.specs()
+    if policy.strategy == "allowlist":
+        by_name = {s["function"]["name"]: s for s in registry.specs()}
+        return [by_name[name] for name in policy.tools if name in by_name]
+    # query_match
+    query_tokens = _exposure_tokens(query)
+    specs = registry.specs()
+    scored = sorted(
+        specs,
+        key=lambda s: (
+            -len(
+                query_tokens
+                & _exposure_tokens(f"{s['function']['name']} {s['function']['description']}")
+            )
+        ),
+    )
+    return scored[: policy.k]
 
 
 def _matches_type(value: object, expected: str) -> bool:

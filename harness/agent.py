@@ -35,7 +35,7 @@ from typing import TypeVar
 
 from harness.compaction import CompactionFacts, compact, estimate_tokens
 from harness.context import deliver
-from harness.harness_config import CONFIG, RetryPolicy, TruncationPolicy
+from harness.harness_config import CONFIG, RetryPolicy, ToolExposurePolicy, TruncationPolicy
 from harness.instructions import load_agents_md, test_command
 from harness.limits import MAX_FOOTER_CHARS, recut, strategy_names, truncate_tool_result
 from harness.memory import DEFAULT_DIR, load_session, load_trace, save_session, save_trace
@@ -44,7 +44,7 @@ from harness.policy import Policy
 from harness.result import RunResult, ToolCall
 from harness.session_env import SessionEnvironment, local_session_env
 from harness.skills import Skill, skills_prompt
-from harness.tools import ToolRegistry
+from harness.tools import ToolRegistry, exposed_specs
 from model import LLMResponse, OnDelta, Provider, chat
 
 # Behavioral knobs live in the editable surface (harness/harness_config.json);
@@ -143,6 +143,7 @@ class Agent:
         response_format: dict | None = None,
         policy: Policy | None = None,
         tool_output: TruncationPolicy | None = None,
+        tool_exposure: ToolExposurePolicy | None = None,
     ) -> None:
         self.model = model
         self.provider = provider
@@ -237,6 +238,13 @@ class Agent:
                 f"(choose one of {sorted(strategy_names())})"
             )
         self.tool_output = tool_output
+        # Per-instance override of the tool-exposure policy (CONFIG.tool_exposure),
+        # the same seam shape as ``tool_output`` just above and for the same reason:
+        # None keeps the editable surface in charge; a code caller gets a kwarg
+        # instead of a config edit. ``ToolExposurePolicy`` validates itself at
+        # construction (menu membership, per-strategy params), so a bad value has
+        # already refused loudly before it reaches this line.
+        self.tool_exposure = tool_exposure
         self.skills = skills or []
         self._last_tokens = 0  # model-reported usage from the last call (ch-08)
         self.session = session
@@ -596,6 +604,39 @@ class Agent:
         """The active tool-result policy: the per-instance override, else the surface."""
         return self.tool_output if self.tool_output is not None else CONFIG.tool_output
 
+    def _tool_exposure_policy(self) -> ToolExposurePolicy:
+        """The active exposure policy: the per-instance override, else the surface."""
+        return self.tool_exposure if self.tool_exposure is not None else CONFIG.tool_exposure
+
+    def _exposure_query(self) -> str:
+        """What ``query_match`` ranks against: the most recent user message — the
+        turn's own text on the first ``_run``, the re-prompt on a verification
+        re-run. Deterministic either way, which is the property that matters: an
+        exposure decision a replay cannot reproduce would smuggle a confound into
+        every measurement."""
+        for m in reversed(self.messages):
+            if m.get("role") == "user":
+                return str(m.get("content", ""))
+        return ""
+
+    def _exposed_specs(self) -> list[dict] | None:
+        """The tool specs this turn offers the model (seam 3, Select).
+
+        Under ``all`` — the default when neither the config file nor the ctor set
+        anything — this IS ``self.tools.specs()``, the exact expression `_run` has
+        always evaluated, so the offered payload stays byte-identical until an
+        editor turns the knob. A non-``all`` strategy that selects nothing sends
+        no tools field at all (None), never an empty list a provider may reject."""
+        if not self.tools:
+            # Falsy, not just None — an EMPTY registry has always meant "no tools
+            # field" (`self.tools.specs() if self.tools else None`), and `all` must
+            # reproduce that exactly, not upgrade it to an empty list.
+            return None
+        policy = self._tool_exposure_policy()
+        if policy.strategy == "all":
+            return self.tools.specs()
+        return exposed_specs(self.tools, policy, query=self._exposure_query()) or None
+
     def _scratch_dir(self) -> Path:
         """Where offloaded tool results are written — the session's private scratch
         (harness/session_env.py), never the workspace: the repo is the user's durable
@@ -608,7 +649,7 @@ class Agent:
         Compaction happens once per turn in ``send`` (before the turn is appended),
         never here — so the verification gate's ``turn_start`` index stays valid even
         across the re-prompt runs ``_enforce_run`` drives."""
-        specs = self.tools.specs() if self.tools else None
+        specs = self._exposed_specs()
         tool_step_budget = (
             self.max_tool_steps if self.max_tool_steps is not None else MAX_TOOL_STEPS
         )
