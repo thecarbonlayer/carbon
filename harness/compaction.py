@@ -162,33 +162,34 @@ def _token_budget_cut(
     return j if j > 0 and messages[j].get("role") == "user" else i
 
 
-# --- prompt assembly, one per strategy family ---------------------------------------
+# --- prompt assembly ----------------------------------------------------------------
+#
+# The strategy-specific tail of the summarizer's instructions, as DATA on the
+# registry (each strategy's ``default_suffix``) rather than per-strategy assembly
+# code. That is what lets the editable surface reach the FULL instruction:
+# ``compaction.prompt_suffix`` (config) replaces the default when set, where
+# ``compaction_prompt`` alone could only ever rewrite the base. Unset keeps each
+# suffix byte-identical to what the assembly functions this replaced produced —
+# pinned literally by tests/test_compaction_prompt_seam.py.
+
+_STRUCTURED_SUFFIX = (
+    _CHECKPOINT_HEADINGS
+    + "Merge any earlier [summary of earlier conversation] into this checkpoint. "
+    + _PRESERVE_VERBATIM
+)
+_INCREMENTAL_SUFFIX = (
+    _CHECKPOINT_HEADINGS + "You are UPDATING an existing checkpoint, not writing a new one: carry "
+    "every still-true fact from it forward unchanged, revise what the new "
+    "messages have changed, and add what they introduced. Never drop a fact "
+    "merely because it is old. " + _PRESERVE_VERBATIM
+)
 
 
-def _plain_prompt(base: str) -> str:
-    return base
-
-
-def _structured_prompt(base: str) -> str:
-    return (
-        base
-        + "\n\n"
-        + _CHECKPOINT_HEADINGS
-        + "Merge any earlier [summary of earlier conversation] into this checkpoint. "
-        + _PRESERVE_VERBATIM
-    )
-
-
-def _incremental_prompt(base: str) -> str:
-    return (
-        base
-        + "\n\n"
-        + _CHECKPOINT_HEADINGS
-        + "You are UPDATING an existing checkpoint, not writing a new one: carry "
-        "every still-true fact from it forward unchanged, revise what the new "
-        "messages have changed, and add what they introduced. Never drop a fact "
-        "merely because it is old. " + _PRESERVE_VERBATIM
-    )
+def _assemble_prompt(base: str, suffix: str) -> str:
+    """The one place base and suffix meet. An empty suffix means the base alone —
+    no separator — which is both ``summarize_middle``'s default shape and the
+    config's way to strip a strategy's suffix entirely."""
+    return f"{base}\n\n{suffix}" if suffix else base
 
 
 # --- post-processing, one per strategy family ---------------------------------------
@@ -236,13 +237,16 @@ def _stateful_finalize(
 
 @dataclass(frozen=True)
 class _Strategy:
-    """One compaction strategy's four behaviors. ``compact()`` dispatches through
+    """One compaction strategy's behaviors. ``compact()`` dispatches through
     this record and never branches on a strategy name directly — adding a strategy
     means adding an entry here, not re-reading ``compact()`` for every place an
     old strategy name was checked."""
 
     cut: Callable[[list[dict], int, int, int], int]
-    prompt: Callable[[str], str]
+    # The text appended to the configurable base prompt (``compaction_prompt``),
+    # used only while ``compaction.prompt_suffix`` is unset — a configured suffix
+    # replaces it, whatever the strategy. "" = no suffix (the plain strategy).
+    default_suffix: str
     finalize: Callable[..., tuple[str, bool]]
     # Whether the previous checkpoint is pulled out of the transcript and passed to
     # the summarizer as its own message, carried forward verbatim when there is
@@ -257,13 +261,13 @@ class _Strategy:
 
 
 _STRATEGIES: dict[str, _Strategy] = {
-    "summarize_middle": _Strategy(_count_cut, _plain_prompt, _identity_finalize, incremental=False),
+    "summarize_middle": _Strategy(_count_cut, "", _identity_finalize, incremental=False),
     "structured_checkpoint": _Strategy(
-        _count_cut, _structured_prompt, _identity_finalize, incremental=False
+        _count_cut, _STRUCTURED_SUFFIX, _identity_finalize, incremental=False
     ),
     "token_budget_checkpoint": _Strategy(
         _token_budget_cut,
-        _incremental_prompt,
+        _INCREMENTAL_SUFFIX,
         _stateful_finalize,
         incremental=True,
         floor_needs_reserve=True,
@@ -398,7 +402,8 @@ def compact(
         else middle
     )
     transcript = "\n".join(_serialize_message(m) for m in summarizable)
-    prompt = strat.prompt(COMPACTION_PROMPT)
+    suffix = policy.prompt_suffix if policy.prompt_suffix is not None else strat.default_suffix
+    prompt = _assemble_prompt(COMPACTION_PROMPT, suffix)
 
     if not transcript.strip():
         # Nothing new to fold in — the middle held only the previous checkpoint, which

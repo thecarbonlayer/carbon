@@ -213,7 +213,14 @@ def test_previous_checkpoint_is_passed_as_its_own_message():
         {"role": "system", "content": "[summary of earlier conversation]\nPRIOR-FACT-1"},
         *_filler(8),
     ]
-    with patch.object(compaction, "chat", side_effect=_reply()):
+    # The update instruction asserted below is the strategy's DEFAULT suffix; pin
+    # that state rather than trusting the checked-in file, so a config that
+    # legitimately sets compaction.prompt_suffix cannot fail this test.
+    default_suffix = replace(CONFIG, compaction=replace(CONFIG.compaction, prompt_suffix=None))
+    with (
+        patch.object(compaction, "CONFIG", default_suffix),
+        patch.object(compaction, "chat", side_effect=_reply()),
+    ):
         compaction.compact(
             messages,
             keep_head=2,
