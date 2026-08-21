@@ -64,6 +64,17 @@ def complete_openai(
         payload["response_format"] = response_format
     if provider.reasoning_effort:
         payload["reasoning"] = {"effort": provider.reasoning_effort}
+    if provider.provider_order or provider.quantization:
+        # OpenRouter's provider-routing object. Only the pins that are set are
+        # sent (never a fabricated field), and any pin disables fallbacks — a
+        # pin that can silently reroute to another serving base is not a pin.
+        routing: dict = {}
+        if provider.provider_order:
+            routing["order"] = [provider.provider_order]
+        routing["allow_fallbacks"] = False
+        if provider.quantization:
+            routing["quantizations"] = [provider.quantization]
+        payload["provider"] = routing
 
     if on_delta is not None:
         return _stream_openai(base_url, api_key, payload, timeout, on_delta)
