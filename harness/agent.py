@@ -25,11 +25,13 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import sys
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TypeVar
 
 from harness.compaction import CompactionFacts, compact, estimate_tokens
 from harness.context import deliver
@@ -50,6 +52,15 @@ from model import LLMResponse, OnDelta, Provider, chat
 DEFAULT_SYSTEM = CONFIG.system_prompt
 MAX_TOOL_STEPS = CONFIG.max_tool_steps
 DEFAULT_CONTEXT_LIMIT = CONFIG.default_context_limit  # ~tokens; compact above this
+
+_T = TypeVar("_T")  # what one retried model call returns (see Agent._retrying)
+
+# Transient status codes matched as standalone numbers, never substrings:
+# "requested 15020 tokens" contains "502", and substring matching classified that
+# context-overflow message as a transient gateway fault — spending the whole
+# retry budget on a payload that can never fit (2026-08-21 review probe). A
+# genuine "502 Bad Gateway" still matches on its own word boundary.
+_TRANSIENT_STATUS = re.compile(r"\b(?:429|502|503|504)\b")
 APPROVAL_TOOLS = CONFIG.approval_tools  # tools the gate guards
 # a write/edit of one of these arms the test gate (a code change to verify)
 CODE_EXTENSIONS = CONFIG.code_extensions
@@ -307,7 +318,12 @@ class Agent:
             # unchanged; only this telemetry number moves.
             pre = estimate_tokens(self.messages)
             start = time.perf_counter()
-            managed, facts = compact(self.messages, model=self.model, provider=self.provider)
+            managed, facts = compact(
+                self.messages,
+                model=self.model,
+                provider=self.provider,
+                with_retry=self._summarizer_retry,
+            )
             seconds = time.perf_counter() - start
             if managed is self.messages:
                 return
@@ -758,21 +774,21 @@ class Agent:
     @staticmethod
     def _transient_error(exc: Exception) -> bool:
         text = str(exc).lower()
-        return any(
+        if any(
             marker in text
             for marker in (
-                "429",
                 "rate limit",
                 "timeout",
                 "timed out",
                 "temporarily unavailable",
                 "connection reset",
                 "connection refused",
-                "502",
-                "503",
-                "504",
             )
-        )
+        ):
+            return True
+        # Status codes go through the word-boundary pattern, not `in` — see
+        # _TRANSIENT_STATUS for the token-count false match this prevents.
+        return _TRANSIENT_STATUS.search(text) is not None
 
     def _compact_active_history(self) -> bool:
         """Reclaim window without disturbing turn-relative gate indices.
@@ -804,7 +820,11 @@ class Agent:
         pre = estimate_tokens(prefix)
         start = time.perf_counter()
         managed, facts = compact(
-            prefix, model=self.model, provider=self.provider, recent_token_reserve=0
+            prefix,
+            model=self.model,
+            provider=self.provider,
+            recent_token_reserve=0,
+            with_retry=self._summarizer_retry,
         )
         seconds = time.perf_counter() - start
         compacted = managed is not prefix
@@ -871,42 +891,60 @@ class Agent:
                 shrank = True
         return shrank
 
-    def _model_call_with_recovery(
-        self, specs: list[dict] | None, on_delta: OnDelta | None
-    ) -> tuple[LLMResponse, list[dict], float]:
-        """Call the model with one forced overflow recovery and bounded retries."""
+    def _retrying(
+        self,
+        call: Callable[[], _T],
+        *,
+        recover_overflow: bool,
+        prepare: Callable[[], None] | None = None,
+    ) -> _T:
+        """Run one model call under the retry policy — THE retry path.
+
+        Every model call a turn makes routes through here: the main loop's (via
+        ``_model_call_with_recovery``) and the compaction summarizer's (via
+        ``_summarizer_retry``). The summarizer used to call ``chat()`` directly,
+        which made it the one unretried model call in a turn — a transient
+        serving fault that any other call would have absorbed crashed the whole
+        turn there (2026-08-21: three of six serving faults in an evaluation
+        campaign hit exactly that call).
+
+        ``prepare`` runs before every try, OUTSIDE the guarded region — the
+        boundary the pre-extraction loop drew. Building the request is not
+        making it: a fault in the payload builder (a workspace read raising) is
+        a local defect, not a model fault, and must escape immediately rather
+        than be classified transient and retried.
+
+        ``recover_overflow`` gates the one-shot compact-and-retry recovery.
+        Only the main loop's call can use it: its payload is rebuilt from
+        ``self.messages`` on every try, so compacting the history changes what
+        is re-sent. A summarizer call's payload is fixed when it is built —
+        compacting the agent's history cannot shrink it, and recovering there
+        would recurse into compaction from inside compaction. On that
+        fixed-payload path an overflow-shaped error raises immediately, before
+        the transient classifier sees it: the identical payload would overflow
+        again, so any retry is spent for nothing.
+        """
         policy = CONFIG.retry
         attempt = 0
         overflow_recovered = False
         while True:
             attempt += 1
-            payload = self._payload()
-            t0 = time.perf_counter()
+            if prepare is not None:
+                prepare()
             try:
-                response = chat(
-                    payload,
-                    model=self.model,
-                    tools=specs,
-                    temperature=self.temperature,
-                    max_tokens=self.max_tokens,
-                    response_format=self.response_format,
-                    provider=self.provider,
-                    on_delta=on_delta,
-                )
-                # Count completed calls only. `turns` is evidence the improvement
-                # loop reads; a flaky endpoint must not read as a chattier agent.
-                # Recovery attempts are their own signal — see `retry_count`.
-                self._turn_model_calls += 1
-                return response, payload, t0
+                return call()
             except Exception as exc:
-                if (
-                    not overflow_recovered
-                    and self._context_overflow(exc)
-                    and self._compact_active_history()
-                ):
-                    overflow_recovered = True
-                    self.retry_count += 1
-                    continue
+                if self._context_overflow(exc):
+                    if (
+                        recover_overflow
+                        and not overflow_recovered
+                        and self._compact_active_history()
+                    ):
+                        overflow_recovered = True
+                        self.retry_count += 1
+                        continue
+                    if not recover_overflow:
+                        raise  # fixed payload: the same request overflows again
                 strat = _RETRY_STRATEGIES.get(policy.strategy)
                 delay = (
                     strat.next_delay(attempt, policy)
@@ -918,6 +956,49 @@ class Agent:
                 self.retry_count += 1
                 if delay:
                     time.sleep(delay)
+
+    def _summarizer_retry(self, call: Callable[[], LLMResponse]) -> LLMResponse:
+        """The compaction summarizer's route through the retry policy — passed
+        to ``compact()`` as ``with_retry`` by both call sites, so the
+        summarizer's model call is retried like every other model call. No
+        overflow recovery on this route; ``_retrying`` says why."""
+        return self._retrying(call, recover_overflow=False)
+
+    def _model_call_with_recovery(
+        self, specs: list[dict] | None, on_delta: OnDelta | None
+    ) -> tuple[LLMResponse, list[dict], float]:
+        """Call the model with one forced overflow recovery and bounded retries."""
+        payload: list[dict] = []
+        t0 = 0.0
+
+        def prepare() -> None:
+            # Rebuilt per try — overflow recovery compacts ``self.messages`` and
+            # the retry must send the compacted payload — but OUTSIDE the
+            # retried region (``_retrying``'s ``prepare`` contract), exactly
+            # where the pre-extraction loop built it: a fault here escapes
+            # instead of being retried as a transient model failure.
+            nonlocal payload, t0
+            payload = self._payload()
+            t0 = time.perf_counter()
+
+        def attempt() -> tuple[LLMResponse, list[dict], float]:
+            response = chat(
+                payload,
+                model=self.model,
+                tools=specs,
+                temperature=self.temperature,
+                max_tokens=self.max_tokens,
+                response_format=self.response_format,
+                provider=self.provider,
+                on_delta=on_delta,
+            )
+            # Count completed calls only. `turns` is evidence the improvement
+            # loop reads; a flaky endpoint must not read as a chattier agent.
+            # Recovery attempts are their own signal — see `retry_count`.
+            self._turn_model_calls += 1
+            return response, payload, t0
+
+        return self._retrying(attempt, recover_overflow=True, prepare=prepare)
 
 
 # --- non-interactive print mode ---------------------------------------------

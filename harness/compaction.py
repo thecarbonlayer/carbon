@@ -26,6 +26,15 @@ from model import LLMResponse, Provider, chat
 # re-export; the summarizer's instructions live in the editable surface
 COMPACTION_PROMPT = CONFIG.compaction_prompt
 
+# The caller's retry wrapper around the summarizer's one model call: it takes the
+# zero-argument call and runs it under the caller's retry policy. The Agent passes
+# its own (``Agent._summarizer_retry``) from both of its ``compact()`` call sites,
+# so the summarizer is retried exactly like every other model call in a turn —
+# it used to call ``chat()`` bare, and a transient serving fault here crashed the
+# turn that every other call site would have absorbed. ``None`` means call
+# directly, which keeps direct callers (tests) on the old single-try behavior.
+SummarizerRetry = Callable[[Callable[[], LLMResponse]], LLMResponse]
+
 # Every checkpoint note starts with this, which is how a later compaction finds the
 # previous one to update instead of re-summarizing raw history it has already seen.
 _NOTE_PREFIX = "[summary of earlier conversation"
@@ -325,6 +334,7 @@ def compact(
     recent_token_reserve: int | None = None,
     model: str | None = None,
     provider: Provider | None = None,
+    with_retry: SummarizerRetry | None = None,
 ) -> tuple[list[dict], CompactionFacts]:
     """Summarize the middle of ``messages`` into a single note; keep head + tail.
 
@@ -412,6 +422,7 @@ def compact(
             model=model,
             provider=provider,
             max_tokens=summary_max_tokens,
+            with_retry=with_retry,
         )
         summarizer_seconds = time.perf_counter() - summarize_start
         summary = summarize_resp.content
@@ -451,6 +462,7 @@ def _summarize(
     model: str | None,
     provider: Provider | None,
     max_tokens: int,
+    with_retry: SummarizerRetry | None = None,
 ) -> LLMResponse:
     """One summarizer call, with the previous checkpoint passed as its own message.
 
@@ -462,17 +474,24 @@ def _summarize(
     Returns the full ``LLMResponse`` rather than just ``.content`` — the caller needs
     ``.usage`` too, to feed ``Tracer.record_llm`` (Codex finding 1) so this call is
     measured like any other model call instead of discarded.
+
+    ``with_retry`` wraps the call itself, not ``chat`` — the ``chat`` name stays
+    resolved here at call time, so the module seam tests patch keeps working.
     """
     conversation = [{"role": "system", "content": prompt}]
     if prior:
         conversation.append({"role": "user", "content": f"Existing checkpoint to update:\n{prior}"})
     conversation.append({"role": "user", "content": f"New messages to fold in:\n{transcript}"})
-    return chat(
-        conversation,
-        model=model,
-        provider=provider,  # summarize through the same endpoint the turn uses
-        max_tokens=max_tokens,
-    )
+
+    def call() -> LLMResponse:
+        return chat(
+            conversation,
+            model=model,
+            provider=provider,  # summarize through the same endpoint the turn uses
+            max_tokens=max_tokens,
+        )
+
+    return call() if with_retry is None else with_retry(call)
 
 
 def _serialize_message(message: dict) -> str:
