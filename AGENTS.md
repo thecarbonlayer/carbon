@@ -15,10 +15,11 @@ chapter is its own commit, tagged, building cumulatively on the last.
 
 `self-improvement` is the integration base: the external evaluation suite
 (refinery) is built against it and pins it machine-readably on its side
-(`carbon-base.json`). carbon `main` + refinery `main` is NOT currently an
-operable pair. Promotion of `self-improvement` into `main` is prepared and
-human-gated; until it lands, anything refinery must see lands on
-`self-improvement`.
+(`carbon-base.json`). Anything refinery must see lands on `self-improvement`
+first. Promotion into `main` is periodic and human-gated. The 2026-08-22
+promotion landed, so `main` carries everything through that point and the two
+branches are an operable pair — but `main` falls behind again as new work lands
+on `self-improvement`, which is why refinery pins the branch rather than `main`.
 
 ## Working in this repo
 

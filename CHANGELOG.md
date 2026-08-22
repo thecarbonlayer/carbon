@@ -154,6 +154,32 @@ One entry per release; commits stay fine-grained under a `feat(surface)` or
   fallbacks disabled whenever any pin is — a pin that can silently reroute is
   not a pin. Unset means nothing new is sent: local endpoints (LM Studio,
   Ollama) see byte-identical requests.
+- `tool_exposure`: which tools the model is offered, as a strategy menu on the
+  editable surface (seam 3, "Select") — `all`, `allowlist`, `query_match`.
+  Optional and default-neutral: absent from the config file means `all`, which
+  returns `ToolRegistry.specs()` through the same code path as ever, so the
+  request is byte-identical and `config_version` does not move for this entry.
+  `ToolRegistry.specs()` decides what COULD be offered; `exposed_specs()`
+  (`harness/tools.py`) decides what IS. `allowlist` offers the named subset in
+  the allowlist's own order, skipping names the registry does not have, because
+  the config file cannot know a consumer's registry at load time.
+  `query_match` scores every tool by token overlap between the current user
+  turn and the tool's name plus description, then offers the top `k` (1..50) in
+  rank order — a stable sort, so a zero-information tie falls back to
+  registration order, and a zero-scoring tool is still offered when `k` exceeds
+  the number that scored: the strategy ranks, it does not filter. Tokens are a
+  set, not a bag, so a description repeating one matching word cannot outrank
+  one matching two different words once each. Deterministic by construction —
+  same registry, policy, and query give the same list — because an exposure
+  decision a replay cannot reproduce would put a serving confound inside every
+  measurement. Each parameter belongs to exactly one strategy, and one supplied
+  to a strategy that never reads it is **refused, not ignored**: the defaults
+  are an UNSET sentinel rather than `()` / `0`, so an explicit `k=0` is
+  distinguishable from an omitted `k` and cannot pass in silence, which is a
+  silently inert knob and exactly the file-on-disk/behavior-in-memory drift
+  this surface exists to prevent. `Agent(tool_exposure=...)` overrides per
+  instance (default `None` keeps the editable surface in charge), the same
+  experiment seam as `Agent(tool_output=...)`.
 - `compaction.prompt_suffix`: the strategy-specific tail of the summarizer's
   instructions — the checkpoint headings, the carry-forward update instruction,
   the preserve-verbatim line — exposed as an optional config knob, additive and
@@ -171,6 +197,22 @@ One entry per release; commits stay fine-grained under a `feat(surface)` or
 
 ### Changed
 
+- **The compaction summarizer's model call now routes through the retry path.**
+  It was the one unretried model call in a turn: the summarizer called `chat()`
+  directly, so a transient serving fault that any other call would have absorbed
+  crashed the whole turn there instead (2026-08-21: three of six serving faults
+  in an evaluation campaign hit exactly that call). `compact()` takes a
+  `with_retry` wrapper and `Agent` passes `_summarizer_retry` from both of its
+  call sites. The wrapper takes the zero-argument call rather than wrapping
+  `chat` itself, so the `chat` name stays patchable where tests already patch
+  it. Three boundaries hold on this route: an overflow-shaped error raises
+  immediately instead of being retried, because a summarizer's payload is fixed
+  once built — compacting the agent's history cannot shrink it, and recovering
+  there would recurse into compaction from inside compaction; the payload
+  builder runs outside the guarded region, so a local defect (a workspace read
+  raising) escapes at once rather than being classified transient; and transient
+  status codes match as standalone numbers through a word-boundary pattern, not
+  as substrings, so a token count containing `503` is not read as a 503.
 - **Renamed the project and package `gemma` → `carbon`.** The repo was named
   after the model it happened to drive, which blurred the one distinction the
   curriculum exists to teach: the harness is not the model. `import gemma`

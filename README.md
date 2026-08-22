@@ -33,7 +33,13 @@ cp .env.example .env          # point at your model endpoint (LM Studio / OpenRo
 
 The agent talks to any OpenAI-compatible endpoint via the `model/` package (the provider seam).
 Defaults target a local LM Studio server; set `LLM_BASE_URL` / `LLM_MODEL` / `LLM_API_KEY` to use
-anything else.
+anything else. Three further variables are optional, apply only behind a multi-provider router
+(OpenRouter), and send nothing at all when unset, so a local endpoint sees byte-identical requests:
+`LLM_REASONING_EFFORT` asks for a reasoning level from models that have one, and
+`LLM_PROVIDER_ORDER` / `LLM_QUANTIZATION` pin which upstream provider and which serving precision
+answer. Either pin also disables the router's fallbacks, because a pin that can silently reroute is
+not a pin. Set them for measurement runs, where an unpinned request can land on a different
+quantization from one call to the next.
 
 ```bash
 uv run agent                 # the interactive REPL (replies stream token by token)
@@ -110,12 +116,22 @@ teaches one primitive in its mature form. That spine does not grow.
 What grows is the surface around it. The harness now has external consumers that
 import it as a library to build their own domain-specific agents, and a
 self-improving loop that proposes edits to its own configuration. That surface is
-now a set of bounded Carbon-owned strategy menus, not merely scalar limits:
-file and tool-output retention, compaction shape and trigger, completion budget,
-and sampling policy. `carbon.surface_manifest()` publishes both the selectable
-menu and the explicit immutable invariants. The loop can pick vetted mechanisms;
-it cannot inject code, weaken verification, relax workspace boundaries, or make
-ambiguous edits legal.
+now a set of bounded Carbon-owned strategy menus, not merely scalar limits. Five
+fields carry a menu of vetted mechanisms: file injection and tool-output
+retention (`head_tail`, `keep_head`, plus `offload_to_file` for tool output),
+compaction shape (`structured_checkpoint`, `summarize_middle`,
+`token_budget_checkpoint`), retry (`backoff`, `fail_fast`), and tool exposure
+(`all`, `allowlist`, `query_match`). Around them sit the scalar and text knobs:
+step and context limits, verify attempts, sampling policy, and both prompts — the
+system prompt and the summarizer's instructions, the latter including the
+per-strategy `compaction.prompt_suffix`. Some keys are optional, and absent means
+today's behavior byte for byte, so a config file can leave them out and still
+report the same `config_version` that external baselines pin to.
+`carbon.surface_manifest()` publishes all three layers: the selectable menu, the
+fields that are locked rather than editable, and the explicit immutable
+invariants. The loop can pick vetted mechanisms; it cannot
+inject code, weaken verification, relax workspace boundaries, or make ambiguous
+edits legal.
 
 The tool belt grows the same deliberate way. `apply_patch` gives the same
 exact-match-or-refuse, atomic-write guarantee `edit_file` already gives for one
@@ -167,9 +183,17 @@ Each chapter is its own commit, tagged `ch-00` … `ch-14`. Check one out to see
 at that point in the build:
 
 ```bash
-git checkout ch-05     # the project at chapter 5 (Tools)
-git checkout main      # back to the latest
+git checkout ch-05             # the project at chapter 5 (Tools)
+git checkout main              # back to the promoted trunk
+git checkout self-improvement  # the integration base, where new work lands first
 ```
+
+Two branches, not one. `self-improvement` is the integration base: work that the
+external evaluation suite must see lands there first, and that suite pins the
+branch by name. Promotion into `main` is periodic and human-gated, so `main`
+carries everything through the last promotion and then trails until the next one.
+Read the code on `self-improvement` if you want what is current; the chapter tags
+are frozen either way. [AGENTS.md](AGENTS.md) has the full branch contract.
 
 ## Layout
 
