@@ -112,6 +112,21 @@ def test_default_offered_tools_payload_is_byte_identical_to_the_registry(tmp_pat
     assert json.dumps(offered[0]) == json.dumps(reg.specs())
 
 
+def test_default_empty_and_absent_registries_still_send_no_tools_field(tmp_path):
+    """The falsy end of neutrality, pinned separately from the byte-identity test
+    above: no registry — and an EMPTY registry — have always meant NO tools field
+    (``self.tools.specs() if self.tools else None``), never an empty list a
+    provider may reject. A plausible refactor (``is None`` where the code says
+    falsy) preserves the byte-identity pin and breaks exactly this."""
+    for reg in (None, ToolRegistry()):
+        agent, offered = _capturing_agent(tmp_path, reg)
+        try:
+            agent.send("hello")
+        finally:
+            agent.close()
+        assert offered == [None], f"registry {reg!r} produced a tools payload: {offered!r}"
+
+
 def test_all_strategy_returns_the_registry_specs_object_shape():
     reg = _registry()
     assert exposed_specs(reg, ToolExposurePolicy("all")) == reg.specs()
