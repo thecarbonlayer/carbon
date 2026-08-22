@@ -80,12 +80,13 @@ class TruncationPolicy:
 class CompactionPolicy:
     """When and how conversation history is compacted.
 
-    The last three fields are the ``token_budget_checkpoint`` surface and default to
-    values that reproduce the previous behavior exactly, so adding them is additive and
-    default-neutral: an existing config file omits them, gets these defaults, and
-    computes the same ``config_version``. That matters because an external improver
-    pins its recorded baselines to that version — a default that shifted behavior would
-    silently invalidate every one of them.
+    Every field with a default is additive and default-neutral: it defaults to a
+    value that reproduces the previous behavior exactly, so an existing config file
+    omits it, gets that default, and computes the same ``config_version``. That
+    matters because an external improver pins its recorded baselines to that
+    version — a default that shifted behavior would silently invalidate every one
+    of them. The three reserve/fallback fields are the ``token_budget_checkpoint``
+    surface; ``prompt_suffix`` applies to every strategy.
     """
 
     strategy: str
@@ -99,6 +100,11 @@ class CompactionPolicy:
     completion_reserve: int = 0
     # Bounded door for a checkpoint that outgrows ``summary_max_tokens``.
     checkpoint_fallback: str = "head_tail"
+    # The strategy-specific tail appended to ``compaction_prompt`` (the headings and
+    # update instruction, compaction.py). None = the strategy's built-in suffix,
+    # byte-identical prompts; a string replaces that suffix; "" strips it, leaving
+    # the base prompt alone.
+    prompt_suffix: str | None = None
 
 
 @dataclass(frozen=True)
@@ -329,10 +335,11 @@ _TOOL_OUTPUT_STRATEGIES = _TRUNCATION_STRATEGIES | {"offload_to_file"}
 _COMPACTION_STRATEGIES = frozenset(
     {"summarize_middle", "structured_checkpoint", "token_budget_checkpoint"}
 )
-# Additive `token_budget_checkpoint` knobs. Optional so an existing config file stays
+# Additive compaction knobs: the three `token_budget_checkpoint` fields, plus the
+# strategy-agnostic prompt suffix. Optional so an existing config file stays
 # valid and its ``config_version`` — which external baselines pin to — does not move.
 _COMPACTION_OPTIONAL = frozenset(
-    {"recent_token_reserve", "completion_reserve", "checkpoint_fallback"}
+    {"recent_token_reserve", "completion_reserve", "checkpoint_fallback", "prompt_suffix"}
 )
 # Bounds for the two reserve knobs above — not part of `_INT_BOUNDS` because that table
 # is keyed by top-level `_SCHEMA` field names and retry's nested fields; these two live
@@ -541,6 +548,13 @@ def _compaction_policy(value: dict) -> CompactionPolicy:
             f"harness config: field {name!r}.checkpoint_fallback must be one of "
             f"{sorted(_TRUNCATION_STRATEGIES)}, got {_short(fallback)}"
         )
+    # None — absent or an explicit null, the temperature precedent — means "use the
+    # strategy's built-in suffix"; only a real string may replace it.
+    suffix = value.get("prompt_suffix")
+    if suffix is not None and not isinstance(suffix, str):
+        raise ValueError(
+            f"harness config: field {name!r}.prompt_suffix must be a string, got {_short(suffix)}"
+        )
     fraction = value["trigger_fraction"]
     if (
         # Both ends EXCLUSIVE. At exactly 1 the pre-turn door fires only once the window
@@ -567,6 +581,7 @@ def _compaction_policy(value: dict) -> CompactionPolicy:
         value.get("recent_token_reserve", 0),
         value.get("completion_reserve", 0),
         fallback,
+        suffix,
     )
 
 
@@ -681,6 +696,7 @@ def config_schema() -> list[dict]:
                 "recent_token_reserve": {"type": "int", "min": reserve_min, "max": reserve_max},
                 "completion_reserve": {"type": "int", "min": reserve_min, "max": reserve_max},
                 "checkpoint_fallback": {"type": "str", "enum": sorted(_TRUNCATION_STRATEGIES)},
+                "prompt_suffix": {"type": "str"},
             }
         elif name == "retry":
             item["strategies"] = sorted(_RETRY_STRATEGIES)
