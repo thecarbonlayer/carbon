@@ -229,6 +229,42 @@ def test_compaction_optional_keys_published_with_contract_bounds():
     }
 
 
+def test_absent_prompt_suffix_loads_as_none(tmp_path):
+    """No ``compaction.prompt_suffix`` key means None — the strategies' built-in
+    suffixes stay in charge, which is the default-neutrality the seam promises."""
+    raw = _valid_raw()
+    raw["compaction"].pop("prompt_suffix", None)
+    assert load_config(_write(tmp_path, raw)).compaction.prompt_suffix is None
+
+
+def test_null_prompt_suffix_loads_as_none(tmp_path):
+    """Explicit null is the temperature precedent: 'use the built-in default',
+    for an editor that keeps the key while reverting the value."""
+    raw = _valid_raw()
+    raw["compaction"]["prompt_suffix"] = None
+    assert load_config(_write(tmp_path, raw)).compaction.prompt_suffix is None
+
+
+def test_string_prompt_suffix_loads_verbatim(tmp_path):
+    raw = _valid_raw()
+    raw["compaction"]["prompt_suffix"] = "CARRY THE OLDEST FACTS FIRST."
+    loaded = load_config(_write(tmp_path, raw))
+    assert loaded.compaction.prompt_suffix == "CARRY THE OLDEST FACTS FIRST."
+
+
+def test_non_string_prompt_suffix_is_rejected_naming_the_field(tmp_path):
+    for bad in (7, True, ["text"]):
+        raw = _valid_raw()
+        raw["compaction"]["prompt_suffix"] = bad
+        with pytest.raises(ValueError, match=r"prompt_suffix.* must be a string"):
+            load_config(_write(tmp_path, raw))
+
+
+def test_prompt_suffix_is_published_on_the_compaction_parameters():
+    params = {f["name"]: f for f in config_schema()}["compaction"]["parameters"]
+    assert params["prompt_suffix"] == {"type": "str"}
+
+
 def test_every_int_bounds_field_publishes_what_the_loader_enforces(tmp_path):
     """``_INT_BOUNDS`` is the single source for both the loader and the published
     schema — read both sides from that same table rather than pinning numbers here,

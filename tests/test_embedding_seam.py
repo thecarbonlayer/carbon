@@ -306,6 +306,7 @@ def test_config_schema_describes_the_surface():
         "attach_pattern",
         "temperature",
         "max_tokens",
+        "tool_exposure",
     }
     assert by["approval_tools"]["collection"] and by["approval_tools"]["type"] == "list[str]"
     assert by["max_tool_steps"]["positive_int"] and by["max_tool_steps"]["type"] == "int"

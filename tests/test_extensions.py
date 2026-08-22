@@ -153,6 +153,7 @@ def test_surface_manifest_has_no_extension_field():
         "attach_pattern",
         "temperature",
         "max_tokens",
+        "tool_exposure",  # seam 3 (Select): deliberate addition, not extension-related
     }
 
 
