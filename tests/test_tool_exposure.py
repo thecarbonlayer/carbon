@@ -279,6 +279,35 @@ def test_policy_rejects_params_that_belong_to_another_strategy():
         ToolExposurePolicy("query_match", k=3, tools=("calculator",))
 
 
+def test_policy_refuses_a_supplied_cross_strategy_param_at_ANY_value():
+    """The refusal is about SUPPLY, not truthiness.
+
+    The first version tested ``elif self.k:`` / ``elif self.tools:`` against
+    defaults of ``0`` and ``()``, so every FALSY forbidden value passed silently —
+    ``ToolExposurePolicy("all", k=0)`` was accepted while ``k=3`` was refused. An
+    editor who writes a param the strategy never reads deserves the same loud
+    refusal whatever value they wrote; a falsy one is not more harmless, it is
+    just quieter."""
+    with pytest.raises(ValueError, match="k"):
+        ToolExposurePolicy("all", k=0)
+    with pytest.raises(ValueError, match="tools"):
+        ToolExposurePolicy("all", tools=())
+    with pytest.raises(ValueError, match="k"):
+        ToolExposurePolicy("allowlist", tools=("calculator",), k=0)
+    with pytest.raises(ValueError, match="tools"):
+        ToolExposurePolicy("query_match", k=3, tools=())
+
+
+def test_policy_omitted_params_still_default_silently():
+    """The other half of the distinction, and the reason this cannot be fixed by
+    refusing every non-default value: a param NOT supplied is not an error. Each
+    strategy's own params stay optional-with-default for the strategies that read
+    them, and ``all`` stays constructible with nothing at all."""
+    assert ToolExposurePolicy("all") == ToolExposurePolicy(strategy="all")
+    ToolExposurePolicy("allowlist", tools=("calculator",))
+    ToolExposurePolicy("query_match", k=3)
+
+
 # --- validation at the door (the config file) ---------------------------------
 
 
@@ -349,6 +378,35 @@ def test_file_cross_strategy_params_are_rejected(tmp_path):
         raw["tool_exposure"] = value
         with pytest.raises(ValueError):
             load_config(_write(tmp_path, raw))
+
+
+def test_file_refuses_a_supplied_cross_strategy_param_at_ANY_value(tmp_path):
+    """The same supplied-vs-omitted rule at the FILE door, which is where it was
+    hardest to see: the loader read ``value.get("k")`` and passed ``0`` for a key
+    that was absent AND for one explicitly written as ``0`` or ``null``, so the
+    policy could not tell them apart and the falsy ones were accepted. A key
+    PRESENT in the object is supplied, whatever it holds."""
+    for value in (
+        {"strategy": "all", "k": 0},
+        {"strategy": "all", "k": None},
+        {"strategy": "all", "tools": []},
+        {"strategy": "all", "tools": None},
+        {"strategy": "allowlist", "tools": ["bash"], "k": 0},
+        {"strategy": "query_match", "k": 3, "tools": []},
+    ):
+        raw = _valid_raw()
+        raw["tool_exposure"] = value
+        with pytest.raises(ValueError):
+            load_config(_write(tmp_path, raw))
+
+
+def test_file_omitted_params_still_default_silently(tmp_path):
+    """A strategy's own params stay OPTIONAL in the file: omitting ``k`` under
+    ``all`` is the normal case, not an error, and the absent-field default is
+    still exactly ``all``."""
+    raw = _valid_raw()
+    raw["tool_exposure"] = {"strategy": "all"}
+    assert load_config(_write(tmp_path, raw)).tool_exposure == ToolExposurePolicy("all")
 
 
 # --- the published surface ----------------------------------------------------

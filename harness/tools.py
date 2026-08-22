@@ -228,7 +228,7 @@ def exposed_specs(
         return registry.specs()
     if policy.strategy == "allowlist":
         by_name = {s["function"]["name"]: s for s in registry.specs()}
-        return [by_name[name] for name in policy.tools if name in by_name]
+        return [by_name[name] for name in policy.allowlist if name in by_name]
     # query_match
     query_tokens = _exposure_tokens(query)
     specs = registry.specs()
@@ -241,7 +241,7 @@ def exposed_specs(
             )
         ),
     )
-    return scored[: policy.k]
+    return scored[: policy.top_k]
 
 
 def _matches_type(value: object, expected: str) -> bool:

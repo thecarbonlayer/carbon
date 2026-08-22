@@ -121,6 +121,30 @@ _TOOL_EXPOSURE_STRATEGIES = frozenset({"all", "allowlist", "query_match"})
 _TOOL_EXPOSURE_K_BOUNDS: tuple[int, int] = (1, 50)
 
 
+class _Unset:
+    """The 'this param was never supplied' sentinel for per-strategy params.
+
+    A plain default (``0``, ``()``, or ``None``) cannot carry this distinction,
+    and the distinction is the whole cross-strategy rule: a param the chosen
+    strategy never reads must be refused BECAUSE IT WAS WRITTEN, at any value,
+    while one that was simply omitted defaults in silence. With ``k: int = 0``
+    the refusal read ``elif self.k:`` and every falsy forbidden value — an
+    explicit ``0``, an explicit ``[]``, an explicit ``null`` — passed as though
+    it had never been written.
+
+    A distinct object, not ``None``: ``null`` is a value a JSON author can
+    actually write, so it has to stay tellable from an absent key.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # keeps error messages and dataclass reprs readable
+        return "<unset>"
+
+
+UNSET = _Unset()
+
+
 @dataclass(frozen=True)
 class ToolExposurePolicy:
     """Which registered tools are offered to the model each turn (seam 3, Select).
@@ -137,9 +161,14 @@ class ToolExposurePolicy:
     *code* (the ``Agent(tool_exposure=...)`` seam) never passes ``load_config``'s
     door, so the type carries its own."""
 
+    # Defaults are the UNSET sentinel, not `()` / `0`: the cross-strategy rule
+    # below refuses a param that was SUPPLIED to a strategy that never reads it,
+    # and "supplied" is exactly "not the sentinel". A falsy default would make an
+    # explicit `k=0` indistinguishable from an omitted `k`, which is how every
+    # falsy forbidden value used to pass in silence.
     strategy: str = "all"
-    tools: tuple[str, ...] = ()  # allowlist only: the fixed subset, in this order
-    k: int = 0  # query_match only: how many ranked tools to offer
+    tools: tuple[str, ...] | _Unset = UNSET  # allowlist only: the subset, in this order
+    k: int | _Unset = UNSET  # query_match only: how many ranked tools to offer
 
     def __post_init__(self) -> None:
         if self.strategy not in _TOOL_EXPOSURE_STRATEGIES:
@@ -148,29 +177,63 @@ class ToolExposurePolicy:
                 f"{sorted(_TOOL_EXPOSURE_STRATEGIES)}, got {self.strategy!r}"
             )
         if self.strategy == "allowlist":
-            if not self.tools or not all(isinstance(t, str) and t for t in self.tools):
+            tools = self.tools
+            if (
+                isinstance(tools, _Unset)
+                or not tools
+                or not all(isinstance(t, str) and t for t in tools)
+            ):
                 raise ValueError(
                     "tool_exposure 'allowlist' requires tools: a non-empty tuple of tool names"
                 )
-            if len(set(self.tools)) != len(self.tools):
+            if len(set(tools)) != len(tools):
                 raise ValueError("tool_exposure 'allowlist' tools must not contain duplicates")
-        elif self.tools:
+        elif self.tools is not UNSET:
+            # SUPPLIED, not truthy: `tools=()` and `tools=None` are refused here
+            # too, because writing a param this strategy never reads is the drift
+            # whatever the value was.
             raise ValueError(
                 f"tool_exposure 'tools' belongs to the 'allowlist' strategy only, "
-                f"not {self.strategy!r}"
+                f"not {self.strategy!r} (remove it; supplied {self.tools!r})"
             )
         low, high = _TOOL_EXPOSURE_K_BOUNDS
         if self.strategy == "query_match":
-            if isinstance(self.k, bool) or not isinstance(self.k, int) or not low <= self.k <= high:
+            if (
+                self.k is UNSET
+                or isinstance(self.k, bool)
+                or not isinstance(self.k, int)
+                or not low <= self.k <= high
+            ):
                 raise ValueError(
                     f"tool_exposure 'query_match' requires k: an integer from {low} to {high}, "
                     f"got {self.k!r}"
                 )
-        elif self.k:
+        elif self.k is not UNSET:
             raise ValueError(
                 f"tool_exposure 'k' belongs to the 'query_match' strategy only, "
-                f"not {self.strategy!r}"
+                f"not {self.strategy!r} (remove it; supplied {self.k!r})"
             )
+
+    # The two accessors below state the invariant `__post_init__` just proved, in
+    # ONE place, so consumers read a concrete type instead of the sentinel union
+    # and no call site has to re-argue why the param must be set. They raise
+    # rather than substitute a default: an unset value reaching them would mean
+    # the door above was bypassed, which is a defect to surface, not to paper
+    # over with an empty allowlist that silently offers nothing.
+
+    @property
+    def allowlist(self) -> tuple[str, ...]:
+        """The allowlist, for the ``allowlist`` strategy that requires it."""
+        if isinstance(self.tools, _Unset):
+            raise ValueError(f"tool_exposure 'tools' is unset under strategy {self.strategy!r}")
+        return self.tools
+
+    @property
+    def top_k(self) -> int:
+        """How many ranked tools to offer, for the ``query_match`` strategy."""
+        if isinstance(self.k, _Unset):
+            raise ValueError(f"tool_exposure 'k' is unset under strategy {self.strategy!r}")
+        return self.k
 
 
 @dataclass(frozen=True)
@@ -538,23 +601,34 @@ def _tool_exposure_policy(value: dict) -> ToolExposurePolicy:
             f"harness config: field {name!r} strategy must be one of "
             f"{sorted(_TOOL_EXPOSURE_STRATEGIES)}, got {_short(strategy)}"
         )
-    tools = value.get("tools")
-    if tools is not None and (
-        not isinstance(tools, list) or not all(isinstance(t, str) and t for t in tools)
-    ):
-        raise ValueError(
-            f"harness config: field {name!r}.tools must be a list of non-empty strings"
-        )
-    k = value.get("k")
-    if k is not None and (isinstance(k, bool) or not isinstance(k, int)):
-        low, high = _TOOL_EXPOSURE_K_BOUNDS
-        raise ValueError(_bound_message(f"{name!r}.k", k, low, high))
+    # PRESENCE, not value: a key written in the object is supplied even when it
+    # holds `null`, `[]`, or `0`. `value.get(key)` collapsed all three into the
+    # same thing an absent key produced, which is what let a cross-strategy param
+    # through whenever its value happened to be falsy. The sentinel travels into
+    # the policy so ONE rule — the policy's — decides supplied-vs-omitted at both
+    # doors, rather than each door carrying its own copy of it.
+    tools = value.get("tools", UNSET)
+    k = value.get("k", UNSET)
+    # Shape checks run only for the strategy that OWNS the param. For any other
+    # strategy the param is forbidden outright, and the policy says so precisely
+    # ("belongs to the 'allowlist' strategy only") instead of this door
+    # complaining about the type of a param that should not be here at all.
+    if strategy == "allowlist" and tools is not UNSET:
+        if not isinstance(tools, list) or not all(isinstance(t, str) and t for t in tools):
+            raise ValueError(
+                f"harness config: field {name!r}.tools must be a list of non-empty strings"
+            )
+    if strategy == "query_match" and k is not UNSET:
+        if isinstance(k, bool) or not isinstance(k, int):
+            low, high = _TOOL_EXPOSURE_K_BOUNDS
+            raise ValueError(_bound_message(f"{name!r}.k", k, low, high))
     # Per-strategy required/forbidden params are the policy's own rules — build it
     # and let ``__post_init__`` refuse, prefixing the file-door context.
     try:
-        return ToolExposurePolicy(
-            strategy, tuple(tools) if tools is not None else (), k if k is not None else 0
-        )
+        # `tuple(...)` only for a real list — a supplied non-list (`null`, a
+        # string, a number) travels through AS WRITTEN so the policy refuses the
+        # thing the author actually put in the file.
+        return ToolExposurePolicy(strategy, tuple(tools) if isinstance(tools, list) else tools, k)
     except ValueError as exc:
         raise ValueError(f"harness config: field {name!r}: {exc}") from exc
 
