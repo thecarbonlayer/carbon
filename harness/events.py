@@ -35,6 +35,7 @@ EXECUTE_TOOL = "execute_tool"
 INVOKE_AGENT = "invoke_agent"
 PLAN = "plan"
 CREATE_AGENT = "create_agent"
+COMPACT = "compact"  # NOTE: ours — OTel GenAI has no compaction operation
 
 # --- span kinds ---------------------------------------------------------------
 CLIENT = "client"
@@ -67,6 +68,16 @@ SYSTEM_INSTRUCTIONS = "gen_ai.system_instructions"
 INPUT_MESSAGES = "gen_ai.input.messages"
 OUTPUT_MESSAGES = "gen_ai.output.messages"
 TOOL_DEFINITIONS = "gen_ai.tool.definitions"
+
+# --- carbon.compaction.* — OUR custom extension (Phase 1 §3, no OTel equivalent) ---
+COMPACTION_STRATEGY = "carbon.compaction.strategy"
+COMPACTION_PRE_TOKENS = "carbon.compaction.pre_tokens"
+COMPACTION_POST_TOKENS = "carbon.compaction.post_tokens"
+COMPACTION_SUMMARY_CHARS = "carbon.compaction.summary_chars"
+COMPACTION_MIDDLE_COUNT = "carbon.compaction.middle_count"
+COMPACTION_FILES_READ = "carbon.compaction.files_read"
+COMPACTION_FILES_MODIFIED = "carbon.compaction.files_modified"
+COMPACTION_TRUNCATED = "carbon.compaction.truncated"
 
 
 @dataclass

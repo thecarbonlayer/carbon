@@ -80,12 +80,13 @@ class TruncationPolicy:
 class CompactionPolicy:
     """When and how conversation history is compacted.
 
-    The last three fields are the ``token_budget_checkpoint`` surface and default to
-    values that reproduce the previous behavior exactly, so adding them is additive and
-    default-neutral: an existing config file omits them, gets these defaults, and
-    computes the same ``config_version``. That matters because an external improver
-    pins its recorded baselines to that version — a default that shifted behavior would
-    silently invalidate every one of them.
+    Every field with a default is additive and default-neutral: it defaults to a
+    value that reproduces the previous behavior exactly, so an existing config file
+    omits it, gets that default, and computes the same ``config_version``. That
+    matters because an external improver pins its recorded baselines to that
+    version — a default that shifted behavior would silently invalidate every one
+    of them. The three reserve/fallback fields are the ``token_budget_checkpoint``
+    surface; ``prompt_suffix`` applies to every strategy.
     """
 
     strategy: str
@@ -99,6 +100,11 @@ class CompactionPolicy:
     completion_reserve: int = 0
     # Bounded door for a checkpoint that outgrows ``summary_max_tokens``.
     checkpoint_fallback: str = "head_tail"
+    # The strategy-specific tail appended to ``compaction_prompt`` (the headings and
+    # update instruction, compaction.py). None = the strategy's built-in suffix,
+    # byte-identical prompts; a string replaces that suffix; "" strips it, leaving
+    # the base prompt alone.
+    prompt_suffix: str | None = None
 
 
 @dataclass(frozen=True)
@@ -108,6 +114,132 @@ class RetryPolicy:
     strategy: str
     max_attempts: int
     base_delay_ms: int
+
+
+# Tool exposure (seam 3, Select): which registered tools are offered per turn.
+# ``phase_gated`` (different sets while planning vs executing) stays a roadmap
+# entry — it waits for the orchestrator seam and must not enter the menu early.
+# Defined ABOVE the policy class, unlike the other strategy sets, because
+# ``HarnessConfig``'s default field instantiates a policy at class-definition
+# time and ``__post_init__`` reads these then.
+_TOOL_EXPOSURE_STRATEGIES = frozenset({"all", "allowlist", "query_match"})
+# Bounds for query_match's k, published in config_schema() from this same pair.
+_TOOL_EXPOSURE_K_BOUNDS: tuple[int, int] = (1, 50)
+
+
+class _Unset:
+    """The 'this param was never supplied' sentinel for per-strategy params.
+
+    A plain default (``0``, ``()``, or ``None``) cannot carry this distinction,
+    and the distinction is the whole cross-strategy rule: a param the chosen
+    strategy never reads must be refused BECAUSE IT WAS WRITTEN, at any value,
+    while one that was simply omitted defaults in silence. With ``k: int = 0``
+    the refusal read ``elif self.k:`` and every falsy forbidden value — an
+    explicit ``0``, an explicit ``[]``, an explicit ``null`` — passed as though
+    it had never been written.
+
+    A distinct object, not ``None``: ``null`` is a value a JSON author can
+    actually write, so it has to stay tellable from an absent key.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # keeps error messages and dataclass reprs readable
+        return "<unset>"
+
+
+UNSET = _Unset()
+
+
+@dataclass(frozen=True)
+class ToolExposurePolicy:
+    """Which registered tools are offered to the model each turn (seam 3, Select).
+
+    ``all`` reproduces today's behavior byte for byte: every registered tool, in
+    registration order. ``allowlist`` offers a fixed subset in the allowlist's own
+    order. ``query_match`` ranks tools against the current user turn by token
+    overlap and offers the top ``k``. Params belong to exactly one strategy each,
+    and a param the chosen strategy never reads is refused rather than ignored: a
+    silently inert knob is the file-on-disk/behavior-in-memory drift this surface
+    exists to prevent.
+
+    Validates in ``__post_init__`` like ``TruncationPolicy``: a policy built in
+    *code* (the ``Agent(tool_exposure=...)`` seam) never passes ``load_config``'s
+    door, so the type carries its own."""
+
+    # Defaults are the UNSET sentinel, not `()` / `0`: the cross-strategy rule
+    # below refuses a param that was SUPPLIED to a strategy that never reads it,
+    # and "supplied" is exactly "not the sentinel". A falsy default would make an
+    # explicit `k=0` indistinguishable from an omitted `k`, which is how every
+    # falsy forbidden value used to pass in silence.
+    strategy: str = "all"
+    tools: tuple[str, ...] | _Unset = UNSET  # allowlist only: the subset, in this order
+    k: int | _Unset = UNSET  # query_match only: how many ranked tools to offer
+
+    def __post_init__(self) -> None:
+        if self.strategy not in _TOOL_EXPOSURE_STRATEGIES:
+            raise ValueError(
+                f"tool_exposure strategy must be one of "
+                f"{sorted(_TOOL_EXPOSURE_STRATEGIES)}, got {self.strategy!r}"
+            )
+        if self.strategy == "allowlist":
+            tools = self.tools
+            if (
+                isinstance(tools, _Unset)
+                or not tools
+                or not all(isinstance(t, str) and t for t in tools)
+            ):
+                raise ValueError(
+                    "tool_exposure 'allowlist' requires tools: a non-empty tuple of tool names"
+                )
+            if len(set(tools)) != len(tools):
+                raise ValueError("tool_exposure 'allowlist' tools must not contain duplicates")
+        elif self.tools is not UNSET:
+            # SUPPLIED, not truthy: `tools=()` and `tools=None` are refused here
+            # too, because writing a param this strategy never reads is the drift
+            # whatever the value was.
+            raise ValueError(
+                f"tool_exposure 'tools' belongs to the 'allowlist' strategy only, "
+                f"not {self.strategy!r} (remove it; supplied {self.tools!r})"
+            )
+        low, high = _TOOL_EXPOSURE_K_BOUNDS
+        if self.strategy == "query_match":
+            if (
+                self.k is UNSET
+                or isinstance(self.k, bool)
+                or not isinstance(self.k, int)
+                or not low <= self.k <= high
+            ):
+                raise ValueError(
+                    f"tool_exposure 'query_match' requires k: an integer from {low} to {high}, "
+                    f"got {self.k!r}"
+                )
+        elif self.k is not UNSET:
+            raise ValueError(
+                f"tool_exposure 'k' belongs to the 'query_match' strategy only, "
+                f"not {self.strategy!r} (remove it; supplied {self.k!r})"
+            )
+
+    # The two accessors below state the invariant `__post_init__` just proved, in
+    # ONE place, so consumers read a concrete type instead of the sentinel union
+    # and no call site has to re-argue why the param must be set. They raise
+    # rather than substitute a default: an unset value reaching them would mean
+    # the door above was bypassed, which is a defect to surface, not to paper
+    # over with an empty allowlist that silently offers nothing.
+
+    @property
+    def allowlist(self) -> tuple[str, ...]:
+        """The allowlist, for the ``allowlist`` strategy that requires it."""
+        if isinstance(self.tools, _Unset):
+            raise ValueError(f"tool_exposure 'tools' is unset under strategy {self.strategy!r}")
+        return self.tools
+
+    @property
+    def top_k(self) -> int:
+        """How many ranked tools to offer, for the ``query_match`` strategy."""
+        if isinstance(self.k, _Unset):
+            raise ValueError(f"tool_exposure 'k' is unset under strategy {self.strategy!r}")
+        return self.k
 
 
 @dataclass(frozen=True)
@@ -132,6 +264,10 @@ class HarnessConfig:
     attach_pattern: str  # regex (as a string) for @path references; compiled in context.py
     temperature: float | None  # sampling temperature; None sends no field (provider default)
     max_tokens: int  # default completion budget
+    # OPTIONAL in the file, for the same reason CompactionPolicy's additive fields
+    # are: an existing config omits it, gets today's behavior (``all``), and the
+    # ``config_version`` external baselines pin to does not move.
+    tool_exposure: ToolExposurePolicy = ToolExposurePolicy("all")  # which tools are offered
 
 
 # name -> expected JSON type; list-typed fields are validated as arrays of
@@ -155,17 +291,39 @@ _SCHEMA: dict[str, type] = {
     "attach_pattern": str,
     "temperature": float,
     "max_tokens": int,
+    "tool_exposure": dict,
 }
 _SET_FIELDS = {"approval_tools", "code_extensions"}
-# integer knobs that are counts/budgets — zero or negative would wedge the loop
-_POSITIVE_INT_FIELDS = {
-    "max_tool_steps",
-    "default_context_limit",
-    "verify_attempts",
-    "max_item_chars",
-    "memory_search_limit",
-    "max_tokens",
+# Top-level fields a config file may omit (defaulting to today's behavior). The
+# loader's no-silent-defaults rule bends here for the same additive reason the
+# compaction object's optional keys bend it: requiring the field would force every
+# existing file — and every baseline pinned to its version — through a rewrite to
+# gain a knob whose default changes nothing.
+_OPTIONAL_FIELDS = frozenset({"tool_exposure"})
+
+# Single-source int bounds: consulted by BOTH `_check_field` (top-level HarnessConfig
+# fields) and `_retry_policy` (retry's nested fields), and published verbatim by
+# `config_schema()` — a bound changed here changes what the loader enforces and what
+# an external editor is told in the same edit, which is the whole point of collecting
+# them in one table instead of the hand-written literals this replaces (retry's
+# `max_attempts`/`base_delay_ms` used to be checked directly against 1/5/0/10_000 in
+# `_retry_policy`, duplicating what `config_schema()` published about them). `None` as
+# the high bound means no ceiling.
+_INT_BOUNDS: dict[str, tuple[int, int | None]] = {
+    "max_tool_steps": (1, 200),
+    "default_context_limit": (256, 1_000_000),
+    "verify_attempts": (1, 10),
+    "max_tokens": (256, 200_000),
+    "memory_search_limit": (1, 100),
+    "max_item_chars": (1, None),
+    "max_attempts": (1, 5),
+    "base_delay_ms": (0, 10_000),
 }
+# Top-level HarnessConfig fields that must be positive ints — derived from the bounds
+# table rather than hand-picked a second time, so a field can't be bounded in one place
+# and "positive" in another. Retry's nested fields (max_attempts, base_delay_ms) are
+# naturally excluded: they aren't top-level `_SCHEMA` keys.
+_POSITIVE_INT_FIELDS = frozenset(k for k in _INT_BOUNDS if k in _SCHEMA)
 
 _TRUNCATION_STRATEGIES = frozenset({"keep_head", "head_tail"})
 # tool_output's menu additionally offers offload_to_file: the complete result goes
@@ -177,11 +335,17 @@ _TOOL_OUTPUT_STRATEGIES = _TRUNCATION_STRATEGIES | {"offload_to_file"}
 _COMPACTION_STRATEGIES = frozenset(
     {"summarize_middle", "structured_checkpoint", "token_budget_checkpoint"}
 )
-# Additive `token_budget_checkpoint` knobs. Optional so an existing config file stays
+# Additive compaction knobs: the three `token_budget_checkpoint` fields, plus the
+# strategy-agnostic prompt suffix. Optional so an existing config file stays
 # valid and its ``config_version`` — which external baselines pin to — does not move.
 _COMPACTION_OPTIONAL = frozenset(
-    {"recent_token_reserve", "completion_reserve", "checkpoint_fallback"}
+    {"recent_token_reserve", "completion_reserve", "checkpoint_fallback", "prompt_suffix"}
 )
+# Bounds for the two reserve knobs above — not part of `_INT_BOUNDS` because that table
+# is keyed by top-level `_SCHEMA` field names and retry's nested fields; these two live
+# one level deeper, inside the `compaction` object, validated by `_compaction_policy`
+# and published in `config_schema()["compaction"]["parameters"]` from this same pair.
+_COMPACTION_RESERVE_BOUNDS: tuple[int, int] = (0, 100_000)
 _RETRY_STRATEGIES = frozenset({"fail_fast", "backoff"})
 
 # These are correctness and trust properties, not optimization choices. They
@@ -239,6 +403,26 @@ def _short(value: object) -> str:
     return r if len(r) <= 80 else f"{r[:80]}…"
 
 
+def _bound_message(label: str, value: object, low: int, high: int | None) -> str:
+    """The out-of-range error for one int-bounded field, phrased from the bound
+    itself rather than hand-written per field — so a field with the same shape of
+    bound (``low >= 1``, or a hard ceiling) reads the same way everywhere.
+
+    ``label`` is the caller's already-formatted field reference (``repr(key)`` for a
+    top-level field, ``f"{name!r}.{key}"`` for one nested a level down, e.g. inside
+    ``retry`` or ``compaction``).
+    """
+    if low >= 1 and high is None:
+        bound = "a positive integer"
+    elif low >= 1:
+        bound = f"a positive integer from {low} to {high}"
+    elif high is None:
+        bound = f"an integer >= {low}"
+    else:
+        bound = f"an integer from {low} to {high}"
+    return f"harness config: field {label} must be {bound}, got {_short(value)}"
+
+
 def _check_field(key: str, value: object, expected: type) -> None:
     """Reject a malformed value loudly. ``bool`` is a subclass of ``int`` in
     Python, so integer knobs must explicitly refuse booleans (and vice versa —
@@ -265,10 +449,10 @@ def _check_field(key: str, value: object, expected: type) -> None:
             f"harness config: field {key!r} must be {expected.__name__}"
             f"{' of str' if expected is list else ''}, got {_short(value)}"
         )
-    if key in _POSITIVE_INT_FIELDS and isinstance(value, int) and value <= 0:
-        raise ValueError(
-            f"harness config: field {key!r} must be a positive integer, got {_short(value)}"
-        )
+    if key in _INT_BOUNDS and isinstance(value, int):
+        low, high = _INT_BOUNDS[key]
+        if value < low or (high is not None and value > high):
+            raise ValueError(_bound_message(repr(key), value, low, high))
     if key == "attach_pattern" and isinstance(value, str):
         try:
             compiled = re.compile(value)
@@ -351,19 +535,25 @@ def _compaction_policy(value: dict) -> CompactionPolicy:
         if not isinstance(item, int) or isinstance(item, bool) or item <= 0:
             raise ValueError(f"harness config: field {name!r}.{key} must be a positive integer")
     # Reserves may be 0 — that is how they are switched off — so they are validated as
-    # non-negative, unlike the required fields above.
+    # bounded rather than strictly positive, unlike the required fields above.
+    low, high = _COMPACTION_RESERVE_BOUNDS
     for key in ("recent_token_reserve", "completion_reserve"):
         if key in value:
             item = value[key]
-            if not isinstance(item, int) or isinstance(item, bool) or item < 0:
-                raise ValueError(
-                    f"harness config: field {name!r}.{key} must be a non-negative integer"
-                )
+            if not isinstance(item, int) or isinstance(item, bool) or item < low or item > high:
+                raise ValueError(_bound_message(f"{name!r}.{key}", item, low, high))
     fallback = value.get("checkpoint_fallback", "head_tail")
     if fallback not in _TRUNCATION_STRATEGIES:
         raise ValueError(
             f"harness config: field {name!r}.checkpoint_fallback must be one of "
             f"{sorted(_TRUNCATION_STRATEGIES)}, got {_short(fallback)}"
+        )
+    # None — absent or an explicit null, the temperature precedent — means "use the
+    # strategy's built-in suffix"; only a real string may replace it.
+    suffix = value.get("prompt_suffix")
+    if suffix is not None and not isinstance(suffix, str):
+        raise ValueError(
+            f"harness config: field {name!r}.prompt_suffix must be a string, got {_short(suffix)}"
         )
     fraction = value["trigger_fraction"]
     if (
@@ -391,6 +581,7 @@ def _compaction_policy(value: dict) -> CompactionPolicy:
         value.get("recent_token_reserve", 0),
         value.get("completion_reserve", 0),
         fallback,
+        suffix,
     )
 
 
@@ -403,17 +594,58 @@ def _retry_policy(value: dict) -> RetryPolicy:
             f"harness config: field {name!r} strategy must be one of "
             f"{sorted(_RETRY_STRATEGIES)}, got {_short(strategy)}"
         )
-    attempts = value["max_attempts"]
-    if not isinstance(attempts, int) or isinstance(attempts, bool) or not 1 <= attempts <= 5:
+    for key in ("max_attempts", "base_delay_ms"):
+        item = value[key]
+        low, high = _INT_BOUNDS[key]
+        if (
+            not isinstance(item, int)
+            or isinstance(item, bool)
+            or item < low
+            or (high is not None and item > high)
+        ):
+            raise ValueError(_bound_message(f"{name!r}.{key}", item, low, high))
+    return RetryPolicy(strategy, value["max_attempts"], value["base_delay_ms"])
+
+
+def _tool_exposure_policy(value: dict) -> ToolExposurePolicy:
+    name = "tool_exposure"
+    _object_keys(name, value, {"strategy"}, frozenset({"tools", "k"}))
+    strategy = value["strategy"]
+    if strategy not in _TOOL_EXPOSURE_STRATEGIES:
         raise ValueError(
-            f"harness config: field {name!r}.max_attempts must be an integer from 1 to 5"
+            f"harness config: field {name!r} strategy must be one of "
+            f"{sorted(_TOOL_EXPOSURE_STRATEGIES)}, got {_short(strategy)}"
         )
-    delay = value["base_delay_ms"]
-    if not isinstance(delay, int) or isinstance(delay, bool) or not 0 <= delay <= 10_000:
-        raise ValueError(
-            f"harness config: field {name!r}.base_delay_ms must be an integer from 0 to 10000"
-        )
-    return RetryPolicy(strategy, attempts, delay)
+    # PRESENCE, not value: a key written in the object is supplied even when it
+    # holds `null`, `[]`, or `0`. `value.get(key)` collapsed all three into the
+    # same thing an absent key produced, which is what let a cross-strategy param
+    # through whenever its value happened to be falsy. The sentinel travels into
+    # the policy so ONE rule — the policy's — decides supplied-vs-omitted at both
+    # doors, rather than each door carrying its own copy of it.
+    tools = value.get("tools", UNSET)
+    k = value.get("k", UNSET)
+    # Shape checks run only for the strategy that OWNS the param. For any other
+    # strategy the param is forbidden outright, and the policy says so precisely
+    # ("belongs to the 'allowlist' strategy only") instead of this door
+    # complaining about the type of a param that should not be here at all.
+    if strategy == "allowlist" and tools is not UNSET:
+        if not isinstance(tools, list) or not all(isinstance(t, str) and t for t in tools):
+            raise ValueError(
+                f"harness config: field {name!r}.tools must be a list of non-empty strings"
+            )
+    if strategy == "query_match" and k is not UNSET:
+        if isinstance(k, bool) or not isinstance(k, int):
+            low, high = _TOOL_EXPOSURE_K_BOUNDS
+            raise ValueError(_bound_message(f"{name!r}.k", k, low, high))
+    # Per-strategy required/forbidden params are the policy's own rules — build it
+    # and let ``__post_init__`` refuse, prefixing the file-door context.
+    try:
+        # `tuple(...)` only for a real list — a supplied non-list (`null`, a
+        # string, a number) travels through AS WRITTEN so the policy refuses the
+        # thing the author actually put in the file.
+        return ToolExposurePolicy(strategy, tuple(tools) if isinstance(tools, list) else tools, k)
+    except ValueError as exc:
+        raise ValueError(f"harness config: field {name!r}: {exc}") from exc
 
 
 def config_schema() -> list[dict]:
@@ -434,6 +666,8 @@ def config_schema() -> list[dict]:
             "positive_int": name in _POSITIVE_INT_FIELDS,
             "editable": name not in _NON_EDITABLE_FIELDS,
         }
+        if name in _INT_BOUNDS:
+            item["min"], item["max"] = _INT_BOUNDS[name]
         if name == "max_item_chars":
             item["deprecated"] = (
                 "Compatibility re-export only; use file_injection.budget or "
@@ -453,17 +687,33 @@ def config_schema() -> list[dict]:
             }
         elif name == "compaction":
             item["strategies"] = sorted(_COMPACTION_STRATEGIES)
+            reserve_min, reserve_max = _COMPACTION_RESERVE_BOUNDS
             item["parameters"] = {
                 "keep_head": {"type": "int", "positive": True},
                 "keep_tail": {"type": "int", "positive": True},
                 "trigger_fraction": {"type": "float", "exclusive_min": 0, "exclusive_max": 1},
                 "summary_max_tokens": {"type": "int", "positive": True},
+                "recent_token_reserve": {"type": "int", "min": reserve_min, "max": reserve_max},
+                "completion_reserve": {"type": "int", "min": reserve_min, "max": reserve_max},
+                "checkpoint_fallback": {"type": "str", "enum": sorted(_TRUNCATION_STRATEGIES)},
+                "prompt_suffix": {"type": "str"},
             }
         elif name == "retry":
             item["strategies"] = sorted(_RETRY_STRATEGIES)
             item["parameters"] = {
-                "max_attempts": {"type": "int", "min": 1, "max": 5},
-                "base_delay_ms": {"type": "int", "min": 0, "max": 10_000},
+                key: {"type": "int", "min": _INT_BOUNDS[key][0], "max": _INT_BOUNDS[key][1]}
+                for key in ("max_attempts", "base_delay_ms")
+            }
+        elif name == "tool_exposure":
+            k_low, k_high = _TOOL_EXPOSURE_K_BOUNDS
+            item["strategies"] = sorted(_TOOL_EXPOSURE_STRATEGIES)
+            # Absent from the file = strategy "all" = today's exposure, byte for byte.
+            item["optional"] = True
+            # Each param names the ONE strategy that reads it; the loader refuses it
+            # under any other, so an external editor is told the same rule it will hit.
+            item["parameters"] = {
+                "tools": {"type": "list[str]", "strategy": "allowlist", "min_len": 1},
+                "k": {"type": "int", "strategy": "query_match", "min": k_low, "max": k_high},
             }
         out.append(item)
     return out
@@ -492,11 +742,13 @@ def load_config(path: str | Path = CONFIG_PATH) -> HarnessConfig:
     unknown = sorted(set(raw) - set(_SCHEMA))
     if unknown:
         raise ValueError(f"harness config: unknown keys {unknown}")
-    missing = sorted(set(_SCHEMA) - set(raw))
+    missing = sorted(set(_SCHEMA) - set(raw) - _OPTIONAL_FIELDS)
     if missing:
         raise ValueError(f"harness config: missing fields {missing}")
     kwargs: dict[str, Any] = {}
     for key, expected in _SCHEMA.items():
+        if key in _OPTIONAL_FIELDS and key not in raw:
+            continue  # the dataclass default IS today's behavior (see _OPTIONAL_FIELDS)
         _check_field(key, raw[key], expected)
         if key in _SET_FIELDS:
             kwargs[key] = frozenset(raw[key])
@@ -506,6 +758,8 @@ def load_config(path: str | Path = CONFIG_PATH) -> HarnessConfig:
             kwargs[key] = _compaction_policy(raw[key])
         elif key == "retry":
             kwargs[key] = _retry_policy(raw[key])
+        elif key == "tool_exposure":
+            kwargs[key] = _tool_exposure_policy(raw[key])
         elif expected is float:
             # a JSON `1` is a valid temperature; null stays None (no field sent)
             kwargs[key] = None if raw[key] is None else float(raw[key])

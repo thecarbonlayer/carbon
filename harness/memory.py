@@ -18,6 +18,7 @@ import tempfile
 from pathlib import Path
 
 from harness.harness_config import CONFIG
+from harness.session_env import delete_session_scratch
 from harness.tools import Tool
 
 DEFAULT_DIR = ".sessions"
@@ -94,10 +95,23 @@ def load_trace(session_id: str, base: str | Path = DEFAULT_DIR) -> list[dict]:
 
 
 def delete_session(session_id: str, base: str | Path = DEFAULT_DIR) -> None:
-    """Wipe a session's persisted messages and trace (ch-24 ``/reset``). Idempotent —
-    missing files are fine, since reset should work whether or not anything was saved."""
+    """Wipe a session's persisted messages, trace, and scratch (ch-24 ``/reset``;
+    scratch since Task 3's durable sessions). Idempotent — missing files/dirs are
+    fine, since reset should work whether or not anything was saved.
+
+    The scratch removal is not optional housekeeping: a durable session's scratch
+    (harness/session_env.py) holds the COMPLETE, un-redacted bytes of every tool
+    result it ever offloaded (limits.py's own warning: "a printenv, a token-bearing
+    log"). Deleting the transcript that pointed at them and leaving the scratch
+    behind would not free anything — it would just remove the last thing telling
+    anyone those bytes are still on disk. This is the one place that invariant is
+    enforced, rather than something every caller of this function has to remember
+    to pair with ``delete_session_scratch`` on its own; ``ui/tui.py``'s ``/reset``
+    is the one production caller today and gets it for free.
+    """
     for path in (_path(session_id, base), _trace_path(session_id, base)):
         path.unlink(missing_ok=True)
+    delete_session_scratch(session_id, base)
 
 
 def list_sessions(base: str | Path = DEFAULT_DIR) -> list[dict]:

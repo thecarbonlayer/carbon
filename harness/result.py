@@ -47,6 +47,15 @@ class RunResult:
     approvals: int = 0  # gated tool calls that were approved and ran
     stop_reason: str = "stop"  # "stop" | "tool_budget" | "incomplete_response" | "deadline"
     totals: dict = field(default_factory=dict)
+    # v0.4 (Phase 1 telemetry slice 1, contract §1): the public alternative to
+    # reaching into agent._observed_pass / agent._last_tokens.
+    verified: bool | None = None  # run-verification verdict; None = not requested
+    # {"total_tokens": int} always when a tracer is attached; "input_tokens"/
+    # "output_tokens" join it only when every call this run reported a real
+    # provider split (amendment 2026-08-19, audit finding 2) — never a fabricated
+    # one built from the total-only fallback.
+    usage: dict = field(default_factory=dict)
+    compactions: int = 0  # agent.compaction_count at run end
 
     def __str__(self) -> str:
         return self.text

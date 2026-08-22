@@ -8,19 +8,22 @@ or an error string the model can read and recover from.
 Tools are an API surface you expose to a model: keep the list small, keep each
 contract narrow, and validate arguments. ``read_file`` returns a file's
 contents, and ``list_files``/``search_text`` explore the tree — and as of
-ch-08 all three are confined to the workspace: a model-invoked tool must not
-wander the host filesystem, so paths are resolved and must live under the
-working directory.
+ch-08 all three are confined: a model-invoked tool must not wander the host
+filesystem, so paths are resolved and must live under the working directory
+(or, for a ``read_file`` path naming a ``scratch://`` ref, strictly inside the
+session's own private scratch — never a workspace fallback).
 """
 
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-from harness.limits import OFFLOAD_SUBDIR  # the one scratch path discovery may be aimed at
+from harness.harness_config import ToolExposurePolicy
+from harness.limits import SCRATCH_SCHEME  # the prefix a resolvable offload ref carries
 
 
 def _is_secret_file(p: Path) -> bool:
@@ -40,18 +43,40 @@ def read_file(
     root: str | Path | None = None,
     start_line: int | None = None,
     end_line: int | None = None,
+    scratch_root: str | Path | None = None,
 ) -> str:
     """Return a file's contents — confined to a root (ch-08 hardening).
 
     The model-invoked tool must not wander the host filesystem (no /etc/passwd) and
     must not read secrets (no ``.env`` API-key exfiltration). Paths are resolved and
     must live under ``root`` (the current working directory by default; the caller
-    binds it to the agent's workspace so reads and writes share one root).
+    binds it to the agent's workspace so reads and writes share one root) — unless
+    ``path`` is a ``scratch://`` ref, which resolves inside ``scratch_root`` instead
+    (the session's private scratch; ``root`` plays no part in that branch).
     """
-    base = Path(root).resolve() if root else Path.cwd().resolve()
-    p = (base / path).resolve()
-    if p != base and base not in p.parents:
-        return f"error: path outside workspace: {path}"
+    if path.startswith(SCRATCH_SCHEME):
+        # A scratch ref names harness-written runtime state (an offloaded result),
+        # resolved strictly inside this session's private scratch — never a
+        # workspace fallback, and never anywhere an escape sequence points.
+        #
+        # Falsy, not just ``None``: ``Path("").resolve()`` is the process cwd, and
+        # ``bool(Path(""))`` is True — a Path object is truthy no matter what it
+        # names — so an ``is None`` check here would let a truthy-but-empty
+        # ``scratch_root=""`` resolve a scratch:// ref against the cwd instead of
+        # refusing it. The write side (limits.py's ``_door``/``_offload_dir``)
+        # already guards falsy for the same reason; this is that same fix on the
+        # read side.
+        if not scratch_root:
+            return f"error: no scratch storage in this context: {path}"
+        base = Path(scratch_root).resolve()
+        p = (base / path[len(SCRATCH_SCHEME) :]).resolve()
+        if p != base and base not in p.parents:
+            return f"error: path outside scratch storage: {path}"
+    else:
+        base = Path(root).resolve() if root else Path.cwd().resolve()
+        p = (base / path).resolve()
+        if p != base and base not in p.parents:
+            return f"error: path outside workspace: {path}"
     if _is_secret_file(p):
         return f"error: refusing to read secret file: {path}"
     if not p.is_file():
@@ -168,6 +193,57 @@ class ToolRegistry:
         return len(self._tools)
 
 
+def _exposure_tokens(text: str) -> frozenset[str]:
+    """Lowercased word tokens for query_match's overlap score. A set, not a bag:
+    the score asks "how much of the ask's vocabulary does this tool speak", and a
+    description that repeats one matching word must not outrank one that matches
+    two different words once each."""
+    return frozenset(re.findall(r"[a-z0-9]+", text.lower()))
+
+
+def exposed_specs(
+    registry: ToolRegistry, policy: ToolExposurePolicy | None, query: str = ""
+) -> list[dict]:
+    """The tool specs offered to the model under one vetted exposure strategy.
+
+    Seam 3 of the strategy surface (Select): ``ToolRegistry.specs()`` decides what
+    COULD be offered; this decides what IS. ``all`` (or no policy) returns
+    ``registry.specs()`` through the same code path as ever — byte-identical, so
+    landing the seam changes nothing until an editor turns the knob.
+
+    ``allowlist`` offers the named subset in the ALLOWLIST's order (what the editor
+    lists is what is sent, in that order); names absent from the registry are
+    skipped, because the config file cannot know a consumer's registry at load
+    time. ``query_match`` ranks every tool by token overlap between ``query`` and
+    the tool's name + description, then offers the top ``k`` in rank order — a
+    stable sort, so zero-information ties fall back to registration order, and a
+    zero-score tool can still be offered when ``k`` exceeds the number of scoring
+    tools: the strategy ranks, it does not filter.
+
+    Deterministic by construction — same registry, policy, and query always
+    produce the same list — because an exposure decision a replay cannot
+    reproduce would put a serving confound inside every measurement.
+    """
+    if policy is None or policy.strategy == "all":
+        return registry.specs()
+    if policy.strategy == "allowlist":
+        by_name = {s["function"]["name"]: s for s in registry.specs()}
+        return [by_name[name] for name in policy.allowlist if name in by_name]
+    # query_match
+    query_tokens = _exposure_tokens(query)
+    specs = registry.specs()
+    scored = sorted(
+        specs,
+        key=lambda s: (
+            -len(
+                query_tokens
+                & _exposure_tokens(f"{s['function']['name']} {s['function']['description']}")
+            )
+        ),
+    )
+    return scored[: policy.top_k]
+
+
 def _matches_type(value: object, expected: str) -> bool:
     if expected == "string":
         return isinstance(value, str)
@@ -215,21 +291,25 @@ def _validate_arguments(arguments: object, schema: dict) -> str | None:
     return None
 
 
-def read_file_tool(root: str | Path | None = None) -> Tool:
-    """A ``read_file`` tool confined to ``root`` (defaults to the process cwd).
+def read_file_tool(root: str | Path | None = None, scratch_root: str | Path | None = None) -> Tool:
+    """A ``read_file`` tool confined to ``root`` (defaults to the process cwd), with
+    ``scratch_root`` closed over too so the model can resolve a ``scratch://`` ref an
+    offloaded tool result left behind in its own transcript.
 
-    The mature agent binds this to its workspace so the model reads the same tree
+    The mature agent binds ``root`` to its workspace so the model reads the same tree
     it writes to — and never the host cwd (where ``.env`` lives)."""
 
     def _read(path: str, start_line: int | None = None, end_line: int | None = None) -> str:
-        return read_file(path, root=root, start_line=start_line, end_line=end_line)
+        return read_file(
+            path, root=root, start_line=start_line, end_line=end_line, scratch_root=scratch_root
+        )
 
     return Tool(
         name="read_file",
         description=(
             "Read a UTF-8 workspace file. For large files, use 1-based start_line/end_line "
             "ranges and follow the continuation hint instead of repeatedly requesting the "
-            "whole file."
+            "whole file. Offloaded tool results are at scratch:// paths."
         ),
         parameters={
             "type": "object",
@@ -250,22 +330,6 @@ def _confined(root: str | Path | None) -> Path:
     return Path(root).resolve() if root else Path.cwd().resolve()
 
 
-_GLOB_MAGIC = set("*?[")
-
-
-def _names_one_spill(pattern: str) -> bool:
-    """Does this pattern point straight at a single offloaded result?
-
-    That is the whole exemption: the footer hands the model
-    ``.carbon/offload/<hash>.txt`` and tells it to grep that file, so exactly that
-    shape is allowed through and nothing wider is. Anything with glob magic in the
-    filename sweeps the directory instead, which is how a stale spill from an unrelated
-    task ends up quoted back as if it were the workspace's own content.
-    """
-    path = Path(pattern)
-    return path.parent == OFFLOAD_SUBDIR and not _GLOB_MAGIC & set(path.name)
-
-
 def _visible_files(base: Path, pattern: str) -> list[Path]:
     """Files under ``base`` matching ``pattern``, minus secrets and VCS/venv noise.
 
@@ -275,20 +339,26 @@ def _visible_files(base: Path, pattern: str) -> list[Path]:
     own name would leak the content it points to. ``read_file`` already resolves
     before its containment check; these have to agree with it.
 
-    ``.carbon`` is skipped for a different reason: it is the harness's own scratch
-    directory inside the workspace (offloaded tool output, project-local extensions),
-    not project content. An undirected walk that surfaced it would let yesterday's
-    spilled tool result answer a question about the user's code, and a search for a
-    symbol would hit every excerpt that ever quoted it. The one exemption is the route
-    the offload footer hands the model: a pattern naming ONE file under the offload
-    directory, which is what ``search_text(pattern=...)`` needs to grep the huge result
-    it just pointed at. A wildcard over that directory is not that route — it is an
-    enumeration of every spill the workspace has ever held — and neither is a pattern
-    that merely mentions ``.carbon`` somewhere.
+    ``.carbon`` is skipped unconditionally: it is the harness's own directory inside
+    the workspace (project-local extensions, the audit log), not project content. An
+    undirected walk that surfaced it would answer a question about the user's code
+    with the harness's own bookkeeping instead. It used to carry one exemption — a
+    pattern naming exactly the single spill file an offload footer pointed at, so
+    ``search_text(pattern=...)`` could grep the result it just named — but that spill
+    no longer lands under the workspace to exempt: it lives in the session's private
+    scratch, and the only way back in is ``read_file`` resolving the footer's
+    ``scratch://`` ref, a route this glob was never able to match anyway.
     """
-    skip = {".git", ".venv", "venv", "node_modules", "__pycache__", ".mypy_cache", ".ruff_cache"}
-    if not _names_one_spill(pattern):
-        skip.add(".carbon")
+    skip = {
+        ".git",
+        ".venv",
+        "venv",
+        "node_modules",
+        "__pycache__",
+        ".mypy_cache",
+        ".ruff_cache",
+        ".carbon",
+    }
     out = []
     for p in sorted(base.glob(pattern)):
         target = p.resolve()
@@ -297,9 +367,9 @@ def _visible_files(base: Path, pattern: str) -> list[Path]:
         if not target.is_file() or _is_secret_file(p) or _is_secret_file(target):
             continue
         # Both the apparent path and the resolved one: containment is judged on the
-        # resolved target, and so must this be, or `ln -s .carbon/offload cache` turns
-        # `cache/*` into the undirected walk of the scratch directory that the skip
-        # exists to prevent.
+        # resolved target, and so must this be, or `ln -s .carbon cache` turns
+        # `cache/*` into the undirected walk of the harness's own directory that the
+        # skip exists to prevent.
         if skip & (set(p.relative_to(base).parts) | set(target.relative_to(base).parts)):
             continue
         out.append(p)
@@ -391,9 +461,11 @@ def search_text_tool(root: str | Path | None = None) -> Tool:
     )
 
 
-def default_tools(root: str | Path | None = None) -> ToolRegistry:
+def default_tools(
+    root: str | Path | None = None, scratch_root: str | Path | None = None
+) -> ToolRegistry:
     reg = ToolRegistry()
-    reg.register(read_file_tool(root))
+    reg.register(read_file_tool(root, scratch_root))
     reg.register(list_files_tool(root))
     reg.register(search_text_tool(root))
     return reg

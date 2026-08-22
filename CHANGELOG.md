@@ -144,6 +144,30 @@ One entry per release; commits stay fine-grained under a `feat(surface)` or
   model is being measured, not of an individual call. Forwarded as
   OpenRouter's own wire format (`{"reasoning": {"effort": ...}}`) only when
   set; every other provider's requests are unaffected.
+- `LLM_PROVIDER_ORDER` / `LLM_QUANTIZATION`: pin the serving base behind a
+  multi-provider router (OpenRouter). `LLM_PROVIDER_ORDER` names exactly one
+  upstream provider, `LLM_QUANTIZATION` one serving precision. Provider-level,
+  like `LLM_REASONING_EFFORT` — which serving base answers is a property of
+  the model being measured, not of one request. Forwarded as OpenRouter's own
+  provider-routing object (`{"provider": {"order": [...], "allow_fallbacks":
+  false, "quantizations": [...]}}`), each field only when its pin is set, and
+  fallbacks disabled whenever any pin is — a pin that can silently reroute is
+  not a pin. Unset means nothing new is sent: local endpoints (LM Studio,
+  Ollama) see byte-identical requests.
+- `compaction.prompt_suffix`: the strategy-specific tail of the summarizer's
+  instructions — the checkpoint headings, the carry-forward update instruction,
+  the preserve-verbatim line — exposed as an optional config knob, additive and
+  default-neutral (unset or null means the strategy's built-in suffix, and the
+  assembled prompt is byte-identical to before, pinned literally by test;
+  `config_version` does not move for this entry). `compaction_prompt` was only
+  the BASE of what the summarizer sees: each strategy appended its tail in
+  code, out of the editable surface's reach, so a prompt candidate could
+  rewrite the base yet never touch the headings or update instruction the
+  model actually reads. The suffixes are now data on the strategy registry
+  (`default_suffix`); a configured `prompt_suffix` replaces any strategy's
+  default, and the empty string strips the tail entirely, leaving the base
+  prompt alone. A non-string value is rejected at load, naming the field, like
+  every other malformed config value.
 
 ### Changed
 

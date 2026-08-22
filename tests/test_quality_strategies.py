@@ -20,6 +20,7 @@ from harness.harness_config import (
     load_config,
 )
 from harness.limits import truncate
+from harness.observability import Tracer
 from harness.tools import Tool, ToolRegistry, read_file, read_file_tool
 from harness.workspace import Workspace
 from model import LLMResponse, Provider
@@ -211,7 +212,7 @@ def test_structured_compaction_serializes_tool_names_arguments_and_prior_summary
         return LLMResponse(content="CHECKPOINT")
 
     with patch.object(compaction, "chat", side_effect=summarize):
-        out = compaction.compact(
+        out, _facts = compaction.compact(
             messages,
             keep_head=1,
             keep_tail=2,
@@ -244,9 +245,10 @@ def test_unbounded_scalars_have_a_quality_floor():
     validator now says both, and it is the door — a test restating a door's rule adds
     no coverage and goes stale on the day the door moves.
 
-    What remains is the part nothing else says. ``max_tokens`` is validated only as a
-    positive integer, so 1 loads cleanly and truncates every reply the agent writes.
-    That is a knob the loop may edit with no floor under it anywhere else.
+    What remains is the part nothing else says. ``max_tokens`` is loader-bounded to
+    256..200_000 (``_INT_BOUNDS`` — telemetry slice 2), which is a technical floor, not
+    a quality one: 256 loads cleanly and still truncates every reply worth writing.
+    This is the floor beneath THAT floor, and nothing but this test asserts it.
     """
     assert CONFIG.max_tokens >= 4096
 
@@ -321,6 +323,236 @@ def test_context_overflow_compacts_active_history_and_retries():
     assert state == {"main_calls": 2, "summary_calls": 1}
     assert agent.compaction_count == 1
     assert agent.retry_count == 1
+
+
+def test_overflow_recovery_records_a_compaction_event_too():
+    """Contract amendment (Phase 1 §3, 2026-08-19): ``_compact_active_history`` —
+    the overflow-recovery path, distinct from the steady-state pre-turn door — calls
+    the SAME ``record_compaction`` hook the same way, so an event-based count of
+    compactions and ``agent.compaction_count`` can never disagree."""
+    state = {"main_calls": 0, "summary_calls": 0}
+
+    def responder(messages, **kwargs):
+        is_summary = bool(
+            messages
+            and messages[0].get("role") == "system"
+            and "context summarizer" in str(messages[0].get("content", ""))
+        )
+        if is_summary:
+            state["summary_calls"] += 1
+            return LLMResponse(content="STRUCTURED CHECKPOINT")
+        state["main_calls"] += 1
+        if state["main_calls"] == 1:
+            raise RuntimeError("maximum context length exceeded")
+        return LLMResponse(content="OVERFLOW-RECOVERED")
+
+    provider = Provider("fake://overflow-telemetry", "fake", responder=responder)
+    tracer = Tracer()
+    agent = Agent(provider=provider, tracer=tracer)
+    agent.messages = [{"role": "user", "content": f"old-{i}"} for i in range(10)]
+    # Same reason as the sibling test above: pin the pre-turn door shut so the only
+    # compaction in play is the overflow-recovery one this test is about.
+    with _pinned(compaction=replace(CONFIG.compaction, trigger_fraction=0.8)):
+        result = agent.run("continue")
+
+    assert result.text == "OVERFLOW-RECOVERED"
+    assert agent.compaction_count == 1
+
+    compaction_events = [e for e in tracer.events if e.kind == "compaction"]
+    assert len(compaction_events) == agent.compaction_count, (
+        f"event count {len(compaction_events)} disagrees with "
+        f"compaction_count {agent.compaction_count}"
+    )
+    spans = [s for s in tracer.spans if s.operation == "compact"]
+    assert len(spans) == agent.compaction_count
+
+
+def _summary_or_main(state: dict, messages: list[dict]) -> str:
+    """Classify one fake-provider call and count it. The summarizer's system
+    prompt is the compaction prompt; the main loop's is the agent's."""
+    is_summary = bool(
+        messages
+        and messages[0].get("role") == "system"
+        and "context summarizer" in str(messages[0].get("content", ""))
+    )
+    kind = "summary_calls" if is_summary else "main_calls"
+    state[kind] += 1
+    return kind
+
+
+def test_summarizer_transient_failure_retries_like_any_other_model_call():
+    """The compaction summarizer is a model call like any other, so a transient
+    provider failure there is retried under the same policy — not allowed to
+    crash the turn.
+
+    It used to call ``chat()`` directly, bypassing the retry path — the one
+    unretried model call in a turn. Three of the six serving faults in the
+    2026-08 evaluation campaign hit exactly this call and crashed their
+    attempts outright while every other call site would have retried.
+    """
+    state = {"summary_calls": 0, "main_calls": 0}
+
+    def responder(messages, **kwargs):
+        if _summary_or_main(state, messages) == "summary_calls":
+            if state["summary_calls"] == 1:
+                raise RuntimeError("503 temporarily unavailable")
+            return LLMResponse(content="STRUCTURED CHECKPOINT")
+        return LLMResponse(content="DONE")
+
+    provider = Provider("fake://summarizer-retry", "fake", responder=responder)
+    agent = Agent(provider=provider)
+    agent.messages = [{"role": "user", "content": f"old-{i}"} for i in range(10)]
+    # trigger_fraction 0.001 opens the PRE-TURN door, so the summarizer under
+    # test runs from the steady-state site (`_maybe_compact`); the overflow
+    # -recovery site gets its own sibling test below — the two are wired
+    # separately, so one passing says nothing about the other.
+    with (
+        _pinned(
+            retry=RetryPolicy("backoff", 3, 0),
+            compaction=replace(CONFIG.compaction, trigger_fraction=0.001),
+        ),
+        patch("harness.agent.time.sleep"),
+    ):
+        result = agent.run("continue")
+
+    assert result.text == "DONE"
+    assert state == {"summary_calls": 2, "main_calls": 1}
+    assert agent.compaction_count == 1
+    assert agent.retry_count == 1
+
+
+def test_summarizer_retries_inside_overflow_recovery_too():
+    """Same contract at the second ``compact()`` call site
+    (``_compact_active_history``): a transient summarizer failure during
+    overflow recovery is retried rather than turning a recoverable overflow
+    into a crashed turn."""
+    state = {"summary_calls": 0, "main_calls": 0}
+
+    def responder(messages, **kwargs):
+        if _summary_or_main(state, messages) == "summary_calls":
+            if state["summary_calls"] == 1:
+                raise RuntimeError("503 temporarily unavailable")
+            return LLMResponse(content="STRUCTURED CHECKPOINT")
+        if state["main_calls"] == 1:
+            raise RuntimeError("maximum context length exceeded")
+        return LLMResponse(content="OVERFLOW-RECOVERED")
+
+    provider = Provider("fake://overflow-summarizer-retry", "fake", responder=responder)
+    agent = Agent(provider=provider)
+    agent.messages = [{"role": "user", "content": f"old-{i}"} for i in range(10)]
+    # Pin the pre-turn door shut (same reason as the overflow tests above): the
+    # only compaction in play must be the overflow-recovery one.
+    with (
+        _pinned(
+            retry=RetryPolicy("backoff", 3, 0),
+            compaction=replace(CONFIG.compaction, trigger_fraction=0.8),
+        ),
+        patch("harness.agent.time.sleep"),
+    ):
+        result = agent.run("continue")
+
+    assert result.text == "OVERFLOW-RECOVERED"
+    assert state == {"summary_calls": 2, "main_calls": 2}
+    assert agent.compaction_count == 1
+    # one summarizer retry, plus the overflow recovery itself
+    assert agent.retry_count == 2
+
+
+def test_transient_classifier_matches_status_codes_not_substrings():
+    """Status codes must match as standalone numbers, not substrings.
+
+    "requested 15020 tokens" contains "502", so substring matching classified a
+    context-overflow message as a transient gateway fault and spent the whole
+    retry budget on a payload that can never fit (2026-08-21 review probe). The
+    other side of the line must hold too: a genuine gateway fault still matches.
+    """
+    assert not Agent._transient_error(
+        RuntimeError("maximum context length exceeded: requested 15020 tokens")
+    )
+    assert not Agent._transient_error(RuntimeError("cache entry 4290 evicted"))
+    assert Agent._transient_error(RuntimeError("502 Bad Gateway"))
+    assert Agent._transient_error(RuntimeError("HTTP 429"))
+    assert Agent._transient_error(RuntimeError("status_code=503"))
+
+
+def test_summarizer_overflow_is_never_retried():
+    """The summarizer's payload is fixed when it is built, so an overflow there
+    will overflow again identically — it must raise immediately instead of
+    spending the retry budget, even when the message also carries a transient
+    marker. (The main loop is different: its payload is rebuilt from compacted
+    history, so overflow recovery can actually change what is re-sent.)"""
+    state = {"summary_calls": 0, "main_calls": 0}
+
+    def responder(messages, **kwargs):
+        if _summary_or_main(state, messages) == "summary_calls":
+            raise RuntimeError("maximum context length exceeded; temporarily unavailable")
+        return LLMResponse(content="UNREACHED")  # pragma: no cover - must never run
+
+    provider = Provider("fake://summarizer-overflow", "fake", responder=responder)
+    agent = Agent(provider=provider)
+    agent.messages = [{"role": "user", "content": f"old-{i}"} for i in range(10)]
+    with (
+        _pinned(
+            retry=RetryPolicy("backoff", 3, 0),
+            compaction=replace(CONFIG.compaction, trigger_fraction=0.001),
+        ),
+        patch("harness.agent.time.sleep"),
+        pytest.raises(RuntimeError, match="context length"),
+    ):
+        agent.run("continue")
+
+    assert state == {"summary_calls": 1, "main_calls": 0}
+    assert agent.retry_count == 0
+
+
+def test_genuine_gateway_fault_still_retries():
+    """Pin the other side of the word-boundary line end to end: a bare
+    "502 Bad Gateway" (no other transient marker in the text) still buys a
+    retry on the main path."""
+    state = {"calls": 0}
+
+    def responder(messages, **kwargs):
+        state["calls"] += 1
+        if state["calls"] == 1:
+            raise RuntimeError("502 Bad Gateway")
+        return LLMResponse(content="RECOVERED")
+
+    provider = Provider("fake://gateway", "fake", responder=responder)
+    with _pinned(retry=RetryPolicy("backoff", 3, 0)), patch("harness.agent.time.sleep"):
+        result = Agent(provider=provider).run("go")
+
+    assert result.text == "RECOVERED"
+    assert state["calls"] == 2
+
+
+def test_payload_construction_faults_escape_the_retry_loop():
+    """Building the request is not making it. A fault in the payload builder
+    (here: the AGENTS.md read raising) is a local defect, not a model fault —
+    it must escape immediately, never be retried as transient. The
+    pre-extraction loop kept ``_payload()`` before the ``try``, and the
+    extracted loop must draw exactly that boundary."""
+    responder_calls = {"n": 0}
+
+    def responder(messages, **kwargs):  # pragma: no cover - must never run
+        responder_calls["n"] += 1
+        return LLMResponse(content="UNREACHED")
+
+    provider = Provider("fake://payload-fault", "fake", responder=responder)
+    agent = Agent(provider=provider)
+    with (
+        _pinned(retry=RetryPolicy("backoff", 3, 0)),
+        patch("harness.agent.time.sleep"),
+        patch(
+            "harness.agent.load_agents_md",
+            side_effect=TimeoutError("timed out reading AGENTS.md"),
+        ) as loader,
+        pytest.raises(TimeoutError, match="AGENTS.md"),
+    ):
+        agent.run("go")
+
+    assert loader.call_count == 1  # raised straight out, not retried
+    assert responder_calls["n"] == 0
+    assert agent.retry_count == 0
 
 
 # --- regressions found reviewing the strategy surface -------------------------

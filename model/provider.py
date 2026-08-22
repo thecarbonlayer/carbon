@@ -108,6 +108,17 @@ class Provider:
     # provider that doesn't recognize the field would otherwise get a silently
     # ignored (or rejected) parameter on every call.
     reasoning_effort: str | None = None
+    # OpenRouter's provider-routing pin (forwarded as a nested ``provider`` object —
+    # see model/openai_compatible.py). Same rationale and shape as
+    # ``reasoning_effort``: provider-level because WHICH serving base answers is a
+    # property of the model being measured, not of one request. ``provider_order``
+    # names exactly one upstream provider (fallbacks are disabled alongside it —
+    # a pin that can silently reroute is not a pin); ``quantization`` names one
+    # serving precision. None means "don't send it": local endpoints (LM Studio,
+    # Ollama) don't know the field, and an unpinned request stays byte-identical
+    # to what this harness always sent.
+    provider_order: str | None = None
+    quantization: str | None = None
 
     @classmethod
     def from_env(cls, root: str | Path = ".") -> Provider:
@@ -117,6 +128,8 @@ class Provider:
             model=os.environ.get("LLM_MODEL", DEFAULT_MODEL),
             api_key=os.environ.get("LLM_API_KEY", DEFAULT_API_KEY),
             reasoning_effort=os.environ.get("LLM_REASONING_EFFORT") or None,
+            provider_order=os.environ.get("LLM_PROVIDER_ORDER") or None,
+            quantization=os.environ.get("LLM_QUANTIZATION") or None,
         )
 
 

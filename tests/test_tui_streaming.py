@@ -118,3 +118,56 @@ def test_turn_done_without_streaming_still_mounts_a_block(tmp_path):
             assert len(app.query(".msg-agent")) == 1
 
     asyncio.run(run())
+
+
+def test_build_agent_closes_the_agent_it_just_built_when_setup_raises(tmp_path, monkeypatch):
+    """``_build_agent`` constructs the Agent (allocating its scratch in
+    ``Agent.__init__``) BEFORE its post-construction setup — ``_coding_tools``, and
+    (when ``--extensions``) ``load_extensions``, which runs arbitrary user code from
+    ``.carbon/extensions/``. Before this fix, a raise from that setup propagated
+    straight out of ``_build_agent`` with ``agent.close()`` never called for the
+    Agent it had just built.
+
+    Spies on ``Agent.close`` directly rather than asserting the scratch directory
+    is gone: every REAL TUI session is DURABLE (``session=`` is a non-empty string
+    through the one shipped CLI entrypoint, ``tasks/tui.py``'s ``_resolve_session``,
+    which maps even a missing/blank argument to ``"cli"``), and a durable
+    ``cleanup()`` is BY DESIGN a no-op regardless of whether ``close()`` even runs
+    (harness/session_env.py) — so a filesystem assertion here could not tell a
+    fixed ``_build_agent`` from a broken one for the session shape production
+    actually uses. What must hold unconditionally, durable or not, is that the
+    Agent this method just constructed gets ``.close()``d when setup fails after it
+    — matching the identical shape already established for ``run_once``/``_run_repl``
+    (harness/agent.py).
+    """
+    import harness.agent as agent_mod
+    from ui.tui import AgentTUI
+
+    closed: list[bool] = []
+    real_close = agent_mod.Agent.close
+
+    def spy_close(self):
+        closed.append(True)
+        return real_close(self)
+
+    monkeypatch.setattr(agent_mod.Agent, "close", spy_close)
+    monkeypatch.setattr(
+        agent_mod,
+        "_coding_tools",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("setup blew up")),
+    )
+
+    try:
+        AgentTUI(
+            workspace=Workspace(root=str(tmp_path / "workspace")),
+            sessions_dir=str(tmp_path / "sessions"),
+        )
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("expected the post-construction setup failure to propagate")
+
+    assert closed, (
+        "a raise during _build_agent's post-construction setup must close the Agent "
+        "it already built, not leak it until the next process's scavenge()"
+    )

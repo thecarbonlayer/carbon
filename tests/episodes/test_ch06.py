@@ -26,7 +26,7 @@ def test_estimate_tokens():
 def test_compact_keeps_head_and_tail_and_summarizes_middle():
     msgs = [{"role": "user", "content": f"m{i}"} for i in range(10)]
     with patch.object(compaction, "chat", return_value=LLMResponse(content="SUMMARY")):
-        out = compact(msgs, keep_head=2, keep_tail=2)
+        out, _facts = compact(msgs, keep_head=2, keep_tail=2)
     assert out[0] == msgs[0] and out[1] == msgs[1]
     assert out[-1] == msgs[-1] and out[-2] == msgs[-2]
     assert any("SUMMARY" in m["content"] for m in out)

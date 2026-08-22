@@ -11,9 +11,11 @@ import json
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING
 
-from harness.tools import default_tools
+from harness.limits import SCRATCH_SCHEME
+from harness.tools import default_tools, read_file
 from model import chat
 
 if TYPE_CHECKING:
@@ -24,6 +26,34 @@ _PLANNER = (
     "You are a planner. Break the task into 2-4 short imperative steps. "
     "Return ONLY a JSON array of step strings, nothing else."
 )
+
+
+def _resolve_scratch_refs(scratch_root: Path) -> Callable[[Callable[..., str]], Callable[..., str]]:
+    """A ``ToolRegistry.wrap`` wrapper that gives a caller-supplied ``read_file``
+    tool a scratch it can actually resolve.
+
+    A caller builds ``tools=`` (``Orchestrator(tools=default_tools(ws.root))`` —
+    ``tasks/checks.py``'s real ch-10 accept check) BEFORE ``run()`` constructs the
+    worker Agent below, so at build time there is no scratch for its ``read_file``
+    to close over — often none at all, same as the caller's own registry. Rebuilding
+    the tool from scratch would lose whatever workspace ``root`` the caller confined
+    it to (unrecoverable from the outside: a ``Tool.func`` closure exposes nothing),
+    so this wraps instead: every path that is not a ``scratch://`` ref still goes to
+    the ORIGINAL callable, untouched; only a scratch ref is redirected to the
+    scratch THIS worker actually owns.
+    """
+
+    def _wrap(orig: Callable[..., str]) -> Callable[..., str]:
+        def _read(path: str, start_line: int | None = None, end_line: int | None = None) -> str:
+            if path.startswith(SCRATCH_SCHEME):
+                return read_file(
+                    path, start_line=start_line, end_line=end_line, scratch_root=scratch_root
+                )
+            return orig(path, start_line=start_line, end_line=end_line)
+
+        return _read
+
+    return _wrap
 
 
 @dataclass
@@ -72,18 +102,40 @@ class Orchestrator:
 
         approve = approve or (lambda _step: True)
         plan = self._plan(task)
+        # Agent before tools: with no tools given at construction, this worker
+        # creates and owns its own SessionEnvironment — and a fallback default_tools()
+        # registry has to be wired to THAT scratch (not built blind) so its own
+        # read_file tool can resolve whatever it offloads.
         worker = Agent(
             system="Execute each step using tools when needed. Be concise.",
-            tools=self.tools if self.tools is not None else default_tools(),
             model=self.model,
         )
-        results: list[str] = []
-        for step in plan:
-            if not approve(step):
-                results.append(f"[skipped] {step}")
-                continue
-            results.append(self._run_with_retry(worker, step))
-        return OrchestratorResult(plan=plan, results=results, final=results[-1] if results else "")
+        try:
+            if self.tools is not None:
+                # A caller-supplied registry was necessarily built before THIS
+                # worker (and its scratch) existed, so whatever scratch_root its
+                # own read_file closed over cannot be this worker's — see
+                # _resolve_scratch_refs. Wrapped in place, not rebuilt: only
+                # touches scratch:// resolution, so whatever root the caller
+                # confined read_file to for everything else is untouched.
+                worker.tools = self.tools
+                if worker.tools.get("read_file") is not None:
+                    worker.tools.wrap(
+                        "read_file", _resolve_scratch_refs(worker.session_env.scratch_root)
+                    )
+            else:
+                worker.tools = default_tools(scratch_root=worker.session_env.scratch_root)
+            results: list[str] = []
+            for step in plan:
+                if not approve(step):
+                    results.append(f"[skipped] {step}")
+                    continue
+                results.append(self._run_with_retry(worker, step))
+            return OrchestratorResult(
+                plan=plan, results=results, final=results[-1] if results else ""
+            )
+        finally:
+            worker.close()
 
     @staticmethod
     def _run_with_retry(worker, step: str, attempts: int = 2) -> str:

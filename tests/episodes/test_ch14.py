@@ -92,13 +92,26 @@ def test_approval_preview_bash_and_diff(tmp_path):
 
 
 def test_delete_session_clears_messages_and_trace(tmp_path):
+    """Reviewer follow-up (Task 3): delete_session is the ONE production call site
+    that deletes a session (ui/tui.py's /reset), so it has to remove the durable
+    scratch too — otherwise a reset leaves the previous session's complete tool
+    outputs (limits.py: unredacted bytes, "a printenv, a token-bearing log") sitting
+    on disk with nothing pointing at them anymore."""
     tr = Tracer(model="google/gemma-4-26b-a4b")
     with patch.object(agent_mod, "chat", return_value=LLMResponse(content="ok")):
-        agent_mod.Agent(session="cli", sessions_dir=str(tmp_path), tracer=tr).send("hi")
+        agent = agent_mod.Agent(session="cli", sessions_dir=str(tmp_path), tracer=tr)
+        agent.send("hi")
+    scratch = agent.session_env.scratch_root
+    (scratch / "offload").mkdir(parents=True)
+    (scratch / "offload" / "secret.txt").write_text("token-bearing log")
+    agent.close()  # durable: a no-op on the scratch (Task 3) — it must still be here
     assert load_session("cli", tmp_path)  # persisted
+    assert scratch.exists()  # sanity: durable scratch really did survive close()
+
     delete_session("cli", tmp_path)
     assert load_session("cli", tmp_path) == []  # messages gone
     assert list_sessions(tmp_path) == []  # trace file gone too, nothing lingers
+    assert not scratch.exists()  # …and now so is the scratch that held its spills
     delete_session("cli", tmp_path)  # idempotent — no error on a missing session
 
 

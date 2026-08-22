@@ -11,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from harness.harness_config import TruncationPolicy
 from harness.policy import Policy
+from harness.session_env import SessionEnvironment
 from harness.tools import Tool, ToolRegistry, default_tools
 from model import Provider
 
@@ -27,6 +28,7 @@ def run_subagent(
     agents_dir: str = ".",
     policy: Policy | None = None,
     tool_output: TruncationPolicy | None = None,
+    session_env: SessionEnvironment | None = None,
 ) -> str:
     """Run one subtask in an isolated Agent. Read-only unless told otherwise.
 
@@ -37,25 +39,56 @@ def run_subagent(
     is therefore ``Policy(read_only=True)``: mutation is opt-in, and a caller that
     wants a worker to write must hand it a policy that says so.
 
-    ``tool_output`` is the parent's truncation policy. A worker reading the same
-    workspace hits the same oversized files; inheriting the door means a parent
-    running ``offload_to_file`` doesn't spawn workers that silently drop the middle.
+    ``session_env`` is the parent's session scratch, passed straight through to the
+    worker ``Agent`` and to the default tool registry's ``scratch_root``. One
+    session, one scratch inventory: a parent running ``offload_to_file`` spills into
+    its own scratch and hands the worker a ``scratch://`` footer naming a file
+    there, so a parent's footer resolves inside a worker only if the worker's own
+    ``read_file`` resolves against that SAME scratch — not a workspace path (there
+    never was one to hit) and not a scratch of the worker's own. No env supplied,
+    no inheritance: the worker opens its own, and this call closes it below, the
+    same as any construction site closes what it owns.
+
+    ``tool_output`` is the parent's truncation policy, inherited for the same
+    reason: a worker reading the same oversized results the parent does should cut
+    them the same way, not silently drop the middle under whatever the surface
+    happens to default to.
     """
     from harness.agent import Agent  # lazy: avoids an import cycle at module load
 
+    # Agent-first, tools-after (the same ordering run_once uses, harness/agent.py):
+    # constructed before the default registry, not inside the ``tools=`` expression.
+    # ``session_env`` (the parameter) is only ever a real value when the CALLER
+    # supplied one; when it's None, the worker's actual scratch doesn't exist until
+    # ``Agent.__init__`` creates it. Building ``default_tools(scratch_root=...)``
+    # from the parameter instead of from ``sub.session_env`` left a no-env worker's
+    # own registry permanently bound to ``scratch_root=None`` — its own read_file
+    # could never resolve the scratch:// footer its own offloads had just written.
+    # ``sub.session_env`` is correct in both cases: the parent's env when supplied,
+    # or the one this Agent just created for itself when it wasn't.
     sub = Agent(
         system=system or DEFAULT_WORKER_SYSTEM,
-        # Default tools are rooted where this worker writes, not at the process cwd:
-        # the worker's own offloaded output lands under ``agents_dir``, and a read_file
-        # resolving anywhere else makes every footer it is handed a dead path.
-        tools=tools or default_tools(agents_dir),
+        tools=tools,
         model=model,
         provider=provider,
         agents_dir=agents_dir,
         policy=policy or Policy(read_only=True),
         tool_output=tool_output,
+        session_env=session_env,
     )
-    return sub.send(task)
+    if tools is None:
+        # read_file/list_files/search_text are rooted at agents_dir, not the process
+        # cwd, so this worker sees the tree it was actually asked to look at —
+        # unrelated to scratch_root, which is a different root entirely (see above).
+        sub.tools = default_tools(agents_dir, scratch_root=sub.session_env.scratch_root)
+    try:
+        return sub.send(task)
+    finally:
+        # This call constructed ``sub``, so this call owns closing it. Agent.close()
+        # already tracks ownership by how ``sub`` was built (a supplied session_env
+        # is a no-op here; one ``sub`` created itself is removed) — nothing here
+        # re-decides that, it only guarantees close() actually runs.
+        sub.close()
 
 
 def fan_out(
@@ -67,9 +100,19 @@ def fan_out(
     agents_dir: str = ".",
     policy: Policy | None = None,
     tool_output: TruncationPolicy | None = None,
+    session_env: SessionEnvironment | None = None,
     max_workers: int = 4,
 ) -> list[str]:
-    """Run subtasks in parallel, each in its own isolated subagent. Order preserved."""
+    """Run subtasks in parallel, each in its own isolated subagent. Order preserved.
+
+    ``session_env`` is forwarded to every worker unchanged — one parent scratch
+    shared by all of them, since it names one session's inventory, not one per
+    worker. Each ``run_subagent`` call still owns closing its own worker (see
+    there): a supplied env is shared, and sharing is not ownership, so this
+    function never closes it either — that stays the caller's job, same as any
+    borrowed ``SessionEnvironment``. With no env supplied, every worker opens (and
+    closes) its own, exactly as a single ``run_subagent`` call would.
+    """
     if not tasks:
         return []
     with ThreadPoolExecutor(max_workers=min(max_workers, len(tasks))) as pool:
@@ -83,6 +126,7 @@ def fan_out(
                     agents_dir=agents_dir,
                     policy=policy,
                     tool_output=tool_output,
+                    session_env=session_env,
                 ),
                 tasks,
             )
@@ -97,8 +141,21 @@ def delegate_tool(
     agents_dir: str = ".",
     policy: Policy | None = None,
     tool_output: TruncationPolicy | None = None,
+    session_env: SessionEnvironment | None = None,
 ) -> Tool:
-    """A tool that lets a main agent delegate a self-contained subtask to a subagent."""
+    """A tool that lets a main agent delegate a self-contained subtask to a subagent.
+
+    ``session_env`` closes the gap ``run_subagent``'s own docstring already
+    describes but this factory used to leave unreached: ``_coding_tools``
+    (harness/agent.py) builds the worker registry it hands to this factory's
+    ``tools=`` from the PARENT's ``scratch_root`` — the only one in scope at that
+    point — so a worker whose OWN session opens fresh (``session_env=None``,
+    the default `run_subagent` falls back to) spills into a DIFFERENT scratch than
+    the one its registry's ``read_file`` resolves against. It cannot read back
+    what it just offloaded, and ``run_subagent``'s own ``finally: close()`` then
+    deletes the only copy. Forwarding the parent's env here — the same one
+    ``tools`` was already built from — is what makes the two agree.
+    """
 
     def delegate(task: str) -> str:
         return run_subagent(
@@ -109,6 +166,7 @@ def delegate_tool(
             agents_dir=agents_dir,
             policy=policy,
             tool_output=tool_output,
+            session_env=session_env,
         )
 
     return Tool(
@@ -131,10 +189,15 @@ def fan_out_tool(
     agents_dir: str = ".",
     policy: Policy | None = None,
     tool_output: TruncationPolicy | None = None,
+    session_env: SessionEnvironment | None = None,
 ) -> Tool:
     """A tool that lets the model split work into independent subtasks and run them
     in parallel, each in its own isolated subagent. Results come back labeled and
-    ordered, so the model can read them as one block."""
+    ordered, so the model can read them as one block.
+
+    ``session_env`` — see ``delegate_tool``'s docstring; the same gap, the same fix,
+    forwarded here to ``fan_out`` instead of ``run_subagent`` (``fan_out`` shares it
+    unchanged across every worker it spawns — one parent scratch, one inventory)."""
 
     def fan_out_call(tasks: list[str]) -> str:
         # The model sometimes passes a JSON string instead of a list; iterating that
@@ -149,6 +212,7 @@ def fan_out_tool(
             agents_dir=agents_dir,
             policy=policy,
             tool_output=tool_output,
+            session_env=session_env,
         )
         return "\n\n".join(
             f"[subtask {i}] {task}\n{result}"

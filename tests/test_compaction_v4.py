@@ -53,7 +53,8 @@ TINY_RESERVE = 5
 
 
 def test_file_ops_reads_tool_calls_not_prose():
-    """A path is tracked because a tool was CALLED with it, not because it was mentioned."""
+    """A path is tracked because a tool was called AND succeeded, not because it
+    was mentioned in prose."""
     messages = [
         {"role": "user", "content": "please edit services/ghost.py"},  # prose only
         _tool_call("read_file", "a.py", "1"),
@@ -63,9 +64,10 @@ def test_file_ops_reads_tool_calls_not_prose():
     ]
     ops = compaction.checkpoint.file_ops(messages)
     assert ops.read == ("a.py",)
-    # Tracked despite the tool FAILING: what the agent was working on is still state.
-    assert ops.modified == ("b.py",)
+    # NOT tracked: the write FAILED, so nothing on disk actually changed.
+    assert ops.modified == ()
     assert "services/ghost.py" not in ops.read + ops.modified
+    assert "b.py" not in ops.read + ops.modified
 
 
 def test_file_ops_survives_malformed_arguments():
@@ -77,9 +79,54 @@ def test_file_ops_survives_malformed_arguments():
                 {"id": "1", "function": {"name": "read_file", "arguments": "{not json"}},
                 {"id": "2", "function": {"name": "read_file", "arguments": '{"path":"ok.py"}'}},
             ],
-        }
+        },
+        {"role": "tool", "tool_call_id": "1", "content": "..."},
+        {"role": "tool", "tool_call_id": "2", "content": "..."},
     ]
     assert checkpoint.file_ops(messages).read == ("ok.py",)
+
+
+def test_file_ops_excludes_a_failed_write_from_ops_and_the_rendered_note():
+    """A denied or failed write must not appear as a modified file, in FileOps or
+    in the rendered checkpoint note — nothing on disk actually changed, so the
+    carried state must not claim otherwise."""
+    messages = [
+        _tool_call("read_file", "kept.py", "0"),
+        {"role": "tool", "tool_call_id": "0", "content": "..."},
+        _tool_call("write_file", "denied.py", "1"),
+        {"role": "tool", "tool_call_id": "1", "content": "error: permission denied"},
+    ]
+    ops = checkpoint.file_ops(messages)
+    assert ops.modified == ()
+    note = checkpoint.render(ops)
+    assert "denied.py" not in note
+    assert "kept.py" in note
+
+
+def test_file_ops_includes_a_successful_write():
+    """The positive case: a write whose result did not error IS tracked, in both
+    FileOps and the rendered note."""
+    messages = [
+        _tool_call("write_file", "ok.py", "1"),
+        {"role": "tool", "tool_call_id": "1", "content": "written"},
+    ]
+    ops = checkpoint.file_ops(messages)
+    assert ops.modified == ("ok.py",)
+    assert "ok.py" in checkpoint.render(ops)
+
+
+def test_file_ops_counts_an_error_then_retry_success_once():
+    """A write that fails and is then retried at the same path, successfully,
+    must appear exactly once — this is state ("this file is now modified"), not
+    a log of every attempt."""
+    messages = [
+        _tool_call("write_file", "retry.py", "1"),
+        {"role": "tool", "tool_call_id": "1", "content": "error: locked"},
+        _tool_call("write_file", "retry.py", "2"),
+        {"role": "tool", "tool_call_id": "2", "content": "written"},
+    ]
+    ops = checkpoint.file_ops(messages)
+    assert ops.modified == ("retry.py",)
 
 
 def test_state_block_round_trips():
@@ -124,7 +171,7 @@ def test_cut_point_is_token_budgeted_not_message_counted():
     kept = {}
     for big in (False, True):
         with patch.object(compaction, "chat", side_effect=_reply()):
-            out = compaction.compact(
+            out, _facts = compaction.compact(
                 history(big),
                 keep_head=2,
                 strategy="token_budget_checkpoint",
@@ -147,7 +194,7 @@ def test_cut_snaps_back_to_a_turn_boundary():
         {"role": "assistant", "content": "done"},
     ]
     with patch.object(compaction, "chat", side_effect=_reply()):
-        out = compaction.compact(
+        out, _facts = compaction.compact(
             messages,
             keep_head=1,
             strategy="token_budget_checkpoint",
@@ -166,7 +213,14 @@ def test_previous_checkpoint_is_passed_as_its_own_message():
         {"role": "system", "content": "[summary of earlier conversation]\nPRIOR-FACT-1"},
         *_filler(8),
     ]
-    with patch.object(compaction, "chat", side_effect=_reply()):
+    # The update instruction asserted below is the strategy's DEFAULT suffix; pin
+    # that state rather than trusting the checked-in file, so a config that
+    # legitimately sets compaction.prompt_suffix cannot fail this test.
+    default_suffix = replace(CONFIG, compaction=replace(CONFIG.compaction, prompt_suffix=None))
+    with (
+        patch.object(compaction, "CONFIG", default_suffix),
+        patch.object(compaction, "chat", side_effect=_reply()),
+    ):
         compaction.compact(
             messages,
             keep_head=2,
@@ -198,7 +252,7 @@ def test_tracked_files_survive_a_summarizer_that_drops_everything():
         *_filler(8),
     ]
     with patch.object(compaction, "chat", side_effect=_reply("nothing")):
-        out = compaction.compact(
+        out, _facts = compaction.compact(
             messages,
             keep_head=2,
             strategy="token_budget_checkpoint",
@@ -220,7 +274,7 @@ def test_file_state_accumulates_across_repeated_compactions():
         *_filler(8),
     ]
     with patch.object(compaction, "chat", side_effect=_reply("first")):
-        once = compaction.compact(
+        once, _facts = compaction.compact(
             first, keep_head=2, strategy="token_budget_checkpoint", recent_token_reserve=50
         )
     # A second round whose own middle touches a DIFFERENT file.
@@ -230,7 +284,7 @@ def test_file_state_accumulates_across_repeated_compactions():
         *_filler(8, start=100),
     ]
     with patch.object(compaction, "chat", side_effect=_reply("second")):
-        twice = compaction.compact(
+        twice, _facts = compaction.compact(
             second, keep_head=2, strategy="token_budget_checkpoint", recent_token_reserve=50
         )
     note = next(m["content"] for m in twice if str(m.get("content", "")).startswith("[summary"))
@@ -249,7 +303,7 @@ def test_oversized_checkpoint_is_bounded_but_keeps_its_state_block():
         *_filler(8),
     ]
     with patch.object(compaction, "chat", side_effect=_reply("B" * 40_000)):
-        out = compaction.compact(
+        out, _facts = compaction.compact(
             messages,
             keep_head=2,
             strategy="token_budget_checkpoint",
@@ -287,7 +341,7 @@ def test_empty_middle_carries_the_checkpoint_forward_without_calling_the_model()
         raise AssertionError("summarizer was called with an empty transcript")
 
     with patch.object(compaction, "chat", side_effect=explode):
-        out = compaction.compact(
+        out, facts = compaction.compact(
             messages,
             keep_head=2,
             strategy="token_budget_checkpoint",
@@ -297,6 +351,9 @@ def test_empty_middle_carries_the_checkpoint_forward_without_calling_the_model()
     note = next(m["content"] for m in out if str(m.get("content", "")).startswith("[summary"))
     assert "KEEP-ME-7" in note, "the carried-forward checkpoint lost its content"
     assert note.count("[summary of earlier conversation") == 1, "note header was nested"
+    # Codex finding 1: no model call happened here — the facts must say so, so a
+    # caller feeding this to Tracer.record_llm never fabricates a phantom event.
+    assert facts.summarizer_usage is None
 
 
 def test_overflow_recovery_still_compacts_a_short_prefix_under_token_budgeting():

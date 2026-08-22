@@ -25,23 +25,26 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import sys
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TypeVar
 
-from harness.compaction import compact, estimate_tokens
+from harness.compaction import CompactionFacts, compact, estimate_tokens
 from harness.context import deliver
-from harness.harness_config import CONFIG, RetryPolicy, TruncationPolicy
+from harness.harness_config import CONFIG, RetryPolicy, ToolExposurePolicy, TruncationPolicy
 from harness.instructions import load_agents_md, test_command
 from harness.limits import MAX_FOOTER_CHARS, recut, strategy_names, truncate_tool_result
 from harness.memory import DEFAULT_DIR, load_session, load_trace, save_session, save_trace
 from harness.observability import Tracer
 from harness.policy import Policy
 from harness.result import RunResult, ToolCall
+from harness.session_env import SessionEnvironment, local_session_env
 from harness.skills import Skill, skills_prompt
-from harness.tools import ToolRegistry
+from harness.tools import ToolRegistry, exposed_specs
 from model import LLMResponse, OnDelta, Provider, chat
 
 # Behavioral knobs live in the editable surface (harness/harness_config.json);
@@ -49,6 +52,15 @@ from model import LLMResponse, OnDelta, Provider, chat
 DEFAULT_SYSTEM = CONFIG.system_prompt
 MAX_TOOL_STEPS = CONFIG.max_tool_steps
 DEFAULT_CONTEXT_LIMIT = CONFIG.default_context_limit  # ~tokens; compact above this
+
+_T = TypeVar("_T")  # what one retried model call returns (see Agent._retrying)
+
+# Transient status codes matched as standalone numbers, never substrings:
+# "requested 15020 tokens" contains "502", and substring matching classified that
+# context-overflow message as a transient gateway fault — spending the whole
+# retry budget on a payload that can never fit (2026-08-21 review probe). A
+# genuine "502 Bad Gateway" still matches on its own word boundary.
+_TRANSIENT_STATUS = re.compile(r"\b(?:429|502|503|504)\b")
 APPROVAL_TOOLS = CONFIG.approval_tools  # tools the gate guards
 # a write/edit of one of these arms the test gate (a code change to verify)
 CODE_EXTENSIONS = CONFIG.code_extensions
@@ -113,6 +125,7 @@ class Agent:
         system: str | None = None,
         agents_dir: str = ".",
         workspace_root: str | None = None,
+        session_env: SessionEnvironment | None = None,
         tools: ToolRegistry | None = None,
         approve: Callable[[str, str], bool] | None = None,
         approval_required: frozenset[str] | set[str] | None = None,
@@ -130,19 +143,48 @@ class Agent:
         response_format: dict | None = None,
         policy: Policy | None = None,
         tool_output: TruncationPolicy | None = None,
+        tool_exposure: ToolExposurePolicy | None = None,
     ) -> None:
         self.model = model
         self.provider = provider
         self.system = system
         self.agents_dir = agents_dir  # where AGENTS.md is auto-loaded from
-        # Where the agent's files live: the directory offloaded tool output is written
-        # under, and the root the model's own read_file resolves against. It defaults
-        # to agents_dir because every mature wiring here binds both to the workspace —
-        # but they answer different questions, and a consumer can legitimately split
-        # them (AGENTS.md loaded from a neutral directory, files written where the
-        # model can reach them). Then the footer's path must follow the read_file
-        # root, not the instructions root, or every recovery route is a dead link.
+        # Where the agent's files live: the root a caller's tool registry resolves
+        # read_file/write_file against (every mature wiring here builds that registry
+        # from this same value). It defaults to agents_dir because every mature wiring
+        # binds both to the workspace — but they answer different questions, and a
+        # consumer can legitimately split them (AGENTS.md loaded from a neutral
+        # directory, files written where the model can reach them). Offloaded tool
+        # output answers neither question anymore — that goes to session_env's private
+        # scratch below (Task 4), never a workspace path — so this field's only
+        # remaining job here is seeding that scratch's workspace_root metadata when no
+        # session_env is supplied.
         self.workspace_root = workspace_root
+        # The session's runtime storage. Created here when not supplied, so every
+        # wiring gets the scratch lifecycle without opting in; supplied by callers
+        # that share one environment across agents (fan-out workers, a test) — a
+        # shared env is the CREATOR's to clean, so ownership tracks construction.
+        self._owns_env = session_env is None
+        # A durable session (``session`` given, ``sessions_dir`` below) gets a scratch
+        # tied to the SESSION's lifetime, not this Agent's: reopening the same session
+        # must land on the same scratch, so a persisted transcript's scratch:// refs
+        # (offload_to_file) still resolve after a restart (harness/session_env.py).
+        # Ownership still tracks CONSTRUCTION — this Agent built it, so it is still
+        # the one that would close it — but a durable SessionEnvironment's own
+        # cleanup() is a no-op by its own rule, so close() below never removes a
+        # durable session's scratch; only delete_session_scratch() does.
+        if session_env is not None:
+            self.session_env = session_env
+        elif session:
+            self.session_env = local_session_env(
+                workspace_root=self.workspace_root or self.agents_dir,
+                session=session,
+                sessions_dir=sessions_dir,
+            )
+        else:
+            self.session_env = local_session_env(
+                workspace_root=self.workspace_root or self.agents_dir
+            )
         self.tools = tools
         self.approve = approve
         self.approval_required = approval_required or set()
@@ -160,6 +202,10 @@ class Agent:
         self._turn_model_calls = 0
         self._turn_approvals = 0
         self._stop_reason = "stop"
+        # Phase 1 telemetry slice 1 (contract §1): the run-verification verdict
+        # _enforce_run acts on, made public via RunResult.verified. Reset at the
+        # top of every run() call; None means no verification was requested.
+        self._last_verified: bool | None = None
         self.retry_count = 0
         self.context_limit = context_limit
         # v0.3: per-instance override of the module-global tool-step budget
@@ -192,6 +238,13 @@ class Agent:
                 f"(choose one of {sorted(strategy_names())})"
             )
         self.tool_output = tool_output
+        # Per-instance override of the tool-exposure policy (CONFIG.tool_exposure),
+        # the same seam shape as ``tool_output`` just above and for the same reason:
+        # None keeps the editable surface in charge; a code caller gets a kwarg
+        # instead of a config edit. ``ToolExposurePolicy`` validates itself at
+        # construction (menu membership, per-strategy params), so a bad value has
+        # already refused loudly before it reaches this line.
+        self.tool_exposure = tool_exposure
         self.skills = skills or []
         self._last_tokens = 0  # model-reported usage from the last call (ch-08)
         self.session = session
@@ -211,6 +264,22 @@ class Agent:
         # ch-13: restore the persisted trace too, so it isn't empty on resume.
         if self.tracer is not None and session:
             self.tracer.load_events(load_trace(session, sessions_dir))
+
+    def close(self) -> None:
+        """End-of-session housekeeping: remove the private scratch if this Agent
+        created it. Idempotent, never raises — callers run it in ``finally``.
+
+        A no-op on the scratch itself when ``self.session_env.durable`` is true
+        (a session opened with ``session=``): ownership still tracks construction
+        (``_owns_env``), but a durable ``SessionEnvironment.cleanup()`` refuses to
+        remove it — that scratch is tied to the SESSION's lifetime, not this
+        Agent's, so a session switch or process exit must not delete refs a
+        persisted transcript still points at. Delete the session itself via
+        ``harness.memory.delete_session`` to remove it (that call now removes the
+        scratch too), or call ``delete_session_scratch`` (harness/session_env.py)
+        directly for the rarer case of wanting only the scratch gone."""
+        if self._owns_env:
+            self.session_env.cleanup()
 
     def _approved(self, name: str, args: str) -> bool:
         # Fail closed: a tool marked as requiring approval with no approver is denied.
@@ -248,13 +317,55 @@ class Agent:
             # tighter wins, so adding a reserve can only ever compact earlier.
             trigger = min(trigger, self.context_limit - policy.completion_reserve)
         if window > trigger:
-            managed = compact(self.messages, model=self.model, provider=self.provider)
+            # Amendment (2026-08-19, audit finding 3): pre must be commensurable
+            # with post — both `estimate_tokens(self.messages)`, computed
+            # immediately before/after the compaction. Never `window` here: it can
+            # be `_last_tokens`, a provider tokenizer count over the full payload
+            # (including the system prompt), which is a different quantity from
+            # what compaction actually measures. The trigger decision above is
+            # unchanged; only this telemetry number moves.
+            pre = estimate_tokens(self.messages)
+            start = time.perf_counter()
+            managed, facts = compact(
+                self.messages,
+                model=self.model,
+                provider=self.provider,
+                with_retry=self._summarizer_retry,
+            )
+            seconds = time.perf_counter() - start
             if managed is self.messages:
                 return
             self.messages = managed
+            post = estimate_tokens(self.messages)
             self._last_tokens = 0  # recomputed from the next response
             self.just_compacted = True
             self.compaction_count += 1
+            self._record_compaction(facts, pre, post, seconds)
+
+    def _record_compaction(
+        self, facts: CompactionFacts, pre: int, post: int, seconds: float
+    ) -> None:
+        """Record one compaction pass, plus its summarizer call if one happened.
+
+        Amendment (2026-08-19, Codex finding 1): the summarizer's own model call
+        must reach ``record_llm`` exactly once — the same as any other model
+        call — so ``llm_calls``, ``tokens``, the split accumulators, and cost all
+        include it. ``facts.summarizer_usage`` is ``None`` on every path that
+        never called the model (a no-op compaction, or an incremental strategy's
+        "nothing new to fold in" carry-forward), so no phantom llm event is ever
+        recorded. Both ``compact()`` call sites (``_maybe_compact`` and
+        ``_compact_active_history``) route through here so neither can forget
+        the summarizer half.
+        """
+        if not self.tracer:
+            return
+        if facts.summarizer_usage is not None:
+            self.tracer.record_llm(
+                facts.summarizer_usage,
+                facts.summarizer_seconds,
+                request_model=self.model,
+            )
+        self.tracer.record_compaction(facts, pre, post, seconds)
 
     def _system_text(self) -> str:
         """Instruction layer = system prompt + project AGENTS.md + skills menu."""
@@ -288,6 +399,7 @@ class Agent:
         self._turn_model_calls = 0
         self._turn_approvals = 0
         self._stop_reason = "stop"
+        self._last_verified = None
         if self.tracer:
             self.tracer.turn_start()  # ch-13: nest this turn's steps under one span
         # Compact BEFORE this turn's messages are appended, so ``turn_start`` (an
@@ -306,13 +418,27 @@ class Agent:
         # gate "done" on a real test run (re-prompt runs stream too)
         reply = self._enforce_run(reply, turn_start, on_delta)
         self._save()  # durable state: persist after every turn
+        totals = self.tracer.totals() if self.tracer else {}
+        # Amendment (2026-08-19, audit finding 2): total_tokens is always safe to
+        # publish, but input_tokens/output_tokens are a fabrication whenever any
+        # call this run fell back to booking the total as input — publish the
+        # split only when the tracer saw a real one on every call.
+        usage: dict = {}
+        if self.tracer and totals:
+            usage["total_tokens"] = totals["tokens"]
+            if self.tracer._split_complete:
+                usage["input_tokens"] = totals["input_tokens"]
+                usage["output_tokens"] = totals["output_tokens"]
         result = RunResult(
             text=reply,
             tool_calls=self._collect_tool_calls(turn_start),
             turns=self._turn_model_calls,
             approvals=self._turn_approvals,
             stop_reason=self._stop_reason,
-            totals=self.tracer.totals() if self.tracer else {},
+            totals=totals,
+            verified=self._last_verified,
+            usage=usage,
+            compactions=self.compaction_count,
         )
         self._emit({"type": "turn_end", "result": result})
         return result
@@ -385,6 +511,7 @@ class Agent:
             return reply
         for _ in range(self.verify_attempts):
             if self._record_pass(command, turn_start):
+                self._last_verified = True
                 return reply
             self.messages.append(
                 {
@@ -400,7 +527,9 @@ class Agent:
             turn_start = self._active_turn_start
         # The last re-prompt's run hasn't been checked yet — check it, then fail closed.
         if self._record_pass(command, turn_start):
+            self._last_verified = True
             return reply
+        self._last_verified = False
         return (
             f"{reply}\n\n[unverified: this turn changed code but no passing `{command}` "
             f"run was observed after the change (tried {self.verify_attempts}×). "
@@ -475,11 +604,44 @@ class Agent:
         """The active tool-result policy: the per-instance override, else the surface."""
         return self.tool_output if self.tool_output is not None else CONFIG.tool_output
 
-    def _offload_root(self) -> str:
-        """Where an offloaded tool result is written — the explicit workspace root when
-        one was given, else agents_dir (which every wiring here binds to the same
-        directory, so no existing caller changes)."""
-        return self.workspace_root or self.agents_dir
+    def _tool_exposure_policy(self) -> ToolExposurePolicy:
+        """The active exposure policy: the per-instance override, else the surface."""
+        return self.tool_exposure if self.tool_exposure is not None else CONFIG.tool_exposure
+
+    def _exposure_query(self) -> str:
+        """What ``query_match`` ranks against: the most recent user message — the
+        turn's own text on the first ``_run``, the re-prompt on a verification
+        re-run. Deterministic either way, which is the property that matters: an
+        exposure decision a replay cannot reproduce would smuggle a confound into
+        every measurement."""
+        for m in reversed(self.messages):
+            if m.get("role") == "user":
+                return str(m.get("content", ""))
+        return ""
+
+    def _exposed_specs(self) -> list[dict] | None:
+        """The tool specs this turn offers the model (seam 3, Select).
+
+        Under ``all`` — the default when neither the config file nor the ctor set
+        anything — this IS ``self.tools.specs()``, the exact expression `_run` has
+        always evaluated, so the offered payload stays byte-identical until an
+        editor turns the knob. A non-``all`` strategy that selects nothing sends
+        no tools field at all (None), never an empty list a provider may reject."""
+        if not self.tools:
+            # Falsy, not just None — an EMPTY registry has always meant "no tools
+            # field" (`self.tools.specs() if self.tools else None`), and `all` must
+            # reproduce that exactly, not upgrade it to an empty list.
+            return None
+        policy = self._tool_exposure_policy()
+        if policy.strategy == "all":
+            return self.tools.specs()
+        return exposed_specs(self.tools, policy, query=self._exposure_query()) or None
+
+    def _scratch_dir(self) -> Path:
+        """Where offloaded tool results are written — the session's private scratch
+        (harness/session_env.py), never the workspace: the repo is the user's durable
+        state, and runtime spills carry a session lifecycle instead."""
+        return self.session_env.scratch_root
 
     def _run(self, on_delta: OnDelta | None = None) -> str:
         """Drive the model, executing tool calls until it produces a final answer.
@@ -487,7 +649,7 @@ class Agent:
         Compaction happens once per turn in ``send`` (before the turn is appended),
         never here — so the verification gate's ``turn_start`` index stays valid even
         across the re-prompt runs ``_enforce_run`` drives."""
-        specs = self.tools.specs() if self.tools else None
+        specs = self._exposed_specs()
         tool_step_budget = (
             self.max_tool_steps if self.max_tool_steps is not None else MAX_TOOL_STEPS
         )
@@ -596,15 +758,23 @@ class Agent:
                     hint = None
                     if name == "read_file":
                         hint = "Use start_line/end_line to request the missing range."
-                    # workspace_root anchors offload_to_file's files where the model's
-                    # own read_file resolves relative paths, so the footer's path is a
-                    # route the model can actually walk.
+                    # scratch_dir anchors offload_to_file's complete copy in the
+                    # session's private scratch; the footer names it as a virtual
+                    # scratch:// ref, which the model's own read_file tool resolves
+                    # against that same scratch_root — never a workspace path.
+                    # durable=self.session_env.durable: a DURABLE session's spills
+                    # must survive a later process reopening this same scratch (Task
+                    # 3 follow-up) — see limits.py's _prune, which is per-process and
+                    # would otherwise treat this session's OWN earlier spills as a
+                    # previous run's strays the moment a reopened process spills one
+                    # more.
                     content = truncate_tool_result(
                         result,
                         policy,
                         budget=budget,
                         continuation_hint=hint,
-                        workspace_root=self._offload_root(),
+                        scratch_dir=self._scratch_dir(),
+                        durable=self.session_env.durable,
                     )
                     self.messages.append(
                         {"role": "tool", "tool_call_id": tc.get("id", ""), "content": content}
@@ -645,21 +815,21 @@ class Agent:
     @staticmethod
     def _transient_error(exc: Exception) -> bool:
         text = str(exc).lower()
-        return any(
+        if any(
             marker in text
             for marker in (
-                "429",
                 "rate limit",
                 "timeout",
                 "timed out",
                 "temporarily unavailable",
                 "connection reset",
                 "connection refused",
-                "502",
-                "503",
-                "504",
             )
-        )
+        ):
+            return True
+        # Status codes go through the word-boundary pattern, not `in` — see
+        # _TRANSIENT_STATUS for the token-count false match this prevents.
+        return _TRANSIENT_STATUS.search(text) is not None
 
     def _compact_active_history(self) -> bool:
         """Reclaim window without disturbing turn-relative gate indices.
@@ -684,13 +854,28 @@ class Agent:
         # compact() correctly report nothing to summarize; here that correctness is a
         # regression, so this caller opts out of the reserve rather than the reserve
         # quietly making an exception for it.
-        managed = compact(prefix, model=self.model, provider=self.provider, recent_token_reserve=0)
+        # Phase 1 §3 amendment: this second call site records exactly like
+        # `_maybe_compact` does — pre/post are the PREFIX's tokens (the only part
+        # `compact()` touches here; `current_turn` is untouched), so an event-based
+        # compaction count can never disagree with `compaction_count`.
+        pre = estimate_tokens(prefix)
+        start = time.perf_counter()
+        managed, facts = compact(
+            prefix,
+            model=self.model,
+            provider=self.provider,
+            recent_token_reserve=0,
+            with_retry=self._summarizer_retry,
+        )
+        seconds = time.perf_counter() - start
         compacted = managed is not prefix
         if compacted:
+            post = estimate_tokens(managed)
             self.messages = managed + current_turn
             self._active_turn_start = len(managed)
             self.just_compacted = True
             self.compaction_count += 1
+            self._record_compaction(facts, pre, post, seconds)
         shrank = self._shrink_turn_tool_results()
         if compacted or shrank:
             self._last_tokens = 0
@@ -747,42 +932,60 @@ class Agent:
                 shrank = True
         return shrank
 
-    def _model_call_with_recovery(
-        self, specs: list[dict] | None, on_delta: OnDelta | None
-    ) -> tuple[LLMResponse, list[dict], float]:
-        """Call the model with one forced overflow recovery and bounded retries."""
+    def _retrying(
+        self,
+        call: Callable[[], _T],
+        *,
+        recover_overflow: bool,
+        prepare: Callable[[], None] | None = None,
+    ) -> _T:
+        """Run one model call under the retry policy — THE retry path.
+
+        Every model call a turn makes routes through here: the main loop's (via
+        ``_model_call_with_recovery``) and the compaction summarizer's (via
+        ``_summarizer_retry``). The summarizer used to call ``chat()`` directly,
+        which made it the one unretried model call in a turn — a transient
+        serving fault that any other call would have absorbed crashed the whole
+        turn there (2026-08-21: three of six serving faults in an evaluation
+        campaign hit exactly that call).
+
+        ``prepare`` runs before every try, OUTSIDE the guarded region — the
+        boundary the pre-extraction loop drew. Building the request is not
+        making it: a fault in the payload builder (a workspace read raising) is
+        a local defect, not a model fault, and must escape immediately rather
+        than be classified transient and retried.
+
+        ``recover_overflow`` gates the one-shot compact-and-retry recovery.
+        Only the main loop's call can use it: its payload is rebuilt from
+        ``self.messages`` on every try, so compacting the history changes what
+        is re-sent. A summarizer call's payload is fixed when it is built —
+        compacting the agent's history cannot shrink it, and recovering there
+        would recurse into compaction from inside compaction. On that
+        fixed-payload path an overflow-shaped error raises immediately, before
+        the transient classifier sees it: the identical payload would overflow
+        again, so any retry is spent for nothing.
+        """
         policy = CONFIG.retry
         attempt = 0
         overflow_recovered = False
         while True:
             attempt += 1
-            payload = self._payload()
-            t0 = time.perf_counter()
+            if prepare is not None:
+                prepare()
             try:
-                response = chat(
-                    payload,
-                    model=self.model,
-                    tools=specs,
-                    temperature=self.temperature,
-                    max_tokens=self.max_tokens,
-                    response_format=self.response_format,
-                    provider=self.provider,
-                    on_delta=on_delta,
-                )
-                # Count completed calls only. `turns` is evidence the improvement
-                # loop reads; a flaky endpoint must not read as a chattier agent.
-                # Recovery attempts are their own signal — see `retry_count`.
-                self._turn_model_calls += 1
-                return response, payload, t0
+                return call()
             except Exception as exc:
-                if (
-                    not overflow_recovered
-                    and self._context_overflow(exc)
-                    and self._compact_active_history()
-                ):
-                    overflow_recovered = True
-                    self.retry_count += 1
-                    continue
+                if self._context_overflow(exc):
+                    if (
+                        recover_overflow
+                        and not overflow_recovered
+                        and self._compact_active_history()
+                    ):
+                        overflow_recovered = True
+                        self.retry_count += 1
+                        continue
+                    if not recover_overflow:
+                        raise  # fixed payload: the same request overflows again
                 strat = _RETRY_STRATEGIES.get(policy.strategy)
                 delay = (
                     strat.next_delay(attempt, policy)
@@ -794,6 +997,49 @@ class Agent:
                 self.retry_count += 1
                 if delay:
                     time.sleep(delay)
+
+    def _summarizer_retry(self, call: Callable[[], LLMResponse]) -> LLMResponse:
+        """The compaction summarizer's route through the retry policy — passed
+        to ``compact()`` as ``with_retry`` by both call sites, so the
+        summarizer's model call is retried like every other model call. No
+        overflow recovery on this route; ``_retrying`` says why."""
+        return self._retrying(call, recover_overflow=False)
+
+    def _model_call_with_recovery(
+        self, specs: list[dict] | None, on_delta: OnDelta | None
+    ) -> tuple[LLMResponse, list[dict], float]:
+        """Call the model with one forced overflow recovery and bounded retries."""
+        payload: list[dict] = []
+        t0 = 0.0
+
+        def prepare() -> None:
+            # Rebuilt per try — overflow recovery compacts ``self.messages`` and
+            # the retry must send the compacted payload — but OUTSIDE the
+            # retried region (``_retrying``'s ``prepare`` contract), exactly
+            # where the pre-extraction loop built it: a fault here escapes
+            # instead of being retried as a transient model failure.
+            nonlocal payload, t0
+            payload = self._payload()
+            t0 = time.perf_counter()
+
+        def attempt() -> tuple[LLMResponse, list[dict], float]:
+            response = chat(
+                payload,
+                model=self.model,
+                tools=specs,
+                temperature=self.temperature,
+                max_tokens=self.max_tokens,
+                response_format=self.response_format,
+                provider=self.provider,
+                on_delta=on_delta,
+            )
+            # Count completed calls only. `turns` is evidence the improvement
+            # loop reads; a flaky endpoint must not read as a chattier agent.
+            # Recovery attempts are their own signal — see `retry_count`.
+            self._turn_model_calls += 1
+            return response, payload, t0
+
+        return self._retrying(attempt, recover_overflow=True, prepare=prepare)
 
 
 # --- non-interactive print mode ---------------------------------------------
@@ -815,6 +1061,7 @@ def _coding_tools(
     workspace,
     *,
     exclude_session: str | None,
+    session_env: SessionEnvironment,
     provider: Provider | None = None,
     model: str | None = None,
     sessions_dir: str | Path | None = None,
@@ -831,6 +1078,16 @@ def _coding_tools(
     parent should cut them the same way (None: the surface's selection, which both
     resolve identically). The sandbox is NOT on that list: ``bash_tool`` applies no
     policy at all, so there is no third door to keep in agreement.
+
+    ``session_env`` is required, not defaulted: this is where the registered
+    ``read_file`` tool's ``scratch_root`` comes from, and a caller that forgot to
+    pass one used to get a registry whose ``read_file`` could never resolve a
+    ``scratch://`` ref — the footer's route shipping dead. Making it required turns
+    that into a construction-time error instead of a silent gap a live session would
+    have to hit an oversized result to discover. The caller must therefore build
+    (or own) a ``SessionEnvironment`` — typically ``agent.session_env`` — BEFORE
+    calling this, which is also why every call site here constructs its ``Agent``
+    first and assigns ``agent.tools`` after building this registry from it.
     """
     from harness.memory import search_memory_tool
     from harness.sandbox import Sandbox, bash_tool
@@ -840,6 +1097,7 @@ def _coding_tools(
 
     root = str(workspace.root)
     memory_dir = sessions_dir if sessions_dir is not None else DEFAULT_DIR
+    scratch_root = session_env.scratch_root
 
     def worker_tools() -> ToolRegistry:
         """What a delegated worker gets: the parent's workspace, read-only.
@@ -849,26 +1107,59 @@ def _coding_tools(
         parent running fail-closed could delegate the write it just refused. Until
         delegation has a composite approval design, workers observe and report; the
         parent makes the changes.
+
+        ``scratch_root`` here is the PARENT's session scratch — the only one in scope
+        this early. It is also the RIGHT one now (Task 4): ``delegate_tool``/
+        ``fan_out_tool`` accept ``session_env`` and this caller passes it (below),
+        so a worker spawned via delegate/fan_out SHARES this same scratch rather
+        than opening its own — its own offload footers resolve through this
+        registry, not only the parent's.
         """
-        registry = default_tools(root)
+        registry = default_tools(root, scratch_root=scratch_root)
         registry.register(search_memory_tool(memory_dir, exclude=exclude_session))
         return registry
 
-    tools = default_tools(root)
+    tools = default_tools(root, scratch_root=scratch_root)
     tools.register(write_file_tool(workspace))
     tools.register(edit_file_tool(workspace))
     tools.register(apply_patch_tool(workspace))
-    tools.register(bash_tool(Sandbox(trusted=True, timeout=120), workdir=root))
+    # scratch_dir=scratch_root: this Sandbox backs the AGENT'S OWN bash tool, so its
+    # $CARBON_SCRATCH_DIR must resolve to the SAME scratch the door's footer just
+    # named (harness/limits.py's shell_ref) and read_file's scratch_root above
+    # already resolves. Omitting it was live until this fix: the footer advertised
+    # the shell route unconditionally, but nothing had ever wired this Sandbox to
+    # a real directory, so the model's own bash tool followed an advertised route
+    # into an unset variable — the exact failure a live measurement found (32 of
+    # 32 attempts to recover a spill went through bash, none of which could
+    # resolve it). See test_the_agents_own_bash_tool_can_read_back_what_its_footer_named
+    # (tests/test_offload_strategy.py).
+    tools.register(
+        bash_tool(Sandbox(trusted=True, timeout=120, scratch_dir=scratch_root), workdir=root)
+    )
     tools.register(search_memory_tool(memory_dir, exclude=exclude_session))
     workers = worker_tools()
+    # session_env=session_env (the PARENT's, the same one `workers` was just built
+    # from above): a delegated worker's OWN offloads must land in the same scratch
+    # `workers`' read_file resolves against, or it can never read back what it just
+    # spilled (Task 4) — see delegate_tool/fan_out_tool's own docstrings.
     tools.register(
         delegate_tool(
-            model=model, provider=provider, tools=workers, agents_dir=root, tool_output=tool_output
+            model=model,
+            provider=provider,
+            tools=workers,
+            agents_dir=root,
+            tool_output=tool_output,
+            session_env=session_env,
         )
     )
     tools.register(
         fan_out_tool(
-            model=model, provider=provider, tools=workers, agents_dir=root, tool_output=tool_output
+            model=model,
+            provider=provider,
+            tools=workers,
+            agents_dir=root,
+            tool_output=tool_output,
+            session_env=session_env,
         )
     )
     return tools
@@ -905,21 +1196,14 @@ def run_once(
     provider = provider or Provider.from_env()
     workspace = Workspace(root=workspace_root)
     tracer = Tracer(model=provider.model)
-    tools = _coding_tools(
-        workspace,
-        exclude_session=session,
-        provider=provider,
-        model=provider.model,
-        sessions_dir=sessions_dir,
-        tool_output=tool_output,
-    )
-    if extensions:
-        load_extensions(tools, *_extension_dirs(workspace.root))
+    # Construct the Agent BEFORE its tools: with no session_env supplied it creates
+    # (and owns) one in __init__, and that is where _coding_tools' scratch_root has
+    # to come from — the registry's read_file tool must resolve the same scratch
+    # the door is about to spill into. Tools are then built and bound afterward.
     agent = Agent(
         system=DEFAULT_SYSTEM,
         provider=provider,
         model=provider.model,
-        tools=tools,
         approve=_approver(yes),
         approval_required=APPROVAL_TOOLS,
         skills=load_skills("skills"),
@@ -933,12 +1217,30 @@ def run_once(
         tracer=tracer,
         tool_output=tool_output,
     )
-    reply = agent.send(prompt, on_delta=on_delta)
-    if fmt == "json":
-        return render_json(reply, tracer, agent.messages)
-    if fmt == "transcript":
-        return render_transcript(agent.messages, tracer)
-    return render_plain(reply)
+    try:
+        tools = _coding_tools(
+            workspace,
+            exclude_session=session,
+            provider=provider,
+            model=provider.model,
+            sessions_dir=sessions_dir,
+            tool_output=tool_output,
+            session_env=agent.session_env,
+        )
+        if extensions:
+            load_extensions(tools, *_extension_dirs(workspace.root))
+        agent.tools = tools
+        reply = agent.send(prompt, on_delta=on_delta)
+        if fmt == "json":
+            return render_json(reply, tracer, agent.messages)
+        if fmt == "transcript":
+            return render_transcript(agent.messages, tracer)
+        return render_plain(reply)
+    finally:
+        # Each invocation is stateless and one-shot (module docstring); nothing else
+        # reuses this Agent, so its scratch's lifecycle ends here rather than waiting
+        # on the next session's scavenge().
+        agent.close()
 
 
 def _stdout_sink(channel: str, text: str) -> None:
@@ -1048,32 +1350,43 @@ def _run_repl(args: argparse.Namespace) -> None:
     # it to price calls (else the REPL trace shows $0.0000), and the agent reuses it.
     provider = Provider.from_env()
     tracer = Tracer(model=provider.model)  # ch-13: record every step + price it
-    tools = _coding_tools(
-        workspace, exclude_session="repl", provider=provider, model=provider.model
-    )
-    if args.extensions:
-        load_extensions(tools, *_extension_dirs(workspace.root))
+    # Agent before tools (see run_once): with no session_env given it creates and
+    # owns one, and _coding_tools' scratch_root has to come from that same env.
     agent = Agent(
         system=DEFAULT_SYSTEM,
         provider=provider,
         model=provider.model,
-        tools=tools,
         approve=approve,
         approval_required=APPROVAL_TOOLS,
         context_limit=args.context_limit,
         skills=load_skills("skills"),
         session="repl",
         agents_dir=str(workspace.root),  # read AGENTS.md (incl. ## Testing) from the project
-        workspace_root=str(workspace.root),  # …and spill oversized results into it
+        workspace_root=str(workspace.root),  # …and read_file/write_file resolve there too
         tracer=tracer,
     )
-    print(
-        "agent ready — streaming replies; observable runs (a trace with tokens + cost "
-        "after each turn); change code and the harness enforces the project's tests "
-        "before 'done'; /plan; durable sessions, approval gate, skills. Ctrl-D to exit."
-    )
-    orchestrator = Orchestrator()
+    # The try opens HERE, immediately after the Agent (and the session_env it just
+    # created and owns) exist — not after the tool-building/extension-loading/
+    # Orchestrator setup below. That setup can raise (load_extensions in particular
+    # runs arbitrary user code from .carbon/extensions/), and a raise there used to
+    # skip agent.close() entirely, leaking the scratch this Agent already created.
     try:
+        tools = _coding_tools(
+            workspace,
+            exclude_session="repl",
+            provider=provider,
+            model=provider.model,
+            session_env=agent.session_env,
+        )
+        if args.extensions:
+            load_extensions(tools, *_extension_dirs(workspace.root))
+        agent.tools = tools
+        print(
+            "agent ready — streaming replies; observable runs (a trace with tokens + cost "
+            "after each turn); change code and the harness enforces the project's tests "
+            "before 'done'; /plan; durable sessions, approval gate, skills. Ctrl-D to exit."
+        )
+        orchestrator = Orchestrator()
         while True:
             try:
                 user = input("you> ")
@@ -1103,7 +1416,8 @@ def _run_repl(args: argparse.Namespace) -> None:
             _ = reply  # already shown via the stream; keep the name for clarity
             print(tracer.timeline())
     finally:
-        cleanup()
+        agent.close()  # end the session's scratch lifecycle
+        cleanup()  # …then the git worktree's
 
 
 if __name__ == "__main__":
